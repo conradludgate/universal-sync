@@ -1,31 +1,38 @@
-use futures::{Sink, Stream, TryStream};
-use zerocopy::{FromBytes, Immutable, IntoBytes, TryFromBytes};
+use std::{
+    collections::{BTreeMap, btree_map},
+    future::poll_fn,
+    task::Poll,
+};
 
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
+
+#[expect(async_fn_in_trait)]
 pub trait Learner {
-    type EpochIdentifier: IntoBytes + FromBytes + Immutable + Ord;
-    type Message: IntoBytes + FromBytes + Immutable;
+    type RoundId: Copy + Ord + 'static;
+    type AttemptId: Copy + Ord + 'static;
+
+    type Message: Clone + Ord + 'static;
     type Error: core::error::Error;
 
-    /// The current state epoch.
-    fn epoch(&self) -> Self::EpochIdentifier;
+    /// Return the next round ID.
+    fn next_round(&self) -> Self::RoundId;
 
-    /// Propose a new message be added to the current state
-    async fn propose(&mut self, message: Self::Message) -> Result<(), Self::Error>;
+    /// Apply the message to the state
+    async fn apply(&mut self, message: Self::Message) -> Result<(), Self::Error>;
+}
 
-    /// Commit the most recently proposed message
-    async fn commit(&mut self) -> Result<(), Self::Error>;
-
-    /// Rollback the latest proposed message.
-    async fn rollback(&mut self) -> Result<(), Self::Error>;
+#[repr(C)]
+pub struct VersionId<S: Learner> {
+    pub round: S::RoundId,
+    pub attempt: S::AttemptId,
 }
 
 /// A proposer
+#[expect(async_fn_in_trait)]
 pub trait Proposer {
     type Error: core::error::Error;
-    type State: Learner<Error = Self::Error>;
-    type Acceptor<'a>: Sink<Prepare<Self::State>, Error = Self::Error>
-        + Sink<Accept<Self::State>, Error = Self::Error>
-        + TryStream<Ok = PromiseOrNack<Self::State>, Error = Self::Error>
+    type State: Learner<Error = Self::Error> + 'static;
+    type Acceptor<'a>: AcceptorConn<Self::State>
     where
         Self: 'a;
 
@@ -39,85 +46,260 @@ pub trait Proposer {
     async fn sync(
         &mut self,
         state: &mut Self::State,
-        epoch: <Self::State as Learner>::EpochIdentifier,
+        round: <Self::State as Learner>::RoundId,
     ) -> Result<(), Self::Error>;
 
-    /// Wait for the next proposal to make
+    /// Wait for the next proposal to make.
     ///
     /// Must be cancel-safe
     async fn next_proposal(
         state: &mut Self::State,
-    ) -> Result<<Self::State as Learner>::Message, Self::Error>;
+        min_attempt: Option<<Self::State as Learner>::AttemptId>,
+    ) -> Result<
+        (
+            <Self::State as Learner>::AttemptId,
+            <Self::State as Learner>::Message,
+        ),
+        Self::Error,
+    >;
 }
 
-pub struct Prepare<S: Learner>(S::EpochIdentifier);
-pub struct Accept<S: Learner>(S::EpochIdentifier, S::Message);
-pub enum PromiseOrNack<S: Learner> {
-    Promise(S::EpochIdentifier),
-    Nack(S::EpochIdentifier),
+pub trait AcceptorConn<State: Learner>:
+    Sink<Prepare<State>, Error = State::Error>
+    + Sink<Accept<State>, Error = State::Error>
+    + Stream<Item = Result<AcceptorMessage<State>, State::Error>>
+    + Unpin
+{
+    type Id: Copy + Ord + 'static;
+    const MIN_ID: Self::Id;
+    const MAX_ID: Self::Id;
+
+    fn id(&self) -> Self::Id;
 }
 
-async fn run_proposer<P>(mut p: P, mut state: P::State) -> Result<(), P::Error>
+pub struct Prepare<S: Learner>(pub VersionId<S>);
+pub struct Accept<S: Learner>(pub VersionId<S>, pub S::Message);
+pub struct AcceptorMessage<S: Learner> {
+    pub promised: VersionId<S>,
+    pub accepted: VersionId<S>,
+    pub msg: S::Message,
+}
+
+pub async fn run_proposer<P>(mut p: P, mut state: P::State) -> Result<(), P::Error>
 where
     P: Proposer,
 {
+    let mut p_state = ProposerState {
+        learned: BTreeMap::new(),
+    };
+
     loop {
+        let round = state.next_round();
+        p.sync(&mut state, round).await?;
+
         let mut acceptors: Vec<_> = p.acceptors().into_iter().collect();
 
+        p_state.prune(round);
+        let should_propose = p_state.should_propose(round);
+        let min_attempt = p_state.min_attempt(round);
+
         tokio::select! {
-            proposal = P::next_proposal(&mut state) => {
-                proposal?;
-                propose(&mut acceptors, proposal).await;
-                state.rollback().await?;
+            res = learn(&mut acceptors, &mut p_state, round) => {
+                // todo: sync if learn could not get the next ID.
+                state.apply(res?).await?
+            }
+            res = P::next_proposal(&mut state, min_attempt), if should_propose => {
+                let (attempt, msg) = res?;
+                let version = VersionId{round, attempt};
+                propose(&mut acceptors, &mut p_state, version, msg, &mut state).await?
             }
         }
     }
 }
 
-async fn learn<A, S, E>(acceptors: &mut [A])
+struct ProposerState<S: Learner> {
+    learned: BTreeMap<S::RoundId, StateInner<S>>,
+}
+
+struct StateInner<S: Learner> {
+    attempt: S::AttemptId,
+    accepted: usize,
+    msg: S::Message,
+}
+
+impl<S: Learner> ProposerState<S> {
+    fn prune(&mut self, round_id: S::RoundId) {
+        self.learned.retain(|k, _| *k >= round_id);
+    }
+
+    fn should_propose(&self, round_id: S::RoundId) -> bool {
+        self.learned
+            .last_key_value()
+            .is_none_or(|(k, _)| *k <= round_id)
+    }
+
+    fn min_attempt(&self, round_id: S::RoundId) -> Option<S::AttemptId> {
+        self.learned
+            .first_key_value()
+            .filter(|(k, _)| **k == round_id)
+            .map(|(_, v)| v.attempt)
+    }
+
+    fn push(
+        &mut self,
+        VersionId { round, attempt }: VersionId<S>,
+        accepted: usize,
+        msg: S::Message,
+    ) -> btree_map::OccupiedEntry<'_, S::RoundId, StateInner<S>> {
+        let inner = StateInner {
+            attempt,
+            accepted,
+            msg,
+        };
+        match self.learned.entry(round) {
+            btree_map::Entry::Vacant(entry) => entry.insert_entry(inner),
+            btree_map::Entry::Occupied(mut entry) => {
+                let val = entry.get_mut();
+                if val.attempt < inner.attempt {
+                    *val = inner;
+                } else if val.attempt == inner.attempt {
+                    val.accepted += inner.accepted;
+                    val.msg = inner.msg;
+                }
+                entry
+            }
+        }
+    }
+}
+
+/// Try learn a new value from the acceptors
+///
+/// Must be cancel-safe
+async fn learn<A, S, E>(
+    acceptors: &mut [A],
+    state: &mut ProposerState<S>,
+    round: S::RoundId,
+) -> Result<S::Message, E>
 where
     E: core::error::Error,
     S: Learner<Error = E>,
-    A: Sink<Prepare<S>, Error = E>
-        + Sink<Accept<S>, Error = E>
-        + TryStream<Ok = PromiseOrNack<S>, Error = E>,
+    A: AcceptorConn<S>,
 {
-    
+    let quorum = acceptors.len().div_ceil(2);
+
+    // cancel safe poll fn
+    poll_fn(|cx| {
+        for acceptor in &mut *acceptors {
+            loop {
+                let Poll::Ready(Some(AcceptorMessage {
+                    accepted: id, msg, ..
+                })) = acceptor.try_poll_next_unpin(cx)?
+                else {
+                    break;
+                };
+
+                if id.round <= round {
+                    continue;
+                }
+
+                let entry = state.push(id, 1, msg);
+                if *entry.key() == round && entry.get().accepted >= quorum {
+                    return Poll::Ready(Ok(entry.remove().msg));
+                }
+            }
+        }
+
+        Poll::Pending
+    })
+    .await
 }
 
-// /// A connection to an Acceptor
-// pub trait AcceptorLink {
-//     type Error: core::error::Error;
+async fn propose<A, S, E>(
+    acceptors: &mut [A],
+    p_state: &mut ProposerState<S>,
+    current_id: VersionId<S>,
+    proposal: S::Message,
+    state: &mut S,
+) -> Result<(), E>
+where
+    E: core::error::Error,
+    S: Learner<Error = E>,
+    A: AcceptorConn<S>,
+{
+    let quorum = acceptors.len().div_ceil(2);
 
-//     /// Send a paxos message to the acceptor
-//     ///
-//     /// Must be cancel-safe
-//     async fn send(&mut self, msg: &[u8]) -> Result<(), Self::Error>;
+    // start sending the proposals
+    futures::future::try_join_all(acceptors.iter_mut().map(|a| a.send(Prepare(current_id))))
+        .await?;
 
-//     /// Receive a paxos message from the acceptor
-//     ///
-//     /// Must be cancel-safe
-//     async fn recv(&mut self) -> Result<Vec<u8>, Self::Error>;
-// }
+    let mut accept_stream = futures::stream::iter(&mut *acceptors).flatten_unordered(None);
 
-// struct P {
-//     acceptors: Vec<A>,
-// }
+    let mut ready = 0;
 
-// impl Proposer for P {
-//     type EpochIdentifier = ();
-//     type Acceptor<'a>
-//         = &'a mut A
-//     where
-//         Self: 'a;
+    while ready < quorum
+        && let Some(AcceptorMessage {
+            promised,
+            accepted,
+            msg,
+        }) = accept_stream.try_next().await?
+    {
+        if accepted >= current_id {
+            let entry = p_state.push(accepted, 1, msg);
+            if *entry.key() == current_id.round && entry.get().accepted >= quorum {
+                state.apply(entry.remove().msg).await?;
+            }
 
-//     fn epoch(&self) -> Self::EpochIdentifier {}
+            return Ok(());
+        }
 
-//     fn acceptors(&mut self) -> impl IntoIterator<Item = Self::Acceptor<'_>> {
-//         &mut self.acceptors
-//     }
-// }
+        if promised >= current_id {
+            // make sure this proposal version is tracked.
+            p_state.push(accepted, 0, msg);
+            return Ok(());
+        }
 
-// struct A {}
+        ready += 1;
+    }
 
-// impl AcceptorLink for &mut A {}
+    drop(accept_stream);
+
+    // start sending the accepts
+    futures::future::try_join_all(
+        acceptors
+            .iter_mut()
+            .map(|a| a.send(Accept(current_id, proposal.clone()))),
+    )
+    .await?;
+
+    // make sure this proposal version is tracked.
+    p_state.push(current_id, 0, proposal);
+
+    Ok(())
+}
+
+impl<S: Learner> Copy for VersionId<S> {}
+impl<S: Learner> Clone for VersionId<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: Learner> PartialOrd for VersionId<S> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(Ord::cmp(self, other))
+    }
+}
+
+impl<S: Learner> PartialEq for VersionId<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.round == other.round && self.attempt == other.attempt
+    }
+}
+
+impl<S: Learner> Ord for VersionId<S> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        Ord::cmp(&self.round, &other.round).then_with(|| Ord::cmp(&self.attempt, &other.attempt))
+    }
+}
+
+impl<S: Learner> Eq for VersionId<S> {}
