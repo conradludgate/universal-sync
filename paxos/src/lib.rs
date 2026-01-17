@@ -89,8 +89,9 @@ pub async fn run_proposer<P>(mut p: P, mut state: P::State) -> Result<(), P::Err
 where
     P: Proposer,
 {
-    let mut p_state = ProposerState {
+    let mut p_state = LearningState {
         learned: BTreeMap::new(),
+        acceptors: BTreeMap::new(),
     };
 
     loop {
@@ -117,17 +118,28 @@ where
     }
 }
 
-struct ProposerState<S: Learner> {
-    learned: BTreeMap<S::RoundId, StateInner<S>>,
+struct LearningState<S: Learner, AcceptorId> {
+    learned: BTreeMap<S::RoundId, LearnedState<S>>,
+    acceptors: BTreeMap<AcceptorId, AcceptorState<S>>,
 }
 
-struct StateInner<S: Learner> {
+struct LearnedState<S: Learner> {
     attempt: S::AttemptId,
     accepted: usize,
     msg: S::Message,
 }
 
-impl<S: Learner> ProposerState<S> {
+struct AcceptorState<S: Learner> {
+    accepted: Option<S::RoundId>,
+}
+
+impl<S: Learner> Default for AcceptorState<S> {
+    fn default() -> Self {
+        Self { accepted: None }
+    }
+}
+
+impl<S: Learner, AcceptorId: Ord> LearningState<S, AcceptorId> {
     fn prune(&mut self, round_id: S::RoundId) {
         self.learned.retain(|k, _| *k >= round_id);
     }
@@ -147,11 +159,14 @@ impl<S: Learner> ProposerState<S> {
 
     fn push(
         &mut self,
+        acceptor: AcceptorId,
         VersionId { round, attempt }: VersionId<S>,
         accepted: usize,
         msg: S::Message,
-    ) -> btree_map::OccupiedEntry<'_, S::RoundId, StateInner<S>> {
-        let inner = StateInner {
+    ) -> btree_map::OccupiedEntry<'_, S::RoundId, LearnedState<S>> {
+        self.acceptors.entry(acceptor).or_default().accepted = Some(round);
+
+        let inner = LearnedState {
             attempt,
             accepted,
             msg,
@@ -170,6 +185,16 @@ impl<S: Learner> ProposerState<S> {
             }
         }
     }
+
+    fn min_round(&self) -> Option<S::RoundId> {
+        self.acceptors
+            .iter()
+            .fold(None, |min, (_, s)| match (min, s.accepted) {
+                (None, next) => next,
+                (Some(_), None) => min,
+                (Some(a), Some(b)) => Some(Ord::min(a, b)),
+            })
+    }
 }
 
 /// Try learn a new value from the acceptors
@@ -177,7 +202,7 @@ impl<S: Learner> ProposerState<S> {
 /// Must be cancel-safe
 async fn learn<A, S, E>(
     acceptors: &mut [A],
-    state: &mut ProposerState<S>,
+    state: &mut LearningState<S, A::Id>,
     round: S::RoundId,
 ) -> Result<S::Message, E>
 where
@@ -202,7 +227,7 @@ where
                     continue;
                 }
 
-                let entry = state.push(id, 1, msg);
+                let entry = state.push(acceptor.id(), id, 1, msg);
                 if *entry.key() == round && entry.get().accepted >= quorum {
                     return Poll::Ready(Ok(entry.remove().msg));
                 }
@@ -216,7 +241,7 @@ where
 
 async fn propose<A, S, E>(
     acceptors: &mut [A],
-    p_state: &mut ProposerState<S>,
+    p_state: &mut LearningState<S, A::Id>,
     current_id: VersionId<S>,
     proposal: S::Message,
     state: &mut S,
