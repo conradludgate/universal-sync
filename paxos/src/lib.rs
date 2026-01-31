@@ -1,15 +1,18 @@
 use std::{
     collections::{BTreeMap, btree_map},
     future::poll_fn,
+    sync::{Arc, Mutex},
     task::Poll,
 };
 
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
+use tokio::sync::mpsc;
 
 #[expect(async_fn_in_trait)]
 pub trait Learner {
     type RoundId: Copy + Ord + 'static;
     type AttemptId: Copy + Ord + 'static;
+    type PropopserId: Copy + Ord + 'static;
 
     type Message: Clone + Ord + 'static;
     type Error: core::error::Error;
@@ -25,6 +28,7 @@ pub trait Learner {
 pub struct VersionId<S: Learner> {
     pub round: S::RoundId,
     pub attempt: S::AttemptId,
+    pub proposer: S::PropopserId,
 }
 
 /// A proposer
@@ -118,15 +122,28 @@ where
     }
 }
 
+struct SharedLearningState<S: Learner, AcceptorId> {
+    state: Mutex<LearningState<S, AcceptorId>>,
+    changes: mpsc::Sender<S::Message>,
+    proposer: Option<ProposerState<S, AcceptorId>>,
+}
+
 struct LearningState<S: Learner, AcceptorId> {
+    round: S::RoundId,
+    quorum: usize,
     learned: BTreeMap<S::RoundId, LearnedState<S>>,
     acceptors: BTreeMap<AcceptorId, AcceptorState<S>>,
 }
 
 struct LearnedState<S: Learner> {
-    attempt: S::AttemptId,
+    version: VersionId<S>,
     accepted: usize,
     msg: S::Message,
+}
+
+struct ProposerState<S: Learner, AcceptorId> {
+    proposer: S::PropopserId,
+    proposed: mpsc::Sender<(AcceptorId, VersionId<S>)>,
 }
 
 struct AcceptorState<S: Learner> {
@@ -160,24 +177,24 @@ impl<S: Learner, AcceptorId: Ord> LearningState<S, AcceptorId> {
     fn push(
         &mut self,
         acceptor: AcceptorId,
-        VersionId { round, attempt }: VersionId<S>,
+        version: VersionId<S>,
         accepted: usize,
         msg: S::Message,
     ) -> btree_map::OccupiedEntry<'_, S::RoundId, LearnedState<S>> {
-        self.acceptors.entry(acceptor).or_default().accepted = Some(round);
+        self.acceptors.entry(acceptor).or_default().accepted = Some(version.round);
 
         let inner = LearnedState {
-            attempt,
+            version,
             accepted,
             msg,
         };
-        match self.learned.entry(round) {
+        match self.learned.entry(version.round) {
             btree_map::Entry::Vacant(entry) => entry.insert_entry(inner),
             btree_map::Entry::Occupied(mut entry) => {
                 let val = entry.get_mut();
-                if val.attempt < inner.attempt {
+                if val.version < inner.version {
                     *val = inner;
-                } else if val.attempt == inner.attempt {
+                } else if val.version == inner.version {
                     val.accepted += inner.accepted;
                     val.msg = inner.msg;
                 }
@@ -195,6 +212,55 @@ impl<S: Learner, AcceptorId: Ord> LearningState<S, AcceptorId> {
                 (Some(a), Some(b)) => Some(Ord::min(a, b)),
             })
     }
+}
+
+// Handle Acceptor -> Learner flow
+async fn learn2<Id, A, S>(
+    state: Arc<SharedLearningState<S, Id>>,
+    acceptor_id: Id,
+    mut acceptor: A,
+) -> Result<(), S::Error>
+where
+    A: Stream<Item = Result<AcceptorMessage<S>, S::Error>> + Unpin,
+    S: Learner,
+    Id: Copy + Ord,
+{
+    let SharedLearningState {
+        state,
+        changes,
+        proposer,
+    } = &*state;
+    {
+        let mut state = state.lock().unwrap();
+        state.acceptors.entry(acceptor_id).or_default();
+    }
+
+    while let Some(msg) = acceptor.try_next().await? {
+        let AcceptorMessage {
+            promised,
+            accepted,
+            msg,
+        } = msg;
+
+        let Ok(permit) = changes.reserve().await else {
+            break;
+        };
+
+        let mut state = state.lock().unwrap();
+        let round = state.round;
+        let quorum = state.quorum;
+
+        if accepted.round <= round {
+            continue;
+        }
+
+        let entry = state.push(acceptor_id, accepted, 1, msg);
+        if *entry.key() == round && entry.get().accepted >= quorum {
+            permit.send(entry.remove().msg);
+        }
+    }
+
+    Ok(())
 }
 
 /// Try learn a new value from the acceptors
@@ -317,13 +383,17 @@ impl<S: Learner> PartialOrd for VersionId<S> {
 
 impl<S: Learner> PartialEq for VersionId<S> {
     fn eq(&self, other: &Self) -> bool {
-        self.round == other.round && self.attempt == other.attempt
+        self.round == other.round
+            && self.attempt == other.attempt
+            && self.proposer == other.proposer
     }
 }
 
 impl<S: Learner> Ord for VersionId<S> {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        Ord::cmp(&self.round, &other.round).then_with(|| Ord::cmp(&self.attempt, &other.attempt))
+        Ord::cmp(&self.round, &other.round)
+            .then_with(|| Ord::cmp(&self.attempt, &other.attempt))
+            .then_with(|| Ord::cmp(&self.proposer, &other.proposer))
     }
 }
 

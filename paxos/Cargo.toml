@@ -7,3 +7,4 @@ edition = "2024"
 zerocopy.workspace = true
 tokio.workspace = true
 futures.workspace = true
+scopeguard.workspace = true

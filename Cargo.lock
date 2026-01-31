@@ -7,6 +7,7 @@ name = "basic-paxos"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "scopeguard",
  "tokio",
  "zerocopy",
 ]
