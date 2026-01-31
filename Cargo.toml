@@ -1,5 +1,6 @@
 [workspace]
 members = ["paxos", "sync"]
+resolver = "3"
 
 [workspace.dependencies]
 zerocopy = { version = "0.8", features = ["derive"] }
