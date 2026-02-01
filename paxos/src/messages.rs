@@ -51,8 +51,8 @@ impl<L: Learner> Clone for AcceptorRequest<L> {
     ))
 )]
 pub struct AcceptorMessage<L: Learner> {
-    /// Highest proposal this acceptor has promised (proposers only)
-    pub promised: Option<L::Proposal>,
+    /// Highest proposal this acceptor has promised
+    pub promised: L::Proposal,
     /// Highest accepted proposal + message
     pub accepted: Option<(L::Proposal, L::Message)>,
 }
@@ -76,10 +76,17 @@ impl<L: Learner> Clone for AcceptorMessage<L> {
     }
 }
 
-impl<L: Learner> From<RoundState<L>> for AcceptorMessage<L> {
-    fn from(state: RoundState<L>) -> Self {
+impl<L: Learner> AcceptorMessage<L> {
+    /// Create a response from round state.
+    ///
+    /// # Panics
+    /// Panics if `promised` is None, which should never happen for valid responses.
+    #[must_use]
+    pub fn from_round_state(state: RoundState<L>) -> Self {
         Self {
-            promised: state.promised,
+            promised: state
+                .promised
+                .expect("response must have a promised proposal"),
             accepted: state.accepted,
         }
     }

@@ -159,7 +159,7 @@ pub trait Acceptor: Learner {
 ///
 /// For crash recovery, implementations should:
 /// 1. Persist state BEFORE returning success from `promise()`/`accept()`
-/// 2. Use fsync/sync_all to ensure durability
+/// 2. Use `fsync`/`sync_all` to ensure durability
 /// 3. On restart, reload state before accepting new requests
 ///
 /// # Concurrency Safety

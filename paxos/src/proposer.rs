@@ -88,6 +88,7 @@ impl<L: Learner> Clone for CoordinatorState<L> {
 /// This task lives as long as the acceptor is in the active set.
 /// It handles connection lifecycle and responds to coordinator commands.
 #[instrument(skip_all, name = "actor", fields(node_id = ?proposer_id, acceptor = ?acceptor_id))]
+#[allow(clippy::too_many_lines)]
 async fn run_actor<L, C>(
     proposer_id: <L::Proposal as Proposal>::NodeId,
     acceptor_id: <L::Proposal as Proposal>::NodeId,
@@ -108,17 +109,13 @@ async fn run_actor<L, C>(
     loop {
         // Wait for state change
         let state = {
-            match state_rx.wait_for(|s| s.seq != last_seq).await {
-                Ok(state) => {
-                    last_seq = state.seq;
-                    trace!(seq = last_seq, "actor received state change");
-                    state.clone()
-                }
-                Err(_) => {
-                    trace!("actor stopping: coordinator dropped");
-                    return;
-                }
-            }
+            let Ok(state) = state_rx.wait_for(|s| s.seq != last_seq).await else {
+                trace!("actor stopping: coordinator dropped");
+                return;
+            };
+            last_seq = state.seq;
+            trace!(seq = last_seq, "actor received state change");
+            state.clone()
         };
 
         match state.command {
@@ -136,17 +133,13 @@ async fn run_actor<L, C>(
                     let Some(Ok(msg)) = conn.next().await else {
                         break None;
                     };
-                    if let Some(promised) = &msg.promised {
-                        // Only accept promises for our proposal or higher
-                        // (lower = stale from previous prepare)
-                        if promised.key() >= proposal_key {
-                            trace!("actor received promise");
-                            break Some(msg);
-                        }
-                        trace!("actor received stale promise, waiting for current");
-                    } else {
-                        trace!("actor received non-promise message, waiting for promise");
+                    // Only accept promises for our proposal or higher
+                    // (lower = stale from previous prepare)
+                    if msg.promised.key() >= proposal_key {
+                        trace!("actor received promise");
+                        break Some(msg);
                     }
+                    trace!("actor received stale promise, waiting for current");
                 };
 
                 let Some(promise) = promise else {
@@ -406,16 +399,12 @@ where
                     }
                 }
                 msg = messages.next() => {
-                    match msg {
-                        Some(msg) => {
-                            debug!("received message to propose");
-                            break msg;
-                        }
-                        None => {
-                            debug!("message stream closed, proposer exiting");
-                            return Ok(());
-                        }
-                    }
+                    let Some(msg) = msg else {
+                        debug!("message stream closed, proposer exiting");
+                        return Ok(());
+                    };
+                    debug!("received message to propose");
+                    break msg;
                 }
             }
         };
@@ -480,6 +469,7 @@ fn process_background_message<L: Learner>(
 }
 
 /// Run a single proposal attempt through both phases
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_proposal<L, C, S>(
     manager: &ActorManager<L, C>,
     msg_rx: &mut mpsc::UnboundedReceiver<ActorMessage<L>>,
@@ -577,11 +567,9 @@ where
             };
         }
 
-        let Some(promised_p) = msg.promised else {
-            continue;
-        };
+        let promised_p = &msg.promised;
 
-        if !learner.validate(&promised_p) {
+        if !learner.validate(promised_p) {
             trace!("ignoring invalid promise");
             continue;
         }

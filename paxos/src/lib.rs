@@ -14,6 +14,7 @@
 mod acceptor;
 mod config;
 mod connection;
+pub mod core;
 mod learner;
 mod messages;
 mod proposer;

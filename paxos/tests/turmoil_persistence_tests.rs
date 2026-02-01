@@ -27,124 +27,8 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 use turmoil::Builder;
 use turmoil::fs::shim::std::fs::{self, File, OpenOptions};
 
-/// Initialize tracing for tests.
-/// Post-processes a Chrome trace file to assign different pids based on node_id.
-/// This makes each proposer/acceptor/learner appear as a separate "process" in Perfetto.
-fn postprocess_trace(path: &std::path::Path) {
-    use std::collections::HashMap;
-    use std::fs;
-
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
-    };
-
-    let Ok(mut trace): Result<serde_json::Value, _> = serde_json::from_str(&content) else {
-        return;
-    };
-
-    let mut node_to_pid: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut actor_to_tid: HashMap<(String, String), (u64, u64)> = HashMap::new();
-    let mut next_pid = 0u64;
-
-    let mut last_pid = 0;
-    let mut last_tid = 0;
-
-    // Process each event and rewrite pid based on node_id
-    if let Some(events) = trace.as_array_mut() {
-        for event in events.iter_mut() {
-            if let Some(obj) = event.as_object_mut() {
-                let Some(args) = obj.get("args") else {
-                    continue;
-                };
-
-                // for events, take the last pid and tid
-                if args.get("message").is_some() {
-                    obj.insert("pid".to_string(), serde_json::json!(last_pid));
-                    obj.insert("tid".to_string(), serde_json::json!(last_tid));
-                    continue;
-                }
-
-                let Some(node_id) = args.get("node_id").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let peer = args
-                    .get("acceptor")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| args.get("proposer").and_then(|v| v.as_str()));
-
-                let &mut (pid, ref mut next_tid) =
-                    node_to_pid.entry(node_id.to_string()).or_insert_with(|| {
-                        next_pid += 1;
-                        (next_pid, 1)
-                    });
-
-                let (_, tid) = if let Some(peer) = peer {
-                    *actor_to_tid
-                        .entry((node_id.to_string(), peer.to_string()))
-                        .or_insert_with(|| {
-                            *next_tid += 1;
-                            (pid, *next_tid)
-                        })
-                } else {
-                    (pid, 1)
-                };
-
-                last_pid = pid;
-                last_tid = tid;
-
-                obj.insert("pid".to_string(), serde_json::json!(pid));
-                obj.insert("tid".to_string(), serde_json::json!(tid));
-            }
-        }
-
-        // Add process_name metadata events
-        let mut metadata_events = Vec::new();
-        for (name, (pid, _)) in &node_to_pid {
-            metadata_events.push(serde_json::json!({
-                "name": "process_name",
-                "ph": "M",
-                "pid": pid,
-                "args": { "name": name }
-            }));
-        }
-        for ((_, peer), (pid, tid)) in &actor_to_tid {
-            metadata_events.push(serde_json::json!({
-                "name": "thread_name",
-                "ph": "M",
-                "pid": pid,
-                "tid": tid,
-                "args": { "name": peer },
-            }));
-        }
-        events.extend(metadata_events);
-    }
-
-    // Write back
-    if let Ok(output) = serde_json::to_string(&trace) {
-        let _ = fs::write(path, output);
-    }
-}
-
-/// Guard that post-processes the trace file on drop.
-struct TracePostProcessor {
-    path: std::path::PathBuf,
-    // Option so we can take and drop it explicitly before post-processing
-    chrome_guard: Option<tracing_chrome::FlushGuard>,
-}
-
-impl Drop for TracePostProcessor {
-    fn drop(&mut self) {
-        // Drop chrome guard first to flush the trace file
-        drop(self.chrome_guard.take());
-        // Now post-process the flushed file
-        postprocess_trace(&self.path);
-        eprintln!("Trace post-processed: {}", self.path.display());
-    }
-}
-
 fn init_tracing() -> impl Sized {
     use tracing::Dispatch;
-    // use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
@@ -159,11 +43,6 @@ fn init_tracing() -> impl Sized {
     ));
     eprintln!("Trace file: {}", trace_file.display());
 
-    // let (chrome_layer, chrome_guard) = ChromeLayerBuilder::new()
-    //     .file(&trace_file)
-    //     .include_args(true)
-    //     .build();
-
     let fmt_layer = fmt::layer()
         .with_test_writer()
         .with_span_events(fmt::format::FmtSpan::CLOSE);
@@ -172,19 +51,9 @@ fn init_tracing() -> impl Sized {
         .unwrap_or_else(|_| EnvFilter::new("basic_paxos=debug,turmoil_persistence_tests=debug"));
 
     let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
-    // .with(chrome_layer);
 
     let dispatch = Dispatch::new(subscriber);
-    let default_guard = tracing::dispatcher::set_default(&dispatch);
-
-    // // Return guards - TracePostProcessor will post-process on drop
-    // let postprocessor = TracePostProcessor {
-    //     path: trace_file,
-    //     chrome_guard: Some(chrome_guard),
-    // };
-    let postprocessor = ();
-
-    (default_guard, postprocessor)
+    tracing::dispatcher::set_default(&dispatch)
 }
 
 const ACCEPTOR_PORT: u16 = 9999;

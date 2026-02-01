@@ -1,7 +1,6 @@
 //! Shared acceptor state implementation
 
 use std::{
-    collections::BTreeMap,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, ready},
@@ -10,7 +9,19 @@ use std::{
 use futures::Stream;
 use tokio::sync::broadcast;
 
-use crate::{AcceptorStateStore, Learner, Proposal};
+use crate::core::{AcceptResult, AcceptorCore, PrepareResult};
+use crate::{AcceptorStateStore, Learner, Proposal, ProposalKey};
+
+/// Type alias for the core state machine with Learner-specific types
+type CoreState<L> = AcceptorCore<
+    <<L as Learner>::Proposal as Proposal>::RoundId,
+    ProposalKey<<L as Learner>::Proposal>,
+    <L as Learner>::Message,
+>;
+
+/// Type alias for the proposal map
+type ProposalMap<L> =
+    std::collections::BTreeMap<ProposalKey<<L as Learner>::Proposal>, <L as Learner>::Proposal>;
 
 /// Per-round acceptor state.
 ///
@@ -40,17 +51,22 @@ impl<L: Learner> Default for RoundState<L> {
     }
 }
 
-/// Inner state type: map from round to round state.
-type StateMap<L> = BTreeMap<<<L as Learner>::Proposal as Proposal>::RoundId, RoundState<L>>;
-
 /// Default in-memory shared acceptor state using `Arc<Mutex>`
 ///
 /// Tracks state per-round to support Multi-Paxos.
 /// Also broadcasts accepted proposals to subscribed learners.
+///
+/// Uses [`AcceptorCore`] for the pure state machine logic, adding:
+/// - Thread-safe synchronization via `Arc<Mutex>`
+/// - Broadcast channel for learner notifications
 #[derive(Clone)]
 pub struct SharedAcceptorState<L: Learner> {
-    inner: Arc<Mutex<StateMap<L>>>,
+    /// Pure state machine core - contains promised/accepted maps
+    core: Arc<Mutex<CoreState<L>>>,
+    /// Broadcast channel for notifying learners of accepted values
     broadcast: broadcast::Sender<(L::Proposal, L::Message)>,
+    /// Map from `ProposalKey` back to full Proposal (needed for API compatibility)
+    proposals: Arc<Mutex<ProposalMap<L>>>,
 }
 
 impl<L: Learner> Default for SharedAcceptorState<L> {
@@ -71,28 +87,42 @@ impl<L: Learner> SharedAcceptorState<L> {
     pub fn with_capacity(capacity: usize) -> Self {
         let (broadcast, _) = broadcast::channel(capacity);
         Self {
-            inner: Arc::new(Mutex::new(BTreeMap::new())),
+            core: Arc::new(Mutex::new(AcceptorCore::new())),
             broadcast,
+            proposals: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
     /// Create with initial accepted state (e.g., loaded from persistence)
     #[must_use]
-    pub fn with_accepted(proposal: L::Proposal, message: L::Message) -> Self {
-        let mut map = BTreeMap::new();
+    pub fn with_accepted(proposal: &L::Proposal, message: &L::Message) -> Self {
+        let mut core = AcceptorCore::new();
         let round = proposal.round();
-        map.insert(
-            round,
-            RoundState {
-                promised: Some(proposal.clone()),
-                accepted: Some((proposal, message)),
-            },
-        );
+        let key = proposal.key();
+        core.promised.insert(round, key);
+        core.accepted.insert(round, (key, message.clone()));
+
+        let mut proposals = std::collections::BTreeMap::new();
+        proposals.insert(key, proposal.clone());
+
         let (broadcast, _) = broadcast::channel(16);
         Self {
-            inner: Arc::new(Mutex::new(map)),
+            core: Arc::new(Mutex::new(core)),
             broadcast,
+            proposals: Arc::new(Mutex::new(proposals)),
         }
+    }
+
+    /// Store a proposal for later retrieval
+    fn store_proposal(&self, proposal: &L::Proposal) {
+        let mut proposals = self.proposals.lock().unwrap();
+        proposals.insert(proposal.key(), proposal.clone());
+    }
+
+    /// Get a stored proposal by key
+    fn get_proposal(&self, key: &ProposalKey<L::Proposal>) -> Option<L::Proposal> {
+        let proposals = self.proposals.lock().unwrap();
+        proposals.get(key).cloned()
     }
 }
 
@@ -122,44 +152,59 @@ where
     type Receiver = AcceptorReceiver<L>;
 
     fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L> {
-        let inner = self.inner.lock().unwrap();
-        inner.get(&round).cloned().unwrap_or_default()
+        let core = self.core.lock().unwrap();
+        let (promised_key, accepted) = core.get(round);
+
+        RoundState {
+            promised: promised_key.and_then(|k| self.get_proposal(&k)),
+            accepted: accepted.and_then(|(k, m)| self.get_proposal(&k).map(|p| (p, m))),
+        }
     }
 
     fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>> {
-        let mut inner = self.inner.lock().unwrap();
-        let round = proposal.round();
-        let state = inner.entry(round).or_default();
-        let dominated = state
-            .promised
-            .as_ref()
-            .is_some_and(|p| p.key() > proposal.key());
-        if dominated {
-            return Err(state.clone());
-        }
+        self.store_proposal(proposal);
 
-        state.promised = Some(proposal.clone());
-        Ok(())
+        let mut core = self.core.lock().unwrap();
+        let round = proposal.round();
+        let key = proposal.key();
+
+        match core.prepare(round, key) {
+            PrepareResult::Promised { .. } => Ok(()),
+            PrepareResult::Rejected {
+                promised: promised_key,
+                accepted,
+            } => {
+                drop(core); // Release lock before calling get_proposal
+                Err(RoundState {
+                    promised: self.get_proposal(&promised_key),
+                    accepted: accepted.and_then(|(k, m)| self.get_proposal(&k).map(|p| (p, m))),
+                })
+            }
+        }
     }
 
     fn accept(&self, proposal: &L::Proposal, message: &L::Message) -> Result<(), RoundState<L>> {
-        let mut inner = self.inner.lock().unwrap();
+        self.store_proposal(proposal);
+
+        let mut core = self.core.lock().unwrap();
         let round = proposal.round();
-        let state = inner.entry(round).or_default();
-        let dominated = state
-            .promised
-            .as_ref()
-            .is_some_and(|p| p.key() > proposal.key());
-        if dominated {
-            return Err(state.clone());
+        let key = proposal.key();
+
+        match core.accept(round, key, message.clone()) {
+            AcceptResult::Accepted { .. } => {
+                // Broadcast to learners (ignore errors - no receivers is ok)
+                let _ = self.broadcast.send((proposal.clone(), message.clone()));
+                Ok(())
+            }
+            AcceptResult::Rejected => {
+                let (promised_key, accepted) = core.get(round);
+                drop(core); // Release lock before calling get_proposal
+                Err(RoundState {
+                    promised: promised_key.and_then(|k| self.get_proposal(&k)),
+                    accepted: accepted.and_then(|(k, m)| self.get_proposal(&k).map(|p| (p, m))),
+                })
+            }
         }
-
-        state.accepted = Some((proposal.clone(), message.clone()));
-        state.promised = Some(proposal.clone());
-
-        // Broadcast to learners (ignore errors - no receivers is ok)
-        let _ = self.broadcast.send((proposal.clone(), message.clone()));
-        Ok(())
     }
 
     fn subscribe(&self) -> Self::Receiver {
@@ -172,18 +217,15 @@ where
         &self,
         from_round: <L::Proposal as Proposal>::RoundId,
     ) -> Vec<(L::Proposal, L::Message)> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .range(from_round..)
-            .filter_map(|(_, state)| state.accepted.clone())
+        let core = self.core.lock().unwrap();
+        core.accepted_from(from_round)
+            .into_iter()
+            .filter_map(|(k, m)| self.get_proposal(&k).map(|p| (p, m)))
             .collect()
     }
 
     fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .iter()
-            .rev()
-            .find_map(|(round, state)| state.accepted.as_ref().map(|_| *round))
+        let core = self.core.lock().unwrap();
+        core.highest_accepted_round()
     }
 }

@@ -84,8 +84,9 @@ where
                 continue;
             }
             trace!(round = ?p.round(), "sending historical value");
+            // For historical values, the accepted proposal is also the promised one
             conn.send(AcceptorMessage {
-                promised: None,
+                promised: p.clone(),
                 accepted: Some((p, m)),
             })
             .await?;
@@ -93,7 +94,8 @@ where
 
         // Then send the promise response
         trace!("sending promise response");
-        conn.send(round_state.into()).await?;
+        conn.send(AcceptorMessage::from_round_state(round_state))
+            .await?;
 
         break from_round;
     };
@@ -141,8 +143,9 @@ where
                 // Only forward if it's >= our sync point
                 if proposal.round() >= from_round {
                     trace!(round = ?proposal.round(), "forwarding broadcast");
+                    // For broadcast accepts, the accepted proposal is also the promised one
                     conn.send(AcceptorMessage {
-                        promised: None,
+                        promised: proposal.clone(),
                         accepted: Some((proposal, message)),
                     }).await?;
                 }
@@ -182,7 +185,8 @@ where
                 }
             };
 
-            conn.send(round_state.into()).await?;
+            conn.send(AcceptorMessage::from_round_state(round_state))
+                .await?;
         }
         AcceptorRequest::Accept(proposal, message) => {
             trace!(round = ?proposal.round(), "received accept");
@@ -203,7 +207,8 @@ where
                 }
             };
 
-            conn.send(round_state.into()).await?;
+            conn.send(AcceptorMessage::from_round_state(round_state))
+                .await?;
         }
     }
 
