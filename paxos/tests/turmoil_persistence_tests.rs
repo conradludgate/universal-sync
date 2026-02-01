@@ -15,7 +15,7 @@ use std::{
 
 use basic_paxos::{
     Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, BackoffConfig, Connector,
-    Learner, Proposal, ProposerConfig, RoundState, Sleep, run_acceptor, run_learner, run_proposer,
+    Learner, Proposal, Proposer, ProposerConfig, RoundState, Sleep, run_acceptor, run_proposer,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures::Stream;
@@ -267,7 +267,6 @@ impl<Enc, Dec: serde::de::DeserializeOwned> Decoder for PostcardCodec<Enc, Dec> 
 
 type ProposerCodec = PostcardCodec<AcceptorRequest<TestState>, AcceptorMessage<TestState>>;
 type AcceptorCodec = PostcardCodec<AcceptorMessage<TestState>, AcceptorRequest<TestState>>;
-type LearnerCodec = ProposerCodec;
 
 type ProposerConn = Framed<turmoil::net::TcpStream, ProposerCodec>;
 
@@ -696,18 +695,6 @@ fn start_persistent_acceptor(
     });
 }
 
-async fn connect_to_acceptors(
-    names: &[&str],
-) -> io::Result<Vec<Framed<turmoil::net::TcpStream, LearnerCodec>>> {
-    let mut connections = Vec::new();
-    for name in names {
-        let addr = SocketAddr::new(turmoil::lookup(*name), ACCEPTOR_PORT);
-        let stream = turmoil::net::TcpStream::connect(addr).await?;
-        connections.push(Framed::new(stream, LearnerCodec::default()));
-    }
-    Ok(connections)
-}
-
 // --- Tests ---
 
 /// Test that acceptors can crash and recover, maintaining consensus.
@@ -822,8 +809,16 @@ fn persistence_with_acceptor_bounce() {
         let mut state = TestState::new(learner_node_id("learner-1"), acceptor_addrs);
         state.learned = l1_learned;
 
-        let connections = connect_to_acceptors(ACCEPTOR_NAMES).await?;
-        run_learner(state, connections).await?;
+        // Run learner using Proposer::learn_one()
+        let mut proposer = Proposer::new(state.node_id(), TcpConnector::new());
+        proposer.sync_actors(state.acceptors());
+        proposer.start_sync(&state);
+        loop {
+            let Some((p, m)) = proposer.learn_one(&state).await else {
+                break;
+            };
+            state.apply(p, m).await?;
+        }
 
         tracing::info!("learner-1 completed");
         Ok(())
@@ -835,8 +830,16 @@ fn persistence_with_acceptor_bounce() {
         let mut state = TestState::new(learner_node_id("learner-2"), acceptor_addrs);
         state.learned = l2_learned;
 
-        let connections = connect_to_acceptors(ACCEPTOR_NAMES).await?;
-        run_learner(state, connections).await?;
+        // Run learner using Proposer::learn_one()
+        let mut proposer = Proposer::new(state.node_id(), TcpConnector::new());
+        proposer.sync_actors(state.acceptors());
+        proposer.start_sync(&state);
+        loop {
+            let Some((p, m)) = proposer.learn_one(&state).await else {
+                break;
+            };
+            state.apply(p, m).await?;
+        }
 
         tracing::info!("learner-2 completed");
         Ok(())

@@ -46,8 +46,10 @@ impl<L: Learner> QuorumTracker<L> {
         }
     }
 
-    /// Check if a specific round has reached quorum and return the value if so.
-    pub fn get_with_quorum(
+    /// Check if any proposal for the given round has reached quorum.
+    ///
+    /// Returns `Some((&proposal, &message))` if quorum was reached, `None` otherwise.
+    pub fn check_quorum(
         &self,
         round: <L::Proposal as Proposal>::RoundId,
     ) -> Option<(&L::Proposal, &L::Message)> {
@@ -55,11 +57,6 @@ impl<L: Learner> QuorumTracker<L> {
             .iter()
             .find(|(k, (count, _, _))| k.round() == round && *count >= self.quorum)
             .map(|(_, (_, proposal, message))| (proposal, message))
-    }
-
-    /// Clear all entries for a given round.
-    pub fn clear_round(&mut self, round: <L::Proposal as Proposal>::RoundId) {
-        self.counts.retain(|k, _| k.round() != round);
     }
 
     /// Get the quorum threshold.

@@ -14,8 +14,8 @@ use std::{
 };
 
 use basic_paxos::{
-    Acceptor, AcceptorMessage, AcceptorRequest, BackoffConfig, Connector, Learner, LearnerSession,
-    Proposal, ProposerConfig, SharedAcceptorState, Sleep, run_acceptor, run_learner, run_proposer,
+    Acceptor, AcceptorMessage, AcceptorRequest, BackoffConfig, Connector, Learner, Proposal,
+    Proposer, ProposerConfig, SharedAcceptorState, Sleep, run_acceptor, run_proposer,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, Stream, channel::mpsc};
@@ -802,9 +802,6 @@ fn turmoil_high_latency_acceptor() {
     assert_eq!(learned.get(&0).unwrap().message, "value-with-slow-acceptor");
 }
 
-/// Codec for learner-side: same as ProposerCodec (encodes AcceptorRequest, decodes AcceptorMessage)
-type LearnerCodec = ProposerCodec;
-
 // --- Learner Tests ---
 
 /// Helper: start an acceptor host with both proposer and learner listener support
@@ -832,19 +829,6 @@ fn start_acceptor_with_learner_support(
             });
         }
     });
-}
-
-/// Helper: connect to all acceptors' learner ports
-async fn connect_to_all_acceptors(
-    names: &[&str],
-) -> std::result::Result<Vec<Framed<turmoil::net::TcpStream, LearnerCodec>>, io::Error> {
-    let mut connections = Vec::new();
-    for name in names {
-        let addr = SocketAddr::new(turmoil::lookup(*name), ACCEPTOR_PORT);
-        let stream = turmoil::net::TcpStream::connect(addr).await?;
-        connections.push(Framed::new(stream, LearnerCodec::default()));
-    }
-    Ok(connections)
 }
 
 #[test]
@@ -906,16 +890,23 @@ fn turmoil_learner_sync() {
         // Wait for proposer to finish
         let _ = (&mut done_rx).await;
 
-        // Connect to ALL acceptors' learner ports
-        let connections = connect_to_all_acceptors(ACCEPTOR_NAMES).await?;
-
-        let mut state = TestState::new(proposer_node_id("learner"), vec![]);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("learner"), acceptor_addrs);
         state.learned = learner_learned_clone;
 
-        let mut session = LearnerSession::new(&state, connections).await?;
-        while session.learn_one(&mut state).await?.is_some()
-            && state.learned.lock().unwrap().len() < 3
-        {}
+        // Run learner using Proposer::learn_one()
+        let mut proposer = Proposer::new(state.node_id(), TcpConnector::new());
+        proposer.sync_actors(state.acceptors());
+        proposer.start_sync(&state);
+        loop {
+            let Some((p, m)) = proposer.learn_one(&state).await else {
+                break;
+            };
+            state.apply(p, m).await.unwrap();
+            if state.learned.lock().unwrap().len() >= 3 {
+                break;
+            }
+        }
 
         Ok(())
     });
@@ -970,15 +961,23 @@ fn turmoil_learner_live_broadcast() {
 
     // Learner connects to ALL acceptors FIRST (before proposer commits)
     sim.client("learner", async move {
-        // Connect to ALL acceptors' learner ports immediately
-        let connections = connect_to_all_acceptors(ACCEPTOR_NAMES).await?;
-
-        let mut state = TestState::new(proposer_node_id("learner"), vec![]);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("learner"), acceptor_addrs);
         state.learned = learner_learned_clone;
 
-        // Run learner with all connections - requires quorum
-        let _ =
-            tokio::time::timeout(Duration::from_secs(10), run_learner(state, connections)).await;
+        // Run learner using Proposer::learn_one() - requires quorum
+        let mut proposer = Proposer::new(state.node_id(), TcpConnector::new());
+        proposer.sync_actors(state.acceptors());
+        proposer.start_sync(&state);
+        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Some((p, m)) = proposer.learn_one(&state).await else {
+                    break;
+                };
+                state.apply(p, m).await.unwrap();
+            }
+        })
+        .await;
 
         Ok(())
     });

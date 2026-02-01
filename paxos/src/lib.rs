@@ -5,9 +5,9 @@
 //!
 //! # Architecture
 //!
-//! - **Proposers**: Drive consensus by proposing values
+//! - **Proposers**: Drive consensus by proposing values (also learn)
 //! - **Acceptors**: Respond to proposals and persist accepted values
-//! - **Learners**: Learn accepted values from acceptors (can sync when offline)
+//! - **Learners**: Proposers that only call [`Proposer::learn_one`], never [`Proposer::propose`]
 
 #![warn(clippy::pedantic)]
 
@@ -15,7 +15,6 @@ mod acceptor;
 mod config;
 mod connection;
 pub mod core;
-mod learner;
 mod messages;
 mod proposer;
 mod quorum;
@@ -25,9 +24,8 @@ mod traits;
 pub use acceptor::run_acceptor;
 pub use config::{BackoffConfig, ProposerConfig, Sleep, TokioSleep};
 pub use connection::LazyConnection;
-pub use learner::{LearnerSession, run_learner};
 pub use messages::{AcceptorMessage, AcceptorRequest};
-pub use proposer::run_proposer;
+pub use proposer::{Proposer, run_proposer};
 pub use state::{AcceptorReceiver, RoundState, SharedAcceptorState};
 pub use traits::{
     Acceptor, AcceptorConn, AcceptorStateStore, Connector, Learner, Proposal, ProposalKey,

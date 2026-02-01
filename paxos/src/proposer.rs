@@ -128,95 +128,109 @@ async fn run_actor<L, C>(
                     continue;
                 }
 
-                // Wait for a valid promise for THIS proposal (skip stale promises from previous prepares)
-                let promise = loop {
+                // Wait for a valid promise for THIS proposal.
+                // Forward ALL messages to coordinator (for learning historical values),
+                // but only break out of the loop when we get our expected promise.
+                loop {
                     let Some(Ok(msg)) = conn.next().await else {
-                        break None;
-                    };
-                    // Only accept promises for our proposal or higher
-                    // (lower = stale from previous prepare)
-                    if msg.promised.key() >= proposal_key {
-                        trace!("actor received promise");
-                        break Some(msg);
-                    }
-                    trace!("actor received stale promise, waiting for current");
-                };
-
-                let Some(promise) = promise else {
-                    warn!("actor connection closed while waiting for promise");
-                    continue;
-                };
-
-                // Send to coordinator
-                let _ = msg_tx.send(ActorMessage {
-                    seq: last_seq,
-                    msg: promise,
-                });
-                trace!("actor sent promise to coordinator");
-
-                // Wait for Accept command
-                'accept_wait: loop {
-                    if state_rx.changed().await.is_err() {
-                        trace!("actor stopping: coordinator dropped during accept_wait");
-                        return;
-                    }
-                    let new_state = state_rx.borrow_and_update().clone();
-
-                    // New round or new seq means restart
-                    if new_state.seq != last_seq {
-                        trace!(
-                            old_seq = last_seq,
-                            new_seq = new_state.seq,
-                            "actor restarting: seq changed"
-                        );
-                        break 'accept_wait;
-                    }
-
-                    if let Command::Accept {
-                        proposal,
-                        message: msg_value,
-                    } = new_state.command
-                    {
-                        let proposal_key = proposal.key();
-                        trace!("actor sending accept");
-
-                        // Send accept
-                        if conn
-                            .send(AcceptorRequest::Accept(proposal, msg_value))
-                            .await
-                            .is_err()
-                        {
-                            warn!("actor accept send failed");
-                            break;
-                        }
-
-                        // Wait for accepted response
-                        let accepted = loop {
-                            let Some(Ok(msg)) = conn.next().await else {
-                                break None;
-                            };
-                            if msg
-                                .accepted
-                                .as_ref()
-                                .is_some_and(|(p, _)| p.key() >= proposal_key)
-                            {
-                                trace!("actor received accepted");
-                                break Some(msg);
-                            }
-                            trace!("actor received non-accepted message, waiting");
-                        };
-
-                        let Some(accepted) = accepted else {
-                            warn!("actor connection closed while waiting for accepted");
-                            break;
-                        };
-
-                        let _ = msg_tx.send(ActorMessage {
-                            seq: last_seq,
-                            msg: accepted,
-                        });
-                        trace!("actor sent accepted to coordinator");
+                        warn!("actor connection closed while waiting for promise");
                         break;
+                    };
+
+                    // Always forward the message to coordinator for potential learning
+                    let _ = msg_tx.send(ActorMessage {
+                        seq: last_seq,
+                        msg: msg.clone(),
+                    });
+
+                    // Only break when we get our expected promise or higher
+                    // (lower = stale from previous prepare, but still useful for learning)
+                    if msg.promised.key() >= proposal_key {
+                        trace!("actor received promise for current proposal");
+                        break;
+                    }
+                    trace!("actor received historical value, forwarded to coordinator");
+                }
+
+                // Wait for Accept command while also forwarding any connection messages
+                // (for learners who need to receive live broadcasts)
+                'accept_wait: loop {
+                    tokio::select! {
+                        biased;
+                        // Check for new commands
+                        result = state_rx.changed() => {
+                            if result.is_err() {
+                                trace!("actor stopping: coordinator dropped during accept_wait");
+                                return;
+                            }
+                            let new_state = state_rx.borrow_and_update().clone();
+
+                            // New round or new seq means restart
+                            if new_state.seq != last_seq {
+                                trace!(
+                                    old_seq = last_seq,
+                                    new_seq = new_state.seq,
+                                    "actor restarting: seq changed"
+                                );
+                                break 'accept_wait;
+                            }
+
+                            if let Command::Accept {
+                                proposal,
+                                message: msg_value,
+                            } = new_state.command
+                            {
+                                let proposal_key = proposal.key();
+                                trace!("actor sending accept");
+
+                                // Send accept
+                                if conn
+                                    .send(AcceptorRequest::Accept(proposal, msg_value))
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("actor accept send failed");
+                                    break 'accept_wait;
+                                }
+
+                                // Wait for accepted response (also forward any other messages)
+                                loop {
+                                    let Some(Ok(msg)) = conn.next().await else {
+                                        warn!("actor connection closed while waiting for accepted");
+                                        break 'accept_wait;
+                                    };
+
+                                    // Always forward the message
+                                    let _ = msg_tx.send(ActorMessage {
+                                        seq: last_seq,
+                                        msg: msg.clone(),
+                                    });
+
+                                    if msg
+                                        .accepted
+                                        .as_ref()
+                                        .is_some_and(|(p, _)| p.key() >= proposal_key)
+                                    {
+                                        trace!("actor received accepted");
+                                        break 'accept_wait;
+                                    }
+                                    trace!("actor received non-accepted message, forwarded");
+                                }
+                            }
+                        }
+                        // Also read from connection and forward any messages (for learners)
+                        msg_result = conn.next() => {
+                            if let Some(Ok(msg)) = msg_result {
+                                let _ = msg_tx.send(ActorMessage {
+                                    seq: last_seq,
+                                    msg,
+                                });
+                                trace!("actor forwarded broadcast message");
+                            } else {
+                                warn!("actor connection closed during accept_wait");
+                                break 'accept_wait;
+                            }
+                        }
                     }
                 }
             }
@@ -239,6 +253,8 @@ enum ProposeResult<L: Learner> {
     Rejected {
         min_attempt: <L::Proposal as Proposal>::AttemptId,
     },
+    /// All connections closed
+    Closed,
 }
 
 /// Manages the set of actor tasks
@@ -343,7 +359,224 @@ where
     }
 }
 
-/// Run the proposer loop.
+// ============================================================================
+// Proposer Struct
+// ============================================================================
+
+/// A proposer/learner that connects to acceptors and drives consensus.
+///
+/// The proposer maintains persistent connections to acceptors via an actor model.
+/// It can be used to either:
+/// - **Propose values**: Call [`propose`](Self::propose) to drive a value to consensus
+/// - **Learn values**: Call [`learn_one`](Self::learn_one) to wait for a quorum-confirmed value
+///
+/// Learners are just proposers that never call `propose()`.
+pub struct Proposer<L: Learner, C: Connector<L>>
+where
+    L::Message: Send + Sync + 'static,
+    C::ConnectFuture: Unpin + Send,
+    C::Connection: Unpin + Send,
+{
+    manager: ActorManager<L, C>,
+    msg_rx: mpsc::UnboundedReceiver<ActorMessage<L>>,
+    attempt: <L::Proposal as Proposal>::AttemptId,
+    /// Quorum tracker for learning - persists across `learn_one` calls to buffer future rounds
+    learn_tracker: Option<QuorumTracker<L>>,
+}
+
+impl<L, C> Proposer<L, C>
+where
+    L: Learner + Send + Sync + 'static,
+    L::Message: Send + Sync + 'static,
+    C: Connector<L> + Send + 'static,
+    C::ConnectFuture: Unpin + Send,
+    C::Connection: Unpin + Send,
+{
+    /// Create a new proposer.
+    ///
+    /// The proposer starts with no active connections. Call [`sync_actors`](Self::sync_actors)
+    /// to establish connections to acceptors.
+    #[must_use]
+    pub fn new(node_id: <L::Proposal as Proposal>::NodeId, connector: C) -> Self {
+        debug!("creating proposer");
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ActorMessage<L>>();
+        let manager = ActorManager::new(node_id, connector, msg_tx);
+        Self {
+            manager,
+            msg_rx,
+            attempt: <L::Proposal as Proposal>::AttemptId::default(),
+            learn_tracker: None,
+        }
+    }
+
+    /// Sync the actor set to match the current acceptors.
+    ///
+    /// Spawns new actors for acceptors not in the current set, and aborts
+    /// actors for acceptors no longer in the set.
+    pub fn sync_actors(
+        &mut self,
+        acceptors: impl IntoIterator<Item = <L::Proposal as Proposal>::NodeId>,
+    ) {
+        self.manager.sync_actors(acceptors);
+    }
+
+    /// Get the number of active acceptor connections.
+    #[must_use]
+    pub fn num_actors(&self) -> usize {
+        self.manager.num_actors()
+    }
+
+    /// Start the sync process by sending a prepare to all acceptors.
+    ///
+    /// This triggers acceptors to send historical values and then stream live updates.
+    /// Call this once before calling `learn_one` in a loop.
+    pub fn start_sync(&mut self, learner: &L) {
+        // Initialize the quorum tracker for learning
+        let num_acceptors = self.manager.num_actors();
+        self.learn_tracker = Some(QuorumTracker::new(num_acceptors));
+
+        // Start a "dummy" prepare to trigger sync from acceptors.
+        // Using default attempt (0) - this is just for sync, not actual proposing.
+        let dummy_proposal = learner.propose(<L::Proposal as Proposal>::AttemptId::default());
+        self.manager.start_prepare(dummy_proposal);
+        debug!(num_acceptors, "started sync");
+    }
+
+    /// Learn one value from acceptors (waits until quorum reached).
+    ///
+    /// Returns `Some((proposal, message))` when a value is learned with quorum,
+    /// or `None` if all connections are closed.
+    ///
+    /// This does not apply the value - the caller is responsible for calling
+    /// `learner.apply()` after receiving the result.
+    ///
+    /// For dedicated learners: call [`start_sync`](Self::start_sync) once before
+    /// calling this in a loop to trigger historical sync.
+    ///
+    /// For proposers: this can be used without `start_sync` to learn from live
+    /// broadcasts while waiting for messages to propose.
+    pub async fn learn_one(&mut self, learner: &L) -> Option<(L::Proposal, L::Message)> {
+        let current_round = learner.current_round();
+
+        // Initialize tracker if needed
+        let num_acceptors = self.manager.num_actors();
+        let tracker = self
+            .learn_tracker
+            .get_or_insert_with(|| QuorumTracker::new(num_acceptors));
+        debug!(?current_round, quorum = tracker.quorum(), "learning");
+
+        // First check if we already have quorum from previously buffered messages
+        if let Some((learned_p, learned_m)) = tracker.check_quorum(current_round) {
+            debug!(?current_round, "learned from buffered messages");
+            return Some((learned_p.clone(), learned_m.clone()));
+        }
+
+        loop {
+            let actor_msg = self.msg_rx.recv().await?;
+
+            // Track all accepted values for rounds >= current_round
+            let Some((proposal, message)) = actor_msg.msg.accepted else {
+                continue;
+            };
+
+            // Skip rounds we've already learned
+            if proposal.round() < current_round {
+                trace!(round = ?proposal.round(), ?current_round, "skipping old round");
+                continue;
+            }
+
+            if !learner.validate(&proposal) {
+                trace!("ignoring invalid proposal");
+                continue;
+            }
+
+            // Track the message (for current or future rounds)
+            let round = proposal.round();
+            trace!(?round, "tracking message");
+            tracker.track(proposal, message);
+
+            // Only return when current_round reaches quorum (to maintain ordering)
+            if let Some((learned_p, learned_m)) = tracker.check_quorum(current_round) {
+                debug!(?current_round, "learned value with quorum");
+                return Some((learned_p.clone(), learned_m.clone()));
+            }
+        }
+    }
+
+    /// Propose a value and drive it to consensus.
+    ///
+    /// Returns the accepted `(proposal, message)` pair. Note that due to Paxos
+    /// semantics, the returned message may be different from the input if a
+    /// higher-numbered proposal was already in progress.
+    ///
+    /// This does not apply the value - the caller is responsible for calling
+    /// `learner.apply()` after receiving the result.
+    ///
+    /// Returns `None` if all connections are closed.
+    pub async fn propose<S: Sleep, R: Rng>(
+        &mut self,
+        learner: &L,
+        message: L::Message,
+        config: &mut ProposerConfig<S, R>,
+    ) -> Option<(L::Proposal, L::Message)> {
+        let round = learner.current_round();
+        let num_acceptors = self.manager.num_actors();
+        let mut tracker: QuorumTracker<L> = QuorumTracker::new(num_acceptors);
+        debug!(?round, quorum = tracker.quorum(), "proposing");
+
+        // Proposal loop with retries
+        for consecutive_rejections in 0.. {
+            let proposal = learner.propose(self.attempt);
+            debug!(attempt = ?self.attempt, consecutive_rejections, "attempting proposal");
+
+            let result = run_proposal(
+                &self.manager,
+                &mut self.msg_rx,
+                learner,
+                proposal.clone(),
+                message.clone(),
+                &mut tracker,
+                round,
+                &config.sleep,
+                config.phase_timeout,
+            )
+            .await;
+
+            match result {
+                ProposeResult::Accepted(proposal, message) => {
+                    debug!("proposal accepted");
+                    self.attempt = <L::Proposal as Proposal>::AttemptId::default();
+                    return Some((proposal, message));
+                }
+                ProposeResult::Rejected { min_attempt } => {
+                    debug!(?min_attempt, "proposal rejected, will retry");
+                    self.attempt = min_attempt;
+                }
+                ProposeResult::Closed => {
+                    debug!("connections closed during proposal");
+                    return None;
+                }
+            }
+
+            // Backoff before retry
+            let backoff = config
+                .backoff
+                .duration(consecutive_rejections, &mut config.rng);
+            trace!(?backoff, "backing off before retry");
+            config.sleep.sleep(backoff).await;
+        }
+
+        unreachable!("infinite loop should return from inside")
+    }
+}
+
+/// Run a proposer loop that proposes messages from a stream.
+///
+/// This is a convenience wrapper around [`Proposer`] that runs a loop:
+/// 1. Wait for a message from `messages` (learning from broadcasts while waiting)
+/// 2. Propose the message
+/// 3. Apply the result
+/// 4. Repeat
 ///
 /// # Errors
 ///
@@ -366,37 +599,27 @@ where
     R: Rng,
 {
     debug!("proposer started");
-    let mut attempt = <L::Proposal as Proposal>::AttemptId::default();
-    let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ActorMessage<L>>();
-    let mut manager: ActorManager<L, C> = ActorManager::new(learner.node_id(), connector, msg_tx);
+    let mut proposer = Proposer::new(learner.node_id(), connector);
 
     loop {
         let round = learner.current_round();
         debug!(?round, "starting new round");
 
-        // Sync actors to current acceptor set
-        manager.sync_actors(learner.acceptors());
-
-        let num_acceptors = manager.num_actors();
-        let mut tracker: QuorumTracker<L> = QuorumTracker::new(num_acceptors);
-        debug!(
-            num_acceptors,
-            quorum = tracker.quorum(),
-            "tracker initialized"
-        );
+        proposer.sync_actors(learner.acceptors());
 
         // Wait for a message to propose, or learn from background
         let msg = loop {
             tokio::select! {
                 biased;
-                Some(actor_msg) = msg_rx.recv() => {
-                    trace!("received background message from actor");
-                    // Process background messages (broadcasts from acceptors)
-                    if let Some((p, m)) = process_background_message(&mut tracker, &learner, actor_msg, round) {
-                        debug!("learned value from background broadcast");
-                        learner.apply(p, m).await?;
-                        attempt = <L::Proposal as Proposal>::AttemptId::default();
-                    }
+                learn_result = proposer.learn_one(&learner) => {
+                    let Some((p, m)) = learn_result else {
+                        debug!("connections closed, proposer exiting");
+                        return Ok(());
+                    };
+                    debug!("learned value from background broadcast");
+                    learner.apply(p, m).await?;
+                    // Continue waiting for message to propose (with updated round)
+                    proposer.sync_actors(learner.acceptors());
                 }
                 msg = messages.next() => {
                     let Some(msg) = msg else {
@@ -409,63 +632,13 @@ where
             }
         };
 
-        // Proposal loop with retries
-        for consecutive_rejections in 0.. {
-            let proposal = learner.propose(attempt);
-            debug!(?attempt, consecutive_rejections, "attempting proposal");
-
-            let result = run_proposal(
-                &manager,
-                &mut msg_rx,
-                &learner,
-                proposal.clone(),
-                msg.clone(),
-                &mut tracker,
-                round,
-                &config.sleep,
-                config.phase_timeout,
-            )
-            .await;
-
-            match result {
-                ProposeResult::Accepted(proposal, message) => {
-                    debug!("proposal accepted");
-                    learner.apply(proposal, message).await?;
-                    attempt = <L::Proposal as Proposal>::AttemptId::default();
-                    break;
-                }
-                ProposeResult::Rejected { min_attempt } => {
-                    debug!(?min_attempt, "proposal rejected, will retry");
-                    attempt = min_attempt;
-                }
-            }
-
-            // Backoff before retry
-            let backoff = config
-                .backoff
-                .duration(consecutive_rejections, &mut config.rng);
-            trace!(?backoff, "backing off before retry");
-            config.sleep.sleep(backoff).await;
-        }
+        // Propose and apply
+        let Some((p, m)) = proposer.propose(&learner, msg, &mut config).await else {
+            debug!("connections closed during proposal, exiting");
+            return Ok(());
+        };
+        learner.apply(p, m).await?;
     }
-}
-
-/// Process a background message (broadcasts)
-fn process_background_message<L: Learner>(
-    tracker: &mut QuorumTracker<L>,
-    learner: &L,
-    actor_msg: ActorMessage<L>,
-    round: <L::Proposal as Proposal>::RoundId,
-) -> Option<(L::Proposal, L::Message)> {
-    let (proposal, message) = actor_msg.msg.accepted?;
-    if proposal.round() != round {
-        return None;
-    }
-    if !learner.validate(&proposal) {
-        return None;
-    }
-    let (learned_p, learned_m) = tracker.track(proposal, message)?;
-    Some((learned_p.clone(), learned_m.clone()))
 }
 
 /// Run a single proposal attempt through both phases
@@ -525,9 +698,7 @@ where
 
         let Some(actor_msg) = actor_msg else {
             debug!("message channel closed during prepare phase");
-            return ProposeResult::Rejected {
-                min_attempt: L::Proposal::next_attempt(proposal.attempt()),
-            };
+            return ProposeResult::Closed;
         };
 
         if actor_msg.seq != seq {
@@ -630,9 +801,7 @@ where
 
         let Some(actor_msg) = actor_msg else {
             debug!("message channel closed during accept phase");
-            return ProposeResult::Rejected {
-                min_attempt: L::Proposal::next_attempt(proposal.attempt()),
-            };
+            return ProposeResult::Closed;
         };
 
         if actor_msg.seq != seq {
