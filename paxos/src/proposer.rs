@@ -13,7 +13,9 @@ use tracing::{debug, instrument, trace, warn};
 
 use crate::{
     AcceptorMessage, AcceptorRequest, Connector, LazyConnection, Learner, Proposal, ProposerConfig,
-    Sleep, quorum::QuorumTracker,
+    Sleep,
+    core::{PreparePhaseResult, ProposerCore},
+    quorum::QuorumTracker,
 };
 
 // ============================================================================
@@ -58,7 +60,11 @@ impl<L: Learner> Default for Command<L> {
 
 /// Messages from actors back to coordinator
 struct ActorMessage<L: Learner> {
+    /// Which acceptor sent this message
+    acceptor_id: <L::Proposal as Proposal>::NodeId,
+    /// Sequence number for this proposal attempt
     seq: u64,
+    /// The actual message
     msg: AcceptorMessage<L>,
 }
 
@@ -139,6 +145,7 @@ async fn run_actor<L, C>(
 
                     // Always forward the message to coordinator for potential learning
                     let _ = msg_tx.send(ActorMessage {
+                        acceptor_id,
                         seq: last_seq,
                         msg: msg.clone(),
                     });
@@ -202,6 +209,7 @@ async fn run_actor<L, C>(
 
                                     // Always forward the message
                                     let _ = msg_tx.send(ActorMessage {
+                                        acceptor_id,
                                         seq: last_seq,
                                         msg: msg.clone(),
                                     });
@@ -222,6 +230,7 @@ async fn run_actor<L, C>(
                         msg_result = conn.next() => {
                             if let Some(Ok(msg)) = msg_result {
                                 let _ = msg_tx.send(ActorMessage {
+                                    acceptor_id,
                                     seq: last_seq,
                                     msg,
                                 });
@@ -381,7 +390,7 @@ where
     msg_rx: mpsc::UnboundedReceiver<ActorMessage<L>>,
     attempt: <L::Proposal as Proposal>::AttemptId,
     /// Quorum tracker for learning - persists across `learn_one` calls to buffer future rounds
-    learn_tracker: Option<QuorumTracker<L>>,
+    learn_tracker: QuorumTracker<L>,
 }
 
 impl<L, C> Proposer<L, C>
@@ -401,11 +410,12 @@ where
         debug!("creating proposer");
         let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ActorMessage<L>>();
         let manager = ActorManager::new(node_id, connector, msg_tx);
+        // Initialize with 0 actors; learn_one() will reset with correct count
         Self {
             manager,
             msg_rx,
             attempt: <L::Proposal as Proposal>::AttemptId::default(),
-            learn_tracker: None,
+            learn_tracker: QuorumTracker::new(0),
         }
     }
 
@@ -431,9 +441,9 @@ where
     /// This triggers acceptors to send historical values and then stream live updates.
     /// Call this once before calling `learn_one` in a loop.
     pub fn start_sync(&mut self, learner: &L) {
-        // Initialize the quorum tracker for learning
+        // Reset the quorum tracker for learning
         let num_acceptors = self.manager.num_actors();
-        self.learn_tracker = Some(QuorumTracker::new(num_acceptors));
+        self.learn_tracker = QuorumTracker::new(num_acceptors);
 
         // Start a "dummy" prepare to trigger sync from acceptors.
         // Using default attempt (0) - this is just for sync, not actual proposing.
@@ -458,11 +468,12 @@ where
     pub async fn learn_one(&mut self, learner: &L) -> Option<(L::Proposal, L::Message)> {
         let current_round = learner.current_round();
 
-        // Initialize tracker if needed
+        // Reinitialize tracker if actor count changed
         let num_acceptors = self.manager.num_actors();
-        let tracker = self
-            .learn_tracker
-            .get_or_insert_with(|| QuorumTracker::new(num_acceptors));
+        if self.learn_tracker.num_acceptors() != num_acceptors {
+            self.learn_tracker = QuorumTracker::new(num_acceptors);
+        }
+        let tracker = &mut self.learn_tracker;
         debug!(?current_round, quorum = tracker.quorum(), "learning");
 
         // First check if we already have quorum from previously buffered messages
@@ -641,7 +652,7 @@ where
     }
 }
 
-/// Run a single proposal attempt through both phases
+/// Run a single proposal attempt through both phases using `ProposerCore`
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_proposal<L, C, S>(
     manager: &ActorManager<L, C>,
@@ -661,17 +672,18 @@ where
     C::Connection: Unpin,
     S: Sleep,
 {
-    let quorum = tracker.quorum();
+    let num_acceptors = manager.num_actors();
     let proposal_key = proposal.key();
+
+    // Initialize ProposerCore for this attempt
+    let mut core = ProposerCore::new(proposal_key, message.clone(), num_acceptors);
+
+    trace!(quorum = core.quorum(), "initialized proposer core");
 
     // Start prepare phase
     manager.start_prepare(proposal.clone());
     let seq = manager.current_seq();
-    trace!(seq, quorum, "collecting promises");
-
-    // Collect promises with optional timeout
-    let mut promises = 0;
-    let mut highest_accepted: Option<(L::Proposal, L::Message)> = None;
+    trace!(seq, quorum = core.quorum(), "collecting promises");
 
     // Create timeout future for prepare phase
     let prepare_timeout = async {
@@ -684,7 +696,8 @@ where
     };
     let mut prepare_timeout = pin!(prepare_timeout);
 
-    loop {
+    // Prepare phase: collect promises
+    let chosen_message = loop {
         let actor_msg = tokio::select! {
             biased;
             msg = msg_rx.recv() => msg,
@@ -709,9 +722,11 @@ where
             );
             continue;
         }
-        let msg = actor_msg.msg;
 
-        // Check for already accepted values in this round
+        let msg = actor_msg.msg;
+        let acceptor_id = actor_msg.acceptor_id;
+
+        // Check for already accepted values in this round (learning from others)
         if let Some((accepted_p, accepted_m)) = msg.accepted.clone()
             && accepted_p.round() == round
             && learner.validate(&accepted_p)
@@ -725,56 +740,49 @@ where
                 return ProposeResult::Accepted(learned_p.clone(), learned_m.clone());
             }
 
+            // Reject if a higher proposal was already accepted in this round
             if accepted_p.key() >= proposal_key {
                 debug!("rejected: higher proposal already accepted");
                 return ProposeResult::Rejected {
                     min_attempt: L::Proposal::next_attempt(accepted_p.attempt()),
                 };
             }
-
-            highest_accepted = match &highest_accepted {
-                Some((h, _)) if h.key() >= accepted_p.key() => highest_accepted,
-                _ => Some((accepted_p, accepted_m)),
-            };
         }
 
         let promised_p = &msg.promised;
 
+        // Validate the promise
         if !learner.validate(promised_p) {
             trace!("ignoring invalid promise");
             continue;
         }
 
-        if promised_p.key() > proposal_key {
-            debug!("rejected: higher proposal promised");
-            return ProposeResult::Rejected {
-                min_attempt: L::Proposal::next_attempt(promised_p.attempt()),
-            };
+        // Use ProposerCore to handle the promise
+        let promised_key = promised_p.key();
+        let accepted = msg.accepted.clone();
+
+        let result = core.handle_promise(acceptor_id, promised_key, accepted, Proposal::key);
+
+        match result {
+            PreparePhaseResult::Quorum { value } => {
+                debug!(quorum = core.quorum(), "prepare phase complete");
+                break value;
+            }
+            PreparePhaseResult::Rejected { superseded_by, .. } => {
+                debug!(?superseded_by, "rejected: higher proposal");
+                return ProposeResult::Rejected {
+                    min_attempt: L::Proposal::next_attempt(superseded_by.attempt()),
+                };
+            }
+            PreparePhaseResult::Pending => {
+                // Need more promises
+            }
         }
+    };
 
-        if promised_p.key() != proposal_key {
-            trace!("ignoring promise for different proposal");
-            continue;
-        }
-
-        promises += 1;
-        trace!(promises, quorum, "received promise");
-        if promises >= quorum {
-            debug!(promises, "prepare phase complete");
-            break;
-        }
-    }
-
-    // Decide what value to accept
-    let message = highest_accepted.map_or(message, |(_, m)| m);
-    let proposal_key = proposal.key();
-
-    // Start accept phase
-    manager.transition_to_accept(proposal.clone(), message.clone());
+    // Start accept phase with the chosen message
+    manager.transition_to_accept(proposal.clone(), chosen_message.clone());
     trace!("collecting accepts");
-
-    // Collect accepts with optional timeout
-    let mut accepts = 0;
 
     // Create timeout future for accept phase
     let accept_timeout = async {
@@ -787,6 +795,7 @@ where
     };
     let mut accept_timeout = pin!(accept_timeout);
 
+    // Accept phase: collect accepts
     loop {
         let actor_msg = tokio::select! {
             biased;
@@ -812,25 +821,37 @@ where
             );
             continue;
         }
-        let msg = actor_msg.msg;
 
-        if let Some((accepted_p, _)) = &msg.accepted {
-            if !learner.validate(accepted_p) {
-                trace!("ignoring invalid accepted");
-                continue;
+        let msg = actor_msg.msg;
+        let acceptor_id = actor_msg.acceptor_id;
+
+        // Get the accepted key if present
+        let Some((accepted_p, _)) = &msg.accepted else {
+            continue;
+        };
+
+        if !learner.validate(accepted_p) {
+            trace!("ignoring invalid accepted");
+            continue;
+        }
+
+        let accepted_key = Some(accepted_p.key());
+
+        let result = core.handle_accepted(acceptor_id, accepted_key, proposal.clone());
+
+        match result {
+            crate::core::AcceptPhaseResult::Learned { proposal, value } => {
+                debug!(quorum = core.quorum(), "accept phase complete");
+                return ProposeResult::Accepted(proposal, value);
             }
-            if accepted_p.key() == proposal_key {
-                accepts += 1;
-                trace!(accepts, quorum, "received accept");
-                if accepts >= quorum {
-                    debug!(accepts, "accept phase complete");
-                    return ProposeResult::Accepted(proposal, message);
-                }
-            } else if accepted_p.key() > proposal_key {
-                debug!("rejected: higher proposal accepted");
+            crate::core::AcceptPhaseResult::Rejected { superseded_by } => {
+                debug!(?superseded_by, "rejected: higher proposal accepted");
                 return ProposeResult::Rejected {
-                    min_attempt: L::Proposal::next_attempt(accepted_p.attempt()),
+                    min_attempt: L::Proposal::next_attempt(superseded_by.attempt()),
                 };
+            }
+            crate::core::AcceptPhaseResult::Pending => {
+                // Need more accepts
             }
         }
     }

@@ -14,6 +14,7 @@ type Key<L> = ProposalKey<<L as Learner>::Proposal>;
 pub struct QuorumTracker<L: Learner> {
     counts: BTreeMap<Key<L>, (usize, L::Proposal, L::Message)>,
     quorum: usize,
+    num_acceptors: usize,
 }
 
 impl<L: Learner> QuorumTracker<L> {
@@ -23,7 +24,14 @@ impl<L: Learner> QuorumTracker<L> {
         Self {
             counts: BTreeMap::new(),
             quorum: (num_acceptors / 2) + 1,
+            num_acceptors,
         }
+    }
+
+    /// Get the number of acceptors this tracker was configured for.
+    #[must_use]
+    pub fn num_acceptors(&self) -> usize {
+        self.num_acceptors
     }
 
     /// Track a (proposal, message) pair. Returns `Some((&proposal, &message))` if quorum

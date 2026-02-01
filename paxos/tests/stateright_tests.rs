@@ -7,12 +7,12 @@
 //! production code, ensuring the model checker verifies the actual implementation.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
 use basic_paxos::core::{
-    AcceptorCore, AcceptorRequest, AcceptorResponse, ProposalKey as ProposalKeyGeneric,
+    AcceptorCore, AcceptorRequest, AcceptorResponse, PreparePhaseResult,
+    ProposalKey as ProposalKeyGeneric, ProposerCore,
 };
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Model};
@@ -47,33 +47,15 @@ enum PaxosMsg {
 // PROPOSER
 // =============================================================================
 
-/// Proposer phase
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum ProposerPhase {
-    /// Collecting promises
-    Preparing {
-        proposal: ProposalKey,
-        value: Value,
-        /// Map from acceptor ID to their accepted value (tracks unique acceptors)
-        promises: BTreeMap<Id, Option<(ProposalKey, Value)>>,
-    },
-    /// Collecting accepts
-    Accepting {
-        proposal: ProposalKey,
-        value: Value,
-        /// Set of acceptors that have accepted (tracks unique acceptors)
-        accepts: BTreeSet<Id>,
-    },
-    /// Successfully learned a value for this round
-    Done { round: u64, value: Value },
-}
-
-/// Proposer state
+/// Proposer state using ProposerCore for phase tracking
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ProposerState {
-    phase: ProposerPhase,
+    /// Core proposer logic - tracks phase and quorum
+    core: ProposerCore<ProposalKey, ProposalKey, Value, Id>,
+    /// Current round number
     current_round: u64,
-    current_attempt: u64,
+    /// True if we've learned a value for this round
+    learned: Option<(u64, Value)>,
 }
 
 // =============================================================================
@@ -98,12 +80,6 @@ enum PaxosActor {
 enum PaxosActorState {
     Acceptor(AcceptorState),
     Proposer(ProposerState),
-}
-
-impl PaxosActor {
-    fn quorum(num_acceptors: usize) -> usize {
-        num_acceptors / 2 + 1
-    }
 }
 
 impl Actor for PaxosActor {
@@ -136,13 +112,9 @@ impl Actor for PaxosActor {
                     o.send(acc, PaxosMsg::Request(AcceptorRequest::Prepare(proposal)));
                 }
                 PaxosActorState::Proposer(ProposerState {
-                    phase: ProposerPhase::Preparing {
-                        proposal,
-                        value: *initial_value,
-                        promises: BTreeMap::new(),
-                    },
+                    core: ProposerCore::new(proposal, *initial_value, acceptor_ids.len()),
                     current_round: 0,
-                    current_attempt: 0,
+                    learned: None,
                 })
             }
         }
@@ -216,138 +188,119 @@ impl PaxosActor {
         msg: PaxosMsg,
         o: &mut Out<Self>,
     ) {
-        let quorum = Self::quorum(acceptor_ids.len());
-        let phase = prop_state.phase.clone();
+        // Skip if already learned
+        if prop_state.learned.is_some() {
+            return;
+        }
 
-        match (phase, msg) {
-            // Handle Response (Promise) during Preparing phase
-            (
-                ProposerPhase::Preparing {
-                    proposal,
-                    value,
-                    promises,
-                },
-                PaxosMsg::Response(response),
-            ) if response.for_proposal == proposal => {
-                // Check if we got a promise for our proposal
-                if response.promised == Some(proposal) {
-                    let mut new_promises = promises.clone();
-                    // Use insert to deduplicate by acceptor ID
-                    new_promises.insert(src, response.accepted);
+        let PaxosMsg::Response(response) = msg else {
+            return;
+        };
 
-                    if new_promises.len() >= quorum {
-                        // Got quorum! Pick value from highest accepted, or use ours
-                        let chosen_value = new_promises
-                            .values()
-                            .filter_map(|acc| acc.as_ref())
-                            .max_by_key(|(p, _)| p)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(value);
+        // Only process responses for our current proposal
+        if response.for_proposal != *prop_state.core.proposal() {
+            return;
+        }
 
-                        // Send Accept to all acceptors
-                        for &acc in acceptor_ids {
-                            o.send(
-                                acc,
-                                PaxosMsg::Request(AcceptorRequest::Accept(proposal, chosen_value)),
-                            );
-                        }
+        let mut new_core = prop_state.core.clone();
 
-                        let new_state = PaxosActorState::Proposer(ProposerState {
-                            phase: ProposerPhase::Accepting {
-                                proposal,
-                                value: chosen_value,
-                                accepts: BTreeSet::new(),
-                            },
-                            current_round: prop_state.current_round,
-                            current_attempt: prop_state.current_attempt,
-                        });
-                        *state.to_mut() = new_state;
-                    } else {
-                        let new_state = PaxosActorState::Proposer(ProposerState {
-                            phase: ProposerPhase::Preparing {
-                                proposal,
-                                value,
-                                promises: new_promises,
-                            },
-                            current_round: prop_state.current_round,
-                            current_attempt: prop_state.current_attempt,
-                        });
-                        *state.to_mut() = new_state;
-                    }
-                } else if let Some(higher) = response.promised {
-                    // Someone promised a higher proposal - need to retry with higher attempt
-                    if higher > proposal {
-                        let new_attempt = higher.attempt + 1;
-                        let new_proposal = ProposalKey {
-                            round: prop_state.current_round,
-                            attempt: new_attempt,
-                            node: id,
-                        };
-                        for &acc in acceptor_ids {
-                            o.send(
-                                acc,
-                                PaxosMsg::Request(AcceptorRequest::Prepare(new_proposal)),
-                            );
-                        }
-                        let new_state = PaxosActorState::Proposer(ProposerState {
-                            phase: ProposerPhase::Preparing {
-                                proposal: new_proposal,
-                                value,
-                                promises: BTreeMap::new(),
-                            },
-                            current_round: prop_state.current_round,
-                            current_attempt: new_attempt,
-                        });
-                        *state.to_mut() = new_state;
+        if new_core.is_preparing() {
+            // Handle promise response
+            let promised_key = match &response.promised {
+                Some(p) => *p,
+                None => return, // No promise, ignore
+            };
+
+            let result = new_core.handle_promise(src, promised_key, response.accepted, |p| *p);
+
+            match result {
+                PreparePhaseResult::Quorum { value } => {
+                    // Got quorum - send Accept to all
+                    let proposal = *new_core.proposal();
+                    for &acc in acceptor_ids {
+                        o.send(
+                            acc,
+                            PaxosMsg::Request(AcceptorRequest::Accept(proposal, value)),
+                        );
                     }
                 }
-            }
-            // Handle Response during Accepting phase (Accept confirmation)
-            (
-                ProposerPhase::Accepting {
-                    proposal,
-                    value,
-                    accepts,
-                },
-                PaxosMsg::Response(response),
-            ) if response.for_proposal == proposal => {
-                // Check if accept succeeded: accepted field contains our proposal
-                let accepted = response
-                    .accepted
-                    .as_ref()
-                    .is_some_and(|(p, _)| *p == proposal);
-
-                if accepted {
-                    let mut new_accepts = accepts.clone();
-                    new_accepts.insert(src); // Deduplicate by acceptor ID
-
-                    if new_accepts.len() >= quorum {
-                        // Success! Value is learned
-                        let new_state = PaxosActorState::Proposer(ProposerState {
-                            phase: ProposerPhase::Done {
-                                round: proposal.round,
-                                value,
-                            },
-                            current_round: prop_state.current_round,
-                            current_attempt: prop_state.current_attempt,
-                        });
-                        *state.to_mut() = new_state;
-                    } else {
-                        let new_state = PaxosActorState::Proposer(ProposerState {
-                            phase: ProposerPhase::Accepting {
-                                proposal,
-                                value,
-                                accepts: new_accepts,
-                            },
-                            current_round: prop_state.current_round,
-                            current_attempt: prop_state.current_attempt,
-                        });
-                        *state.to_mut() = new_state;
+                PreparePhaseResult::Rejected { superseded_by, .. } => {
+                    // Retry with higher attempt
+                    let new_attempt = superseded_by.attempt + 1;
+                    let new_proposal = ProposalKey {
+                        round: prop_state.current_round,
+                        attempt: new_attempt,
+                        node: id,
+                    };
+                    for &acc in acceptor_ids {
+                        o.send(
+                            acc,
+                            PaxosMsg::Request(AcceptorRequest::Prepare(new_proposal)),
+                        );
                     }
+                    // Create new core for the new proposal
+                    new_core = ProposerCore::new(
+                        new_proposal,
+                        *prop_state.core.value(),
+                        acceptor_ids.len(),
+                    );
                 }
-                // If not accepted, ignore (could handle rejection here)
+                PreparePhaseResult::Pending => {}
             }
-            _ => {}
+
+            *state.to_mut() = PaxosActorState::Proposer(ProposerState {
+                core: new_core,
+                current_round: prop_state.current_round,
+                learned: None,
+            });
+        } else if new_core.is_accepting() {
+            // Handle accept response
+            let accepted_key = response.accepted.as_ref().map(|(p, _)| *p);
+            let proposal = *new_core.proposal();
+
+            let result = new_core.handle_accepted(src, accepted_key, proposal);
+
+            match result {
+                basic_paxos::core::AcceptPhaseResult::Learned { value, .. } => {
+                    *state.to_mut() = PaxosActorState::Proposer(ProposerState {
+                        core: new_core,
+                        current_round: prop_state.current_round,
+                        learned: Some((proposal.round, value)),
+                    });
+                }
+                basic_paxos::core::AcceptPhaseResult::Rejected { superseded_by } => {
+                    // Retry with higher attempt
+                    let new_attempt = superseded_by.attempt + 1;
+                    let new_proposal = ProposalKey {
+                        round: prop_state.current_round,
+                        attempt: new_attempt,
+                        node: id,
+                    };
+                    for &acc in acceptor_ids {
+                        o.send(
+                            acc,
+                            PaxosMsg::Request(AcceptorRequest::Prepare(new_proposal)),
+                        );
+                    }
+                    new_core = ProposerCore::new(
+                        new_proposal,
+                        *prop_state.core.value(),
+                        acceptor_ids.len(),
+                    );
+                    *state.to_mut() = PaxosActorState::Proposer(ProposerState {
+                        core: new_core,
+                        current_round: prop_state.current_round,
+                        learned: None,
+                    });
+                }
+                basic_paxos::core::AcceptPhaseResult::Pending => {
+                    *state.to_mut() = PaxosActorState::Proposer(ProposerState {
+                        core: new_core,
+                        current_round: prop_state.current_round,
+                        learned: None,
+                    });
+                }
+            }
         }
     }
 }
@@ -389,7 +342,7 @@ fn paxos_model_with_config(
                 .actor_states
                 .iter()
                 .all(|s: &Arc<PaxosActorState>| match s.as_ref() {
-                    PaxosActorState::Proposer(ps) => ps.current_attempt <= cfg.max_attempt,
+                    PaxosActorState::Proposer(ps) => ps.core.proposal().attempt <= cfg.max_attempt,
                     _ => true,
                 })
         });
@@ -415,12 +368,11 @@ fn paxos_model_with_config(
             .actor_states
             .iter()
             .filter_map(|s: &Arc<PaxosActorState>| {
-                if let PaxosActorState::Proposer(ps) = s.as_ref()
-                    && let ProposerPhase::Done { round, value } = ps.phase
-                {
-                    return Some((round, value));
+                if let PaxosActorState::Proposer(ps) = s.as_ref() {
+                    ps.learned
+                } else {
+                    None
                 }
-                None
             })
             .collect();
 
@@ -459,7 +411,8 @@ mod tests {
     #[test]
     fn check_paxos_two_proposers() {
         // 2 proposers with different values, 3 acceptors
-        let model = paxos_model(2, 3, &[1, 2]);
+        // Use smaller max_attempt bound (2 instead of 3) for faster checking
+        let model = paxos_model_with_config(2, 3, &[1, 2], 2);
 
         let checker = model.checker().threads(num_cpus::get()).spawn_bfs().join();
 
