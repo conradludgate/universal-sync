@@ -5,10 +5,7 @@ use std::collections::BTreeMap;
 use crate::{Learner, Proposal, ProposalKey};
 
 /// Key type for quorum tracking maps.
-type Key<L> = ProposalKey<
-    <<L as Learner>::Proposal as Proposal>::RoundId,
-    <<L as Learner>::Proposal as Proposal>::AttemptId,
->;
+type Key<L> = ProposalKey<<L as Learner>::Proposal>;
 
 /// Tracks proposal counts and detects when quorum is reached.
 ///

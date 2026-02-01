@@ -14,16 +14,22 @@ use futures::{Sink, SinkExt, Stream, channel::mpsc};
 
 // --- Test Proposal Implementation ---
 
-/// Proposal is just metadata (round, attempt) - the actual value is Message
+/// Proposal is just metadata (node_id, round, attempt) - the actual value is Message
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TestProposal {
+    node_id: IpAddr,
     round: u64,
     attempt: u64,
 }
 
 impl Proposal for TestProposal {
+    type NodeId = IpAddr;
     type RoundId = u64;
     type AttemptId = u64;
+
+    fn node_id(&self) -> IpAddr {
+        self.node_id
+    }
 
     fn round(&self) -> u64 {
         self.round
@@ -42,6 +48,7 @@ impl Proposal for TestProposal {
 
 #[derive(Clone)]
 struct TestState {
+    node_id: IpAddr,
     round: u64,
     acceptors: Vec<IpAddr>,
     learned: Arc<Mutex<Vec<String>>>,
@@ -49,8 +56,9 @@ struct TestState {
 }
 
 impl TestState {
-    fn new(acceptors: Vec<IpAddr>) -> Self {
+    fn new(node_id: IpAddr, acceptors: Vec<IpAddr>) -> Self {
         Self {
+            node_id,
             round: 0,
             acceptors,
             learned: Arc::new(Mutex::new(Vec::new())),
@@ -63,7 +71,7 @@ impl Learner for TestState {
     type Proposal = TestProposal;
     type Message = String;
     type Error = io::Error;
-    type AcceptorAddr = IpAddr;
+    type NodeId = IpAddr;
 
     fn current_round(&self) -> u64 {
         self.round
@@ -79,6 +87,7 @@ impl Learner for TestState {
 
     fn propose(&self, attempt: u64) -> TestProposal {
         TestProposal {
+            node_id: self.node_id,
             round: self.round,
             attempt,
         }
@@ -251,7 +260,7 @@ async fn test_basic_consensus_channels() {
         let (proposer_conn, acceptor_conn) = create_connection_pair();
         proposer_conns.push((*addr, proposer_conn));
 
-        let state = TestState::new(acceptor_addrs.clone());
+        let state = TestState::new(*addr, acceptor_addrs.clone());
         let handle = tokio::spawn(async move {
             let _ = run_acceptor(state, SharedAcceptorState::new(), acceptor_conn).await;
         });
@@ -263,8 +272,9 @@ async fn test_basic_consensus_channels() {
         connections: Arc::new(Mutex::new(proposer_conns)),
     };
 
-    // Create proposer state
-    let mut state = TestState::new(acceptor_addrs);
+    // Create proposer state (use unique ID for proposer)
+    let proposer_id = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+    let mut state = TestState::new(proposer_id, acceptor_addrs);
     state.learned = learned.clone();
 
     // Create message channel
@@ -307,7 +317,7 @@ async fn test_multiple_proposals() {
         let (proposer_conn, acceptor_conn) = create_connection_pair();
         proposer_conns.push((*addr, proposer_conn));
 
-        let state = TestState::new(acceptor_addrs.clone());
+        let state = TestState::new(*addr, acceptor_addrs.clone());
         let handle = tokio::spawn(async move {
             let _ = run_acceptor(state, SharedAcceptorState::new(), acceptor_conn).await;
         });
@@ -318,7 +328,8 @@ async fn test_multiple_proposals() {
         connections: Arc::new(Mutex::new(proposer_conns)),
     };
 
-    let mut state = TestState::new(acceptor_addrs);
+    let proposer_id = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+    let mut state = TestState::new(proposer_id, acceptor_addrs);
     state.learned = learned.clone();
 
     let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -364,7 +375,7 @@ async fn test_minority_slow() {
         let (proposer_conn, acceptor_conn) = create_connection_pair();
         proposer_conns.push((*addr, proposer_conn));
 
-        let state = TestState::new(acceptor_addrs.clone());
+        let state = TestState::new(*addr, acceptor_addrs.clone());
 
         if i < 2 {
             // Normal acceptors
@@ -387,7 +398,8 @@ async fn test_minority_slow() {
         connections: Arc::new(Mutex::new(proposer_conns)),
     };
 
-    let mut state = TestState::new(acceptor_addrs);
+    let proposer_id = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0));
+    let mut state = TestState::new(proposer_id, acceptor_addrs);
     state.learned = learned.clone();
 
     let (mut tx, rx) = mpsc::channel::<String>(16);

@@ -18,7 +18,7 @@ use crate::{AcceptorMessage, AcceptorRequest, Connector, Learner};
 /// The connector is responsible for implementing retry logic with backoff.
 /// Tracks consecutive failures so callers can check connection health.
 pub struct LazyConnection<L: Learner, C: Connector<L>> {
-    addr: L::AcceptorAddr,
+    node_id: L::NodeId,
     connector: C,
     connecting: Option<C::ConnectFuture>,
     connection: Option<C::Connection>,
@@ -27,10 +27,10 @@ pub struct LazyConnection<L: Learner, C: Connector<L>> {
 }
 
 impl<L: Learner, C: Connector<L>> LazyConnection<L, C> {
-    /// Create a new lazy connection to the given address.
-    pub fn new(addr: L::AcceptorAddr, connector: C) -> Self {
+    /// Create a new lazy connection to the given node.
+    pub fn new(node_id: L::NodeId, connector: C) -> Self {
         Self {
-            addr,
+            node_id,
             connector,
             connecting: None,
             connection: None,
@@ -89,7 +89,7 @@ where
 
             // Start a new connection attempt
             // The connector is responsible for backoff and returning an error when giving up
-            this.connecting = Some(this.connector.connect(&this.addr));
+            this.connecting = Some(this.connector.connect(&this.node_id));
         }
     }
 }

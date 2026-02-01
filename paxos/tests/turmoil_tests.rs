@@ -70,16 +70,22 @@ fn turmoil_config() -> ProposerConfig<TurmoilSleep, StdRng> {
 
 // --- Test Proposal Implementation ---
 
-/// Proposal is just metadata (round, attempt) - the actual value is Message
+/// Proposal is just metadata (node_id, round, attempt) - the actual value is Message
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TestProposal {
+    node_id: SocketAddr,
     round: u64,
     attempt: u64,
 }
 
 impl Proposal for TestProposal {
+    type NodeId = SocketAddr;
     type RoundId = u64;
     type AttemptId = u64;
+
+    fn node_id(&self) -> SocketAddr {
+        self.node_id
+    }
 
     fn round(&self) -> u64 {
         self.round
@@ -110,14 +116,16 @@ type SharedLearned = Arc<Mutex<BTreeMap<u64, LearnedEntry>>>;
 /// Stores full proposals for thorough testing
 #[derive(Clone)]
 struct TestState {
+    node_id: SocketAddr,
     acceptors: Vec<SocketAddr>,
     /// Full proposals learned, keyed by round to prevent duplicates
     learned: SharedLearned,
 }
 
 impl TestState {
-    fn new(acceptors: Vec<SocketAddr>) -> Self {
+    fn new(node_id: SocketAddr, acceptors: Vec<SocketAddr>) -> Self {
         Self {
+            node_id,
             acceptors,
             learned: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -128,7 +136,7 @@ impl Learner for TestState {
     type Proposal = TestProposal;
     type Message = String;
     type Error = io::Error;
-    type AcceptorAddr = SocketAddr;
+    type NodeId = SocketAddr;
 
     fn current_round(&self) -> u64 {
         // Derive from shared state to stay synchronized across proposers
@@ -145,6 +153,7 @@ impl Learner for TestState {
 
     fn propose(&self, attempt: u64) -> TestProposal {
         TestProposal {
+            node_id: self.node_id,
             round: self.current_round(),
             attempt,
         }
@@ -355,25 +364,68 @@ impl Connector<TestState> for TcpConnector {
 
 // --- Encoding/Decoding ---
 
+fn encode_proposal(buf: &mut Vec<u8>, p: &TestProposal) {
+    // Encode node_id (SocketAddr as ip:port)
+    match p.node_id.ip() {
+        std::net::IpAddr::V4(ip) => {
+            buf.push(4);
+            buf.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            buf.push(6);
+            buf.extend_from_slice(&ip.octets());
+        }
+    }
+    buf.extend_from_slice(&p.node_id.port().to_le_bytes());
+    buf.extend_from_slice(&p.round.to_le_bytes());
+    buf.extend_from_slice(&p.attempt.to_le_bytes());
+}
+
+fn decode_proposal(buf: &[u8], pos: &mut usize) -> Option<TestProposal> {
+    let ip_version = *buf.get(*pos)?;
+    *pos += 1;
+    let node_id = match ip_version {
+        4 => {
+            let octets: [u8; 4] = buf.get(*pos..*pos + 4)?.try_into().ok()?;
+            *pos += 4;
+            let port = u16::from_le_bytes(buf.get(*pos..*pos + 2)?.try_into().ok()?);
+            *pos += 2;
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), port)
+        }
+        6 => {
+            let octets: [u8; 16] = buf.get(*pos..*pos + 16)?.try_into().ok()?;
+            *pos += 16;
+            let port = u16::from_le_bytes(buf.get(*pos..*pos + 2)?.try_into().ok()?);
+            *pos += 2;
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)), port)
+        }
+        _ => return None,
+    };
+    let round = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
+    *pos += 8;
+    let attempt = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
+    *pos += 8;
+    Some(TestProposal {
+        node_id,
+        round,
+        attempt,
+    })
+}
+
 fn encode_acceptor_request(msg: &AcceptorRequest<TestState>) -> Vec<u8> {
     let mut buf = Vec::new();
     match msg {
         AcceptorRequest::Prepare(p) => {
-            // Prepare sends signed proposal (round + attempt), can be validated
             buf.push(0);
-            buf.extend_from_slice(&p.round.to_le_bytes());
-            buf.extend_from_slice(&p.attempt.to_le_bytes());
+            encode_proposal(&mut buf, p);
         }
         AcceptorRequest::Accept(p, message) => {
-            // Accept sends proposal + message
             buf.push(1);
-            buf.extend_from_slice(&p.round.to_le_bytes());
-            buf.extend_from_slice(&p.attempt.to_le_bytes());
+            encode_proposal(&mut buf, p);
             buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
             buf.extend_from_slice(message.as_bytes());
         }
         AcceptorRequest::Sync { from_round } => {
-            // Sync just sends the round to sync from
             buf.push(2);
             buf.extend_from_slice(&from_round.to_le_bytes());
         }
@@ -386,27 +438,21 @@ fn decode_acceptor_request(buf: &[u8]) -> Option<AcceptorRequest<TestState>> {
         return None;
     }
     let tag = buf[0];
+    let mut pos = 1;
     match tag {
         0 => {
-            // Prepare: proposal (round + attempt)
-            let round = u64::from_le_bytes(buf[1..9].try_into().ok()?);
-            let attempt = u64::from_le_bytes(buf[9..17].try_into().ok()?);
-            Some(AcceptorRequest::Prepare(TestProposal { round, attempt }))
+            let proposal = decode_proposal(buf, &mut pos)?;
+            Some(AcceptorRequest::Prepare(proposal))
         }
         1 => {
-            // Accept: proposal + message
-            let round = u64::from_le_bytes(buf[1..9].try_into().ok()?);
-            let attempt = u64::from_le_bytes(buf[9..17].try_into().ok()?);
-            let len = u32::from_le_bytes(buf[17..21].try_into().ok()?) as usize;
-            let message = String::from_utf8(buf[21..21 + len].to_vec()).ok()?;
-            Some(AcceptorRequest::Accept(
-                TestProposal { round, attempt },
-                message,
-            ))
+            let proposal = decode_proposal(buf, &mut pos)?;
+            let len = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
+            pos += 4;
+            let message = String::from_utf8(buf.get(pos..pos + len)?.to_vec()).ok()?;
+            Some(AcceptorRequest::Accept(proposal, message))
         }
         2 => {
-            // Sync: from_round
-            let from_round = u64::from_le_bytes(buf[1..9].try_into().ok()?);
+            let from_round = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
             Some(AcceptorRequest::Sync { from_round })
         }
         _ => None,
@@ -416,11 +462,10 @@ fn decode_acceptor_request(buf: &[u8]) -> Option<AcceptorRequest<TestState>> {
 fn encode_acceptor_msg(msg: &AcceptorMessage<TestState>) -> Vec<u8> {
     let mut buf = Vec::new();
 
-    // Promised is a proposal (round + attempt)
+    // Promised is a proposal
     if let Some(p) = &msg.promised {
         buf.push(1);
-        buf.extend_from_slice(&p.round.to_le_bytes());
-        buf.extend_from_slice(&p.attempt.to_le_bytes());
+        encode_proposal(&mut buf, p);
     } else {
         buf.push(0);
     }
@@ -428,8 +473,7 @@ fn encode_acceptor_msg(msg: &AcceptorMessage<TestState>) -> Vec<u8> {
     // Accepted is (proposal, message)
     if let Some((p, message)) = &msg.accepted {
         buf.push(1);
-        buf.extend_from_slice(&p.round.to_le_bytes());
-        buf.extend_from_slice(&p.attempt.to_le_bytes());
+        encode_proposal(&mut buf, p);
         buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
         buf.extend_from_slice(message.as_bytes());
     } else {
@@ -445,11 +489,7 @@ fn decode_acceptor_msg(buf: &[u8]) -> Option<AcceptorMessage<TestState>> {
     // Promised is a proposal
     let promised = if buf.get(pos)? == &1 {
         pos += 1;
-        let round = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        let attempt = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        Some(TestProposal { round, attempt })
+        Some(decode_proposal(buf, &mut pos)?)
     } else {
         pos += 1;
         None
@@ -458,14 +498,11 @@ fn decode_acceptor_msg(buf: &[u8]) -> Option<AcceptorMessage<TestState>> {
     // Accepted is (proposal, message)
     let accepted = if buf.get(pos)? == &1 {
         pos += 1;
-        let round = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
-        let attempt = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-        pos += 8;
+        let proposal = decode_proposal(buf, &mut pos)?;
         let len = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
         let message = String::from_utf8(buf.get(pos..pos + len)?.to_vec()).ok()?;
-        Some((TestProposal { round, attempt }, message))
+        Some((proposal, message))
     } else {
         None
     };
@@ -481,7 +518,41 @@ fn resolve_acceptors(names: &[&str]) -> Vec<SocketAddr> {
         .collect()
 }
 
+/// Get a unique node ID for a proposer (uses port 0 to distinguish from acceptors)
+fn proposer_node_id(name: &str) -> SocketAddr {
+    SocketAddr::new(turmoil::lookup(name), 0)
+}
+
+/// Get a node ID for an acceptor host
+fn acceptor_node_id(name: &str) -> SocketAddr {
+    SocketAddr::new(turmoil::lookup(name), ACCEPTOR_PORT)
+}
+
 // --- Turmoil Tests ---
+
+fn start_acceptor(
+    sim: &mut turmoil::Sim<'_>,
+    name: &'static str,
+    acceptor_names: &'static [&'static str],
+) {
+    sim.host(name, move || async move {
+        let my_node_id = acceptor_node_id(name);
+        let listener =
+            turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
+        let acceptor_addrs = resolve_acceptors(acceptor_names);
+        let state = TestState::new(my_node_id, acceptor_addrs);
+        let shared = SharedAcceptorState::new();
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let conn = Framed::new(stream, AcceptorCodec);
+            let state = state.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let _ = run_acceptor(state, shared, conn).await;
+            });
+        }
+    });
+}
 
 #[test]
 fn turmoil_basic_consensus() {
@@ -489,34 +560,19 @@ fn turmoil_basic_consensus() {
         .simulation_duration(Duration::from_secs(55))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
     let learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
 
     // Start acceptors
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     // Start proposer as a client
     let learned_clone = learned.clone();
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -548,32 +604,17 @@ fn turmoil_multiple_messages() {
         .simulation_duration(Duration::from_secs(60))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
     let learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
 
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     let learned_clone = learned.clone();
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -608,32 +649,17 @@ fn turmoil_with_latency() {
         .max_message_latency(Duration::from_millis(100))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
     let learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
 
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     let learned_clone = learned.clone();
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -666,36 +692,21 @@ fn turmoil_competing_proposers() {
         .max_message_latency(Duration::from_millis(10))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
     const TARGET_ROUNDS: usize = 3;
 
     // SHARED learned state between both proposers
     let shared_learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
 
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     // Proposer A - shares learned state, starts immediately
     let learned_a = shared_learned.clone();
     sim.client("proposer-a", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer-a"), acceptor_addrs);
         state.learned = learned_a.clone();
 
         let stream = RetryMessageStream::new("A".to_string(), TARGET_ROUNDS, learned_a);
@@ -710,8 +721,8 @@ fn turmoil_competing_proposers() {
         // Small delay to break symmetry
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer-b"), acceptor_addrs);
         state.learned = learned_b.clone();
 
         let stream = RetryMessageStream::new("B".to_string(), TARGET_ROUNDS, learned_b);
@@ -777,21 +788,21 @@ fn turmoil_one_acceptor_slow() {
         .max_message_latency(Duration::from_millis(10))
         .build();
 
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
+
     // Start all 3 acceptors, but one is very slow
-    for (i, name) in ["acceptor-0", "acceptor-1", "acceptor-2"]
-        .iter()
-        .enumerate()
-    {
+    for (i, name) in ACCEPTOR_NAMES.iter().enumerate() {
         sim.host(*name, move || async move {
             // Acceptor-2 has a long startup delay
             if i == 2 {
                 tokio::time::sleep(Duration::from_secs(20)).await;
             }
 
+            let my_node_id = acceptor_node_id(ACCEPTOR_NAMES[i]);
             let listener =
                 turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
+            let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+            let state = TestState::new(my_node_id, acceptor_addrs);
             let shared = SharedAcceptorState::new();
             loop {
                 let (stream, _) = listener.accept().await?;
@@ -809,8 +820,8 @@ fn turmoil_one_acceptor_slow() {
     let learned_clone = learned.clone();
 
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -839,33 +850,18 @@ fn turmoil_acceptor_crashes_and_recovers() {
         .simulation_duration(Duration::from_secs(30))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
 
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     let learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
     let learned_clone = learned.clone();
 
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -908,33 +904,18 @@ fn turmoil_high_latency_acceptor() {
         .simulation_duration(Duration::from_secs(30))
         .build();
 
-    let acceptor_names = ["acceptor-0", "acceptor-1", "acceptor-2"];
+    const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
 
-    for name in &acceptor_names {
-        sim.host(*name, || async move {
-            let listener =
-                turmoil::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, ACCEPTOR_PORT)).await?;
-            let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-            let state = TestState::new(acceptor_addrs);
-            let shared = SharedAcceptorState::new();
-            loop {
-                let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
-                let state = state.clone();
-                let shared = shared.clone();
-                tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn).await;
-                });
-            }
-        });
+    for name in ACCEPTOR_NAMES {
+        start_acceptor(&mut sim, name, ACCEPTOR_NAMES);
     }
 
     let learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
     let learned_clone = learned.clone();
 
     sim.client("proposer", async move {
-        let acceptor_addrs = resolve_acceptors(&["acceptor-0", "acceptor-1", "acceptor-2"]);
-        let mut state = TestState::new(acceptor_addrs);
+        let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -1013,6 +994,7 @@ fn start_acceptor_with_learner_support(
     acceptor_names: &'static [&'static str],
 ) {
     sim.host(name, move || async move {
+        let my_node_id = acceptor_node_id(name);
         let acceptor_addrs = resolve_acceptors(acceptor_names);
         let shared = SharedAcceptorState::new();
 
@@ -1022,7 +1004,7 @@ fn start_acceptor_with_learner_support(
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let conn = Framed::new(stream, AcceptorCodec);
-            let state = TestState::new(acceptor_addrs.clone());
+            let state = TestState::new(my_node_id, acceptor_addrs.clone());
             let shared = shared.clone();
             tokio::spawn(async move {
                 let _ = run_acceptor(state, shared, conn).await;
@@ -1065,7 +1047,7 @@ fn turmoil_learner_sync() {
     // Proposer commits some values
     sim.client("proposer", async move {
         let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
-        let mut state = TestState::new(acceptor_addrs);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = proposer_learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);
@@ -1093,7 +1075,7 @@ fn turmoil_learner_sync() {
         // Connect to ALL acceptors' learner ports
         let connections = connect_to_all_acceptors(ACCEPTOR_NAMES).await?;
 
-        let mut state = TestState::new(vec![]);
+        let mut state = TestState::new(proposer_node_id("learner"), vec![]);
         state.learned = learner_learned_clone;
 
         let mut session = LearnerSession::new(&state, connections).await?;
@@ -1156,7 +1138,7 @@ fn turmoil_learner_live_broadcast() {
         // Connect to ALL acceptors' learner ports immediately
         let connections = connect_to_all_acceptors(ACCEPTOR_NAMES).await?;
 
-        let mut state = TestState::new(vec![]);
+        let mut state = TestState::new(proposer_node_id("learner"), vec![]);
         state.learned = learner_learned_clone;
 
         // Run learner with all connections - requires quorum
@@ -1175,7 +1157,7 @@ fn turmoil_learner_live_broadcast() {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let acceptor_addrs = resolve_acceptors(ACCEPTOR_NAMES);
-        let mut state = TestState::new(acceptor_addrs);
+        let mut state = TestState::new(proposer_node_id("proposer"), acceptor_addrs);
         state.learned = proposer_learned_clone;
 
         let (mut tx, rx) = mpsc::channel::<String>(16);

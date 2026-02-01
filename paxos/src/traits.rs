@@ -6,11 +6,13 @@ use futures::{Sink, Stream};
 
 use crate::messages::{AcceptorMessage, AcceptorRequest};
 
-/// A proposal that can be ordered by (round, attempt)
+/// A proposal that can be ordered by (`node_id`, round, attempt)
 pub trait Proposal: Clone {
+    type NodeId: Copy + Ord + core::fmt::Debug + core::hash::Hash;
     type RoundId: Copy + Ord + Default + core::fmt::Debug + core::hash::Hash;
-    type AttemptId: Copy + Ord + Default + core::fmt::Debug;
+    type AttemptId: Copy + Ord + Default + core::fmt::Debug + core::hash::Hash;
 
+    fn node_id(&self) -> Self::NodeId;
     fn round(&self) -> Self::RoundId;
     fn attempt(&self) -> Self::AttemptId;
 
@@ -18,34 +20,95 @@ pub trait Proposal: Clone {
     /// Used when a proposal is rejected to retry with a higher attempt.
     fn next_attempt(attempt: Self::AttemptId) -> Self::AttemptId;
 
-    /// Get the ordering key for this proposal (round, attempt).
+    /// Get the ordering key for this proposal (round, attempt, `node_id`).
     /// Used for comparing proposals in the Paxos protocol.
-    fn key(&self) -> ProposalKey<Self::RoundId, Self::AttemptId> {
-        ProposalKey(self.round(), self.attempt())
+    fn key(&self) -> ProposalKey<Self> {
+        ProposalKey::new(self.round(), self.attempt(), self.node_id())
     }
 }
 
-/// Ordering key for proposals - compares by (round, attempt) only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProposalKey<R, A>(pub(crate) R, pub(crate) A);
+/// Ordering key for proposals - compares by (round, attempt, `node_id`).
+/// The `node_id` ensures proposals from different proposers are always unique.
+#[derive(Debug)]
+pub struct ProposalKey<P: Proposal>(
+    pub(crate) P::RoundId,
+    pub(crate) P::AttemptId,
+    pub(crate) P::NodeId,
+);
 
-impl<R: Copy, A: Copy> ProposalKey<R, A> {
+impl<P: Proposal> Copy for ProposalKey<P> {}
+
+#[expect(clippy::expl_impl_clone_on_copy)]
+impl<P: Proposal> Clone for ProposalKey<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Proposal> Hash for ProposalKey<P> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self(round, attempt, node_id) => {
+                round.hash(state);
+                attempt.hash(state);
+                node_id.hash(state);
+            }
+        }
+    }
+}
+
+impl<P: Proposal> Eq for ProposalKey<P> {}
+
+impl<P: Proposal> PartialEq for ProposalKey<P> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self(round1, attempt1, node1), Self(round2, attempt2, node2)) => {
+                round1 == round2 && attempt1 == attempt2 && node1 == node2
+            }
+        }
+    }
+}
+
+impl<P: Proposal> PartialOrd for ProposalKey<P> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<P: Proposal> Ord for ProposalKey<P> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self(round1, attempt1, node1), Self(round2, attempt2, node2)) => round1
+                .cmp(round2)
+                .then(attempt1.cmp(attempt2))
+                .then(node1.cmp(node2)),
+        }
+    }
+}
+
+impl<P: Proposal> ProposalKey<P> {
     /// Create a new proposal key.
     #[must_use]
-    pub fn new(round: R, attempt: A) -> Self {
-        Self(round, attempt)
+    pub fn new(round: P::RoundId, attempt: P::AttemptId, node_id: P::NodeId) -> Self {
+        Self(round, attempt, node_id)
     }
 
     /// Get the round ID from this key.
     #[must_use]
-    pub fn round(&self) -> R {
+    pub fn round(&self) -> P::RoundId {
         self.0
     }
 
     /// Get the attempt ID from this key.
     #[must_use]
-    pub fn attempt(&self) -> A {
+    pub fn attempt(&self) -> P::AttemptId {
         self.1
+    }
+
+    /// Get the node ID from this key.
+    #[must_use]
+    pub fn node_id(&self) -> P::NodeId {
+        self.2
     }
 }
 
@@ -55,7 +118,7 @@ pub trait Learner {
     type Proposal: Proposal;
     type Message: Clone;
     type Error: core::error::Error + Send;
-    type AcceptorAddr: Clone + Eq + Hash;
+    type NodeId: Clone + Eq + Hash;
 
     /// Current round (next to be learned)
     fn current_round(&self) -> <Self::Proposal as Proposal>::RoundId;
@@ -64,7 +127,7 @@ pub trait Learner {
     fn validate(&self, proposal: &Self::Proposal) -> bool;
 
     /// Current acceptor set based on learned state
-    fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorAddr>;
+    fn acceptors(&self) -> impl IntoIterator<Item = Self::NodeId>;
 
     /// Create a signed proposal for the current round and attempt.
     /// The message is sent separately during Accept phase.
@@ -132,7 +195,7 @@ pub trait AcceptorStateStore<L: Learner> {
     fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
 }
 
-/// Connects to acceptors by address.
+/// Connects to acceptors by node ID.
 ///
 /// Implementations should handle backoff/retry logic internally when connections fail.
 /// The connector is cloned per-address, so `&mut self` can be used to track retry state.
@@ -141,7 +204,7 @@ pub trait Connector<L: Learner>: Clone {
     type Error: core::error::Error;
     type ConnectFuture: Future<Output = Result<Self::Connection, Self::Error>>;
 
-    fn connect(&mut self, addr: &L::AcceptorAddr) -> Self::ConnectFuture;
+    fn connect(&mut self, node_id: &L::NodeId) -> Self::ConnectFuture;
 }
 
 /// Connection to an acceptor
