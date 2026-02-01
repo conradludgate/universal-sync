@@ -8,3 +8,10 @@ zerocopy.workspace = true
 tokio.workspace = true
 futures.workspace = true
 scopeguard.workspace = true
+rand.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+turmoil.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
