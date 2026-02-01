@@ -94,7 +94,7 @@ fn turmoil_config() -> ProposerConfig<TurmoilSleep, StdRng> {
 // --- Test Proposal Implementation ---
 
 /// Proposal is just metadata (node_id, round, attempt) - the actual value is Message
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct TestProposal {
     node_id: SocketAddr,
     round: u64,
@@ -159,6 +159,10 @@ impl Learner for TestState {
     type Proposal = TestProposal;
     type Message = String;
     type Error = io::Error;
+
+    fn node_id(&self) -> SocketAddr {
+        self.node_id
+    }
 
     fn current_round(&self) -> u64 {
         // Derive from shared state to stay synchronized across proposers
@@ -245,83 +249,54 @@ impl Stream for RetryMessageStream {
     }
 }
 
-// --- Codec for Proposer <-> Acceptor Messages ---
+// --- Postcard-based Codec ---
+
+/// Generic length-prefixed postcard codec
+struct PostcardCodec<Enc, Dec>(std::marker::PhantomData<(Enc, Dec)>);
+
+impl<Enc, Dec> Default for PostcardCodec<Enc, Dec> {
+    fn default() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<Enc: serde::Serialize, Dec> Encoder<Enc> for PostcardCodec<Enc, Dec> {
+    type Error = io::Error;
+
+    fn encode(&mut self, item: Enc, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let encoded =
+            postcard::to_allocvec(&item).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        dst.put_u32_le(encoded.len() as u32);
+        dst.extend_from_slice(&encoded);
+        Ok(())
+    }
+}
+
+impl<Enc, Dec: serde::de::DeserializeOwned> Decoder for PostcardCodec<Enc, Dec> {
+    type Item = Dec;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
+        if src.len() < 4 + len {
+            return Ok(None);
+        }
+        src.advance(4);
+        let data = src.split_to(len);
+        let item = postcard::from_bytes(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Some(item))
+    }
+}
 
 /// Codec for proposer-side: encodes AcceptorRequest, decodes AcceptorMessage
-struct ProposerCodec;
-
-impl Encoder<AcceptorRequest<TestState>> for ProposerCodec {
-    type Error = io::Error;
-
-    fn encode(
-        &mut self,
-        item: AcceptorRequest<TestState>,
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let encoded = encode_acceptor_request(&item);
-        dst.put_u32_le(encoded.len() as u32);
-        dst.extend_from_slice(&encoded);
-        Ok(())
-    }
-}
-
-impl Decoder for ProposerCodec {
-    type Item = AcceptorMessage<TestState>;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
-            return Ok(None);
-        }
-        let len = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
-        if src.len() < 4 + len {
-            return Ok(None);
-        }
-        src.advance(4);
-        let data = src.split_to(len);
-        decode_acceptor_msg(&data)
-            .ok_or_else(|| io::Error::other("failed to decode acceptor message"))
-            .map(Some)
-    }
-}
+type ProposerCodec = PostcardCodec<AcceptorRequest<TestState>, AcceptorMessage<TestState>>;
 
 /// Codec for acceptor-side: encodes AcceptorMessage, decodes AcceptorRequest
-struct AcceptorCodec;
-
-impl Encoder<AcceptorMessage<TestState>> for AcceptorCodec {
-    type Error = io::Error;
-
-    fn encode(
-        &mut self,
-        item: AcceptorMessage<TestState>,
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let encoded = encode_acceptor_msg(&item);
-        dst.put_u32_le(encoded.len() as u32);
-        dst.extend_from_slice(&encoded);
-        Ok(())
-    }
-}
-
-impl Decoder for AcceptorCodec {
-    type Item = AcceptorRequest<TestState>;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
-            return Ok(None);
-        }
-        let len = u32::from_le_bytes(src[..4].try_into().unwrap()) as usize;
-        if src.len() < 4 + len {
-            return Ok(None);
-        }
-        src.advance(4);
-        let data = src.split_to(len);
-        decode_acceptor_request(&data)
-            .ok_or_else(|| io::Error::other("failed to decode proposer message"))
-            .map(Some)
-    }
-}
+type AcceptorCodec = PostcardCodec<AcceptorMessage<TestState>, AcceptorRequest<TestState>>;
 
 // --- Connection Types ---
 
@@ -379,149 +354,9 @@ impl Connector<TestState> for TcpConnector {
                 tokio::time::sleep(delay).await;
             }
             let stream = turmoil::net::TcpStream::connect(addr).await?;
-            Ok(Framed::new(stream, ProposerCodec))
+            Ok(Framed::new(stream, ProposerCodec::default()))
         })
     }
-}
-
-// --- Encoding/Decoding ---
-
-fn encode_proposal(buf: &mut Vec<u8>, p: &TestProposal) {
-    // Encode node_id (SocketAddr as ip:port)
-    match p.node_id.ip() {
-        std::net::IpAddr::V4(ip) => {
-            buf.push(4);
-            buf.extend_from_slice(&ip.octets());
-        }
-        std::net::IpAddr::V6(ip) => {
-            buf.push(6);
-            buf.extend_from_slice(&ip.octets());
-        }
-    }
-    buf.extend_from_slice(&p.node_id.port().to_le_bytes());
-    buf.extend_from_slice(&p.round.to_le_bytes());
-    buf.extend_from_slice(&p.attempt.to_le_bytes());
-}
-
-fn decode_proposal(buf: &[u8], pos: &mut usize) -> Option<TestProposal> {
-    let ip_version = *buf.get(*pos)?;
-    *pos += 1;
-    let node_id = match ip_version {
-        4 => {
-            let octets: [u8; 4] = buf.get(*pos..*pos + 4)?.try_into().ok()?;
-            *pos += 4;
-            let port = u16::from_le_bytes(buf.get(*pos..*pos + 2)?.try_into().ok()?);
-            *pos += 2;
-            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)), port)
-        }
-        6 => {
-            let octets: [u8; 16] = buf.get(*pos..*pos + 16)?.try_into().ok()?;
-            *pos += 16;
-            let port = u16::from_le_bytes(buf.get(*pos..*pos + 2)?.try_into().ok()?);
-            *pos += 2;
-            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)), port)
-        }
-        _ => return None,
-    };
-    let round = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
-    *pos += 8;
-    let attempt = u64::from_le_bytes(buf.get(*pos..*pos + 8)?.try_into().ok()?);
-    *pos += 8;
-    Some(TestProposal {
-        node_id,
-        round,
-        attempt,
-    })
-}
-
-fn encode_acceptor_request(msg: &AcceptorRequest<TestState>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    match msg {
-        AcceptorRequest::Prepare(p) => {
-            buf.push(0);
-            encode_proposal(&mut buf, p);
-        }
-        AcceptorRequest::Accept(p, message) => {
-            buf.push(1);
-            encode_proposal(&mut buf, p);
-            buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
-            buf.extend_from_slice(message.as_bytes());
-        }
-    }
-    buf
-}
-
-fn decode_acceptor_request(buf: &[u8]) -> Option<AcceptorRequest<TestState>> {
-    if buf.is_empty() {
-        return None;
-    }
-    let tag = buf[0];
-    let mut pos = 1;
-    match tag {
-        0 => {
-            let proposal = decode_proposal(buf, &mut pos)?;
-            Some(AcceptorRequest::Prepare(proposal))
-        }
-        1 => {
-            let proposal = decode_proposal(buf, &mut pos)?;
-            let len = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
-            pos += 4;
-            let message = String::from_utf8(buf.get(pos..pos + len)?.to_vec()).ok()?;
-            Some(AcceptorRequest::Accept(proposal, message))
-        }
-        _ => None,
-    }
-}
-
-fn encode_acceptor_msg(msg: &AcceptorMessage<TestState>) -> Vec<u8> {
-    let mut buf = Vec::new();
-
-    // Promised is a proposal
-    if let Some(p) = &msg.promised {
-        buf.push(1);
-        encode_proposal(&mut buf, p);
-    } else {
-        buf.push(0);
-    }
-
-    // Accepted is (proposal, message)
-    if let Some((p, message)) = &msg.accepted {
-        buf.push(1);
-        encode_proposal(&mut buf, p);
-        buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
-        buf.extend_from_slice(message.as_bytes());
-    } else {
-        buf.push(0);
-    }
-
-    buf
-}
-
-fn decode_acceptor_msg(buf: &[u8]) -> Option<AcceptorMessage<TestState>> {
-    let mut pos = 0;
-
-    // Promised is a proposal
-    let promised = if buf.get(pos)? == &1 {
-        pos += 1;
-        Some(decode_proposal(buf, &mut pos)?)
-    } else {
-        pos += 1;
-        None
-    };
-
-    // Accepted is (proposal, message)
-    let accepted = if buf.get(pos)? == &1 {
-        pos += 1;
-        let proposal = decode_proposal(buf, &mut pos)?;
-        let len = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?) as usize;
-        pos += 4;
-        let message = String::from_utf8(buf.get(pos..pos + len)?.to_vec()).ok()?;
-        Some((proposal, message))
-    } else {
-        None
-    };
-
-    Some(AcceptorMessage { promised, accepted })
 }
 
 /// Convert hostnames to SocketAddrs using turmoil's DNS lookup
@@ -558,7 +393,7 @@ fn start_acceptor(
         let shared = SharedAcceptorState::new();
         loop {
             let (stream, _) = listener.accept().await?;
-            let conn = Framed::new(stream, AcceptorCodec);
+            let conn = Framed::new(stream, AcceptorCodec::default());
             let state = state.clone();
             let shared = shared.clone();
             tokio::spawn(async move {
@@ -825,7 +660,7 @@ fn turmoil_one_acceptor_slow() {
             let shared = SharedAcceptorState::new();
             loop {
                 let (stream, _) = listener.accept().await?;
-                let conn = Framed::new(stream, AcceptorCodec);
+                let conn = Framed::new(stream, AcceptorCodec::default());
                 let state = state.clone();
                 let shared = shared.clone();
                 tokio::spawn(async move {
@@ -965,46 +800,8 @@ fn turmoil_high_latency_acceptor() {
     assert_eq!(learned.get(&0).unwrap().message, "value-with-slow-acceptor");
 }
 
-// --- Learner Codecs ---
-
-/// Codec for learner-side: encodes AcceptorRequest (Sync), decodes AcceptorMessage
-/// Uses the same wire format as AcceptorCodec so they can share a port.
-struct LearnerCodec;
-
-impl Encoder<AcceptorRequest<TestState>> for LearnerCodec {
-    type Error = io::Error;
-
-    fn encode(
-        &mut self,
-        item: AcceptorRequest<TestState>,
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        // Use same format as AcceptorCodec (encode_acceptor_request)
-        let encoded = encode_acceptor_request(&item);
-        dst.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        dst.extend_from_slice(&encoded);
-        Ok(())
-    }
-}
-
-impl Decoder for LearnerCodec {
-    type Item = AcceptorMessage<TestState>;
-    type Error = io::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Use same format as AcceptorCodec (decode_acceptor_msg)
-        if src.len() < 4 {
-            return Ok(None);
-        }
-        let len = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
-        if src.len() < 4 + len {
-            return Ok(None);
-        }
-        src.advance(4);
-        let data: BytesMut = src.split_to(len);
-        Ok(decode_acceptor_msg(&data))
-    }
-}
+/// Codec for learner-side: same as ProposerCodec (encodes AcceptorRequest, decodes AcceptorMessage)
+type LearnerCodec = ProposerCodec;
 
 // --- Learner Tests ---
 
@@ -1024,7 +821,7 @@ fn start_acceptor_with_learner_support(
 
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let conn = Framed::new(stream, AcceptorCodec);
+            let conn = Framed::new(stream, AcceptorCodec::default());
             let state = TestState::new(my_node_id, acceptor_addrs.clone());
             let shared = shared.clone();
             tokio::spawn(async move {
@@ -1042,7 +839,7 @@ async fn connect_to_all_acceptors(
     for name in names {
         let addr = SocketAddr::new(turmoil::lookup(*name), ACCEPTOR_PORT);
         let stream = turmoil::net::TcpStream::connect(addr).await?;
-        connections.push(Framed::new(stream, LearnerCodec));
+        connections.push(Framed::new(stream, LearnerCodec::default()));
     }
     Ok(connections)
 }

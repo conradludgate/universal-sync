@@ -120,6 +120,9 @@ pub trait Learner: Send + Sync + 'static {
     type Message: Clone + Send + Sync + 'static;
     type Error: core::error::Error + Send;
 
+    /// This node's unique identifier
+    fn node_id(&self) -> <Self::Proposal as Proposal>::NodeId;
+
     /// Current round (next to be learned)
     fn current_round(&self) -> <Self::Proposal as Proposal>::RoundId;
 

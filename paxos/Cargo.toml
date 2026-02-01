@@ -3,6 +3,10 @@ name = "basic-paxos"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+serde = ["dep:serde"]
+
 [dependencies]
 zerocopy.workspace = true
 tokio.workspace = true
@@ -12,8 +16,12 @@ scopeguard.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 turmoil.workspace = true
 bytes.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
+postcard.workspace = true
+basic-paxos = { path = ".", features = ["serde"] }

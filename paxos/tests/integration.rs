@@ -95,6 +95,10 @@ impl Learner for TestState {
     type Message = String;
     type Error = io::Error;
 
+    fn node_id(&self) -> IpAddr {
+        self.node_id
+    }
+
     fn current_round(&self) -> u64 {
         self.round
     }

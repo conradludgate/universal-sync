@@ -87,8 +87,10 @@ impl<L: Learner> Clone for CoordinatorState<L> {
 ///
 /// This task lives as long as the acceptor is in the active set.
 /// It handles connection lifecycle and responds to coordinator commands.
+#[instrument(skip_all, name = "actor", fields(proposer = ?proposer_id, acceptor = ?acceptor_id))]
 async fn run_actor<L, C>(
-    node_id: <L::Proposal as Proposal>::NodeId,
+    proposer_id: <L::Proposal as Proposal>::NodeId,
+    acceptor_id: <L::Proposal as Proposal>::NodeId,
     connector: C,
     mut state_rx: watch::Receiver<CoordinatorState<L>>,
     msg_tx: mpsc::UnboundedSender<ActorMessage<L>>,
@@ -98,7 +100,7 @@ async fn run_actor<L, C>(
     C::ConnectFuture: Unpin,
     C::Connection: Unpin,
 {
-    let mut conn: LazyConnection<L, C> = LazyConnection::new(node_id, connector);
+    let mut conn: LazyConnection<L, C> = LazyConnection::new(acceptor_id, connector);
     let mut last_seq = 0u64;
 
     trace!("actor started");
@@ -248,6 +250,7 @@ enum ProposeResult<L: Learner> {
 
 /// Manages the set of actor tasks
 struct ActorManager<L: Learner, C: Connector<L>> {
+    proposer_id: <L::Proposal as Proposal>::NodeId,
     actors: JoinMap<<L::Proposal as Proposal>::NodeId, ()>,
     connector: C,
     state_tx: watch::Sender<CoordinatorState<L>>,
@@ -269,7 +272,11 @@ where
     C::ConnectFuture: Unpin,
     C::Connection: Unpin,
 {
-    fn new(connector: C, msg_tx: mpsc::UnboundedSender<ActorMessage<L>>) -> Self {
+    fn new(
+        proposer_id: <L::Proposal as Proposal>::NodeId,
+        connector: C,
+        msg_tx: mpsc::UnboundedSender<ActorMessage<L>>,
+    ) -> Self {
         debug!("creating actor manager");
         let (state_tx, state_rx) = watch::channel(CoordinatorState {
             command: Command::Idle,
@@ -277,6 +284,7 @@ where
         });
 
         Self {
+            proposer_id,
             actors: JoinMap::new(),
             connector,
             state_tx,
@@ -302,11 +310,12 @@ where
         let mut spawned = 0;
         for id in desired {
             if !self.actors.contains_key(&id) {
+                let proposer_id = self.proposer_id;
                 let connector = self.connector.clone();
                 let state_rx = self.state_rx.clone();
                 let msg_tx = self.msg_tx.clone();
                 self.actors
-                    .spawn(id, run_actor(id, connector, state_rx, msg_tx));
+                    .spawn(id, run_actor(proposer_id, id, connector, state_rx, msg_tx));
                 spawned += 1;
             }
         }
@@ -346,7 +355,7 @@ where
 /// # Errors
 ///
 /// Returns an error if the learner fails to apply a learned proposal.
-#[instrument(skip_all, name = "proposer")]
+#[instrument(skip_all, name = "proposer", fields(node_id = ?learner.node_id()))]
 pub async fn run_proposer<L, C, M, S, R>(
     mut learner: L,
     connector: C,
@@ -366,7 +375,7 @@ where
     debug!("proposer started");
     let mut attempt = <L::Proposal as Proposal>::AttemptId::default();
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<ActorMessage<L>>();
-    let mut manager: ActorManager<L, C> = ActorManager::new(connector, msg_tx);
+    let mut manager: ActorManager<L, C> = ActorManager::new(learner.node_id(), connector, msg_tx);
 
     loop {
         let round = learner.current_round();

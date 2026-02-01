@@ -152,7 +152,7 @@ where
 /// Returns an error if:
 /// - Communication with acceptors fails
 /// - The learner fails to apply a proposal
-#[instrument(skip_all, name = "learner")]
+#[instrument(skip_all, name = "learner", fields(node_id = ?learner.node_id()))]
 pub async fn run_learner<L, C, I>(mut learner: L, connections: I) -> Result<(), L::Error>
 where
     L: Learner,

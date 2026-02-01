@@ -22,7 +22,7 @@ use crate::{Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, Prop
 /// Returns an error if:
 /// - Communication with the client fails
 /// - The acceptor fails to persist an accepted proposal
-#[instrument(skip_all, name = "acceptor")]
+#[instrument(skip_all, name = "acceptor", fields(node_id = ?acceptor.node_id()))]
 pub async fn run_acceptor<A, S, C>(mut acceptor: A, state: S, mut conn: C) -> Result<(), A::Error>
 where
     A: Acceptor,
