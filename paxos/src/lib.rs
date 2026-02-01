@@ -26,7 +26,7 @@ pub use config::{BackoffConfig, ProposerConfig, Sleep, TokioSleep};
 pub use connection::LazyConnection;
 pub use learner::{LearnerSession, run_learner};
 pub use messages::{AcceptorMessage, AcceptorRequest};
-pub use proposer::{ProposerError, run_proposer};
+pub use proposer::run_proposer;
 pub use state::{AcceptorReceiver, RoundState, SharedAcceptorState};
 pub use traits::{
     Acceptor, AcceptorConn, AcceptorStateStore, Connector, Learner, Proposal, ProposalKey,

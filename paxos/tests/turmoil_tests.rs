@@ -23,6 +23,29 @@ use rand::rngs::StdRng;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use turmoil::Builder;
 
+/// Initialize tracing for tests. Call at the start of each test.
+/// Uses RUST_LOG env var for filtering (defaults to "debug" for this crate).
+fn init_tracing() -> impl Sized {
+    use tracing::Dispatch;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("basic_paxos=debug")),
+        )
+        .with_span_events(FmtSpan::CLOSE)
+        .with_test_writer()
+        .finish();
+
+    // Use registry and set as the default for this thread only,
+    // using tracing::dispatcher::set_global_default will set for the whole process (not wanted).
+    // Instead, use set_default in a scope, but make it a no-op closure to persist it for this thread.
+    let dispatch = Dispatch::new(subscriber);
+    tracing::dispatcher::set_default(&dispatch)
+}
+
 const ACCEPTOR_PORT: u16 = 9999;
 
 // --- Turmoil Sleep Implementation ---
@@ -136,7 +159,6 @@ impl Learner for TestState {
     type Proposal = TestProposal;
     type Message = String;
     type Error = io::Error;
-    type NodeId = SocketAddr;
 
     fn current_round(&self) -> u64 {
         // Derive from shared state to stay synchronized across proposers
@@ -548,6 +570,7 @@ fn start_acceptor(
 
 #[test]
 fn turmoil_basic_consensus() {
+    let _guard = init_tracing();
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(55))
         .build();
@@ -592,6 +615,7 @@ fn turmoil_basic_consensus() {
 
 #[test]
 fn turmoil_multiple_messages() {
+    let _guard = init_tracing();
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(60))
         .build();
@@ -634,6 +658,7 @@ fn turmoil_multiple_messages() {
 
 #[test]
 fn turmoil_with_latency() {
+    let _guard = init_tracing();
     // Test with variable message latency
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(60))
@@ -675,6 +700,7 @@ fn turmoil_with_latency() {
 
 #[test]
 fn turmoil_competing_proposers() {
+    let _guard = init_tracing();
     // Two proposers competing for multiple rounds.
     // They SHARE the learned state (simulating a shared database or same-node scenario).
     // This ensures they stay synchronized on which round to propose for.
@@ -772,6 +798,7 @@ fn turmoil_competing_proposers() {
 
 #[test]
 fn turmoil_one_acceptor_slow() {
+    let _guard = init_tracing();
     // Test that consensus can be reached even when one acceptor is very slow
     // (simulates a partially failed acceptor)
     let mut sim = Builder::new()
@@ -837,6 +864,7 @@ fn turmoil_one_acceptor_slow() {
 
 #[test]
 fn turmoil_acceptor_crashes_and_recovers() {
+    let _guard = init_tracing();
     // Test that the proposer can handle an acceptor that crashes and comes back
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(30))
@@ -891,6 +919,7 @@ fn turmoil_acceptor_crashes_and_recovers() {
 
 #[test]
 fn turmoil_high_latency_acceptor() {
+    let _guard = init_tracing();
     // Test that consensus works when one acceptor has very high latency
     let mut sim = Builder::new()
         .simulation_duration(Duration::from_secs(30))
@@ -1020,13 +1049,18 @@ async fn connect_to_all_acceptors(
 
 #[test]
 fn turmoil_learner_sync() {
+    let _guard = init_tracing();
     // Test that a learner can sync from acceptors and receive proposals
     // Learner connects to ALL acceptors and requires quorum confirmation
-    let mut sim = Builder::new()
-        // .simulation_duration(Duration::from_secs(30))
-        .build();
+    //
+    // This test runs proposer first, then learner connects after proposer finishes.
+    // Both run in the same simulation using a notification channel.
 
     const ACCEPTOR_NAMES: &[&str] = &["acceptor-0", "acceptor-1", "acceptor-2"];
+
+    let mut sim = Builder::new()
+        .simulation_duration(Duration::from_secs(60))
+        .build();
 
     // Start all acceptors with learner support
     for name in ACCEPTOR_NAMES {
@@ -1035,6 +1069,11 @@ fn turmoil_learner_sync() {
 
     let proposer_learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
     let proposer_learned_clone = proposer_learned.clone();
+    let learner_learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
+    let learner_learned_clone = learner_learned.clone();
+
+    // Notification channel - proposer signals when done
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Proposer commits some values
     sim.client("proposer", async move {
@@ -1053,17 +1092,20 @@ fn turmoil_learner_sync() {
             .map_err(|e| {
                 Box::new(io::Error::other(format!("{e:?}"))) as Box<dyn std::error::Error>
             })?;
+
+        // Signal completion
+        let _ = done_tx.send(());
         Ok(())
     });
 
     // wait for proposer to finish
     while !sim.step().unwrap() {}
 
-    let learner_learned: SharedLearned = Arc::new(Mutex::new(BTreeMap::new()));
-    let learner_learned_clone = learner_learned.clone();
-
-    // Learner connects to ALL acceptors after proposer has committed values
+    // Learner waits for proposer to finish, then syncs
     sim.client("learner", async move {
+        // Wait for proposer to finish
+        let _ = (&mut done_rx).await;
+
         // Connect to ALL acceptors' learner ports
         let connections = connect_to_all_acceptors(ACCEPTOR_NAMES).await?;
 
@@ -1109,6 +1151,7 @@ fn turmoil_learner_sync() {
 
 #[test]
 fn turmoil_learner_live_broadcast() {
+    let _guard = init_tracing();
     // Test that a learner receives live broadcasts as values are accepted
     // Learner connects to ALL acceptors and requires quorum confirmation
     let mut sim = Builder::new()

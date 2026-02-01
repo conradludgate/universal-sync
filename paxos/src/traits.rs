@@ -1,6 +1,7 @@
 //! Core Paxos traits
 
-use std::{future::Future, hash::Hash};
+use core::future::Future;
+use core::{fmt, hash::Hash};
 
 use futures::{Sink, Stream};
 
@@ -8,9 +9,9 @@ use crate::messages::{AcceptorMessage, AcceptorRequest};
 
 /// A proposal that can be ordered by (`node_id`, round, attempt)
 pub trait Proposal: Clone {
-    type NodeId: Copy + Ord + core::fmt::Debug + core::hash::Hash;
-    type RoundId: Copy + Ord + Default + core::fmt::Debug + core::hash::Hash;
-    type AttemptId: Copy + Ord + Default + core::fmt::Debug + core::hash::Hash;
+    type NodeId: Copy + Ord + fmt::Debug + Hash + Send + Sync;
+    type RoundId: Copy + Ord + Default + fmt::Debug + Hash + Send + Sync;
+    type AttemptId: Copy + Ord + Default + fmt::Debug + Hash + Send + Sync;
 
     fn node_id(&self) -> Self::NodeId;
     fn round(&self) -> Self::RoundId;
@@ -114,11 +115,10 @@ impl<P: Proposal> ProposalKey<P> {
 
 /// State machine that learns from consensus
 #[expect(async_fn_in_trait)]
-pub trait Learner {
-    type Proposal: Proposal;
-    type Message: Clone;
+pub trait Learner: Send + Sync + 'static {
+    type Proposal: Proposal + Send + Sync + 'static;
+    type Message: Clone + Send + Sync + 'static;
     type Error: core::error::Error + Send;
-    type NodeId: Clone + Eq + Hash;
 
     /// Current round (next to be learned)
     fn current_round(&self) -> <Self::Proposal as Proposal>::RoundId;
@@ -127,7 +127,7 @@ pub trait Learner {
     fn validate(&self, proposal: &Self::Proposal) -> bool;
 
     /// Current acceptor set based on learned state
-    fn acceptors(&self) -> impl IntoIterator<Item = Self::NodeId>;
+    fn acceptors(&self) -> impl IntoIterator<Item = <Self::Proposal as Proposal>::NodeId>;
 
     /// Create a signed proposal for the current round and attempt.
     /// The message is sent separately during Accept phase.
@@ -199,12 +199,12 @@ pub trait AcceptorStateStore<L: Learner> {
 ///
 /// Implementations should handle backoff/retry logic internally when connections fail.
 /// The connector is cloned per-address, so `&mut self` can be used to track retry state.
-pub trait Connector<L: Learner>: Clone {
-    type Connection: AcceptorConn<L>;
+pub trait Connector<L: Learner>: Clone + Send + 'static {
+    type Connection: AcceptorConn<L> + Send;
     type Error: core::error::Error;
-    type ConnectFuture: Future<Output = Result<Self::Connection, Self::Error>>;
+    type ConnectFuture: Future<Output = Result<Self::Connection, Self::Error>> + Send;
 
-    fn connect(&mut self, node_id: &L::NodeId) -> Self::ConnectFuture;
+    fn connect(&mut self, node_id: &<L::Proposal as Proposal>::NodeId) -> Self::ConnectFuture;
 }
 
 /// Connection to an acceptor

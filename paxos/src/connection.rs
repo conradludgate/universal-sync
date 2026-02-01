@@ -7,8 +7,9 @@ use std::{
 
 use futures::{Sink, Stream};
 use tokio::task::coop;
+use tracing::{trace, warn};
 
-use crate::{AcceptorMessage, AcceptorRequest, Connector, Learner};
+use crate::{AcceptorMessage, AcceptorRequest, Connector, Learner, Proposal};
 
 /// A lazy connection that establishes the actual connection on first use.
 ///
@@ -18,7 +19,7 @@ use crate::{AcceptorMessage, AcceptorRequest, Connector, Learner};
 /// The connector is responsible for implementing retry logic with backoff.
 /// Tracks consecutive failures so callers can check connection health.
 pub struct LazyConnection<L: Learner, C: Connector<L>> {
-    node_id: L::NodeId,
+    node_id: <L::Proposal as Proposal>::NodeId,
     connector: C,
     connecting: Option<C::ConnectFuture>,
     connection: Option<C::Connection>,
@@ -28,7 +29,7 @@ pub struct LazyConnection<L: Learner, C: Connector<L>> {
 
 impl<L: Learner, C: Connector<L>> LazyConnection<L, C> {
     /// Create a new lazy connection to the given node.
-    pub fn new(node_id: L::NodeId, connector: C) -> Self {
+    pub fn new(node_id: <L::Proposal as Proposal>::NodeId, connector: C) -> Self {
         Self {
             node_id,
             connector,
@@ -77,6 +78,7 @@ where
                 coop.made_progress();
 
                 if let Ok(conn) = res {
+                    trace!("connection established");
                     this.connecting = None;
                     this.connection = Some(conn);
                     this.consecutive_failures = 0;
@@ -84,11 +86,16 @@ where
                 }
                 this.connecting = None;
                 this.consecutive_failures += 1;
+                warn!(
+                    failures = this.consecutive_failures,
+                    "connection attempt failed"
+                );
                 // Try again - connector handles backoff
             }
 
             // Start a new connection attempt
             // The connector is responsible for backoff and returning an error when giving up
+            trace!("starting connection attempt");
             this.connecting = Some(this.connector.connect(&this.node_id));
         }
     }

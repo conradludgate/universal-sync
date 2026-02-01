@@ -1,6 +1,7 @@
 //! Learner connection to acceptors for syncing and receiving broadcasts
 
 use futures::{Sink, SinkExt, Stream, StreamExt, stream::SelectAll};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::{AcceptorMessage, AcceptorRequest, Learner, Proposal, quorum::QuorumTracker};
 
@@ -34,15 +35,25 @@ where
         I: IntoIterator<Item = C>,
     {
         let mut connections: Vec<C> = connections.into_iter().collect();
-        let tracker: QuorumTracker<L> = QuorumTracker::new(connections.len());
+        let num_connections = connections.len();
+        let tracker: QuorumTracker<L> = QuorumTracker::new(num_connections);
 
         // Send a dummy prepare to trigger sync from our current round
         // Using default attempt (0) - this is just for sync, not actual proposing
         let current_round = learner.current_round();
+        debug!(
+            ?current_round,
+            num_connections,
+            quorum = tracker.quorum(),
+            "creating learner session"
+        );
+
         let dummy_proposal = learner.propose(<L::Proposal as Proposal>::AttemptId::default());
         for conn in &mut connections {
-            conn.send(AcceptorRequest::Prepare(dummy_proposal.clone())).await?;
+            conn.send(AcceptorRequest::Prepare(dummy_proposal.clone()))
+                .await?;
         }
+        trace!("sent prepare to all acceptors");
 
         // Merge all streams into one
         let merged: SelectAll<C> = connections.into_iter().collect();
@@ -68,15 +79,31 @@ where
         &mut self,
         learner: &mut L,
     ) -> Result<Option<(L::Proposal, L::Message)>, L::Error> {
+        // First check if current_round already has quorum from previously tracked messages
+        // This handles the case where future rounds were tracked before we advanced to them
+        if let Some((learned_p, learned_m)) = self.tracker.get_with_quorum(self.current_round) {
+            let result = (learned_p.clone(), learned_m.clone());
+            debug!(round = ?self.current_round, "learned value with quorum (already tracked)");
+            learner.apply(result.0.clone(), result.1.clone()).await?;
+            self.tracker.clear_round(self.current_round);
+            self.current_round = learner.current_round();
+            trace!(new_round = ?self.current_round, "advanced to next round");
+            return Ok(Some(result));
+        }
+
+        trace!(current_round = ?self.current_round, "learn_one waiting for messages");
+
         while let Some(result) = self.merged.next().await {
             let msg = result?;
 
             // Learners only care about accepted (proposal, message) pairs
             let Some((proposal, message)) = msg.accepted else {
+                trace!("received non-accepted message, skipping");
                 continue;
             };
 
             if !learner.validate(&proposal) {
+                warn!("received invalid proposal, skipping");
                 continue;
             }
 
@@ -84,19 +111,28 @@ where
 
             // Skip rounds we've already learned
             if round < self.current_round {
+                trace!(?round, current = ?self.current_round, "skipping old round");
                 continue;
             }
 
-            // Track and check for quorum
-            if let Some((learned_p, learned_m)) = self.tracker.track(proposal, message) {
+            trace!(?round, "tracking message");
+            // Track the message (for current or future rounds)
+            self.tracker.track(proposal, message);
+
+            // Only try to learn the current round (to maintain ordering)
+            // Even if a higher round has quorum, we must wait for current_round first
+            if let Some((learned_p, learned_m)) = self.tracker.get_with_quorum(self.current_round) {
                 let result = (learned_p.clone(), learned_m.clone());
+                debug!(round = ?self.current_round, "learned value with quorum");
                 learner.apply(result.0.clone(), result.1.clone()).await?;
-                self.tracker.clear_round(round);
+                self.tracker.clear_round(self.current_round);
                 self.current_round = learner.current_round();
+                trace!(new_round = ?self.current_round, "advanced to next round");
                 return Ok(Some(result));
             }
         }
 
+        debug!("all connections closed");
         Ok(None)
     }
 }
@@ -116,6 +152,7 @@ where
 /// Returns an error if:
 /// - Communication with acceptors fails
 /// - The learner fails to apply a proposal
+#[instrument(skip_all, name = "learner")]
 pub async fn run_learner<L, C, I>(mut learner: L, connections: I) -> Result<(), L::Error>
 where
     L: Learner,
@@ -124,10 +161,15 @@ where
         + Unpin,
     I: IntoIterator<Item = C>,
 {
+    debug!("learner started");
     let mut session = LearnerSession::new(&learner, connections).await?;
 
     // Learn values until all connections close
-    while session.learn_one(&mut learner).await?.is_some() {}
+    let mut count = 0;
+    while session.learn_one(&mut learner).await?.is_some() {
+        count += 1;
+    }
 
+    debug!(learned_count = count, "learner finished");
     Ok(())
 }

@@ -2,6 +2,7 @@
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::select;
+use tracing::{debug, instrument, trace, warn};
 
 use crate::{Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, Proposal};
 
@@ -21,6 +22,7 @@ use crate::{Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, Prop
 /// Returns an error if:
 /// - Communication with the client fails
 /// - The acceptor fails to persist an accepted proposal
+#[instrument(skip_all, name = "acceptor")]
 pub async fn run_acceptor<A, S, C>(mut acceptor: A, state: S, mut conn: C) -> Result<(), A::Error>
 where
     A: Acceptor,
@@ -29,31 +31,45 @@ where
         + Sink<AcceptorMessage<A>, Error = A::Error>
         + Unpin,
 {
+    debug!("acceptor started, waiting for initial prepare");
+
     // Wait for initial Prepare to establish the sync point
     let from_round = loop {
         let Some(msg) = conn.next().await else {
+            debug!("connection closed before initial prepare");
             return Ok(());
         };
         let AcceptorRequest::Prepare(proposal) = msg? else {
-            // Ignore Accept before Prepare
+            trace!("ignoring non-prepare message before initial prepare");
             continue;
         };
 
         // Validate the signed proposal
         if !acceptor.validate(&proposal) {
+            warn!("rejecting invalid proposal");
             continue;
         }
 
         let from_round = proposal.round();
+        debug!(?from_round, "received initial prepare");
 
         // Try to promise
         let round_state = match state.promise(&proposal) {
-            Ok(()) => state.get(proposal.round()),
-            Err(current) => current,
+            Ok(()) => {
+                trace!("promise succeeded");
+                state.get(proposal.round())
+            }
+            Err(current) => {
+                trace!("promise failed, returning current state");
+                current
+            }
         };
 
         // Send historical accepted values first
-        for (p, m) in state.accepted_from(from_round) {
+        let historical = state.accepted_from(from_round);
+        debug!(count = historical.len(), "sending historical values");
+        for (p, m) in historical {
+            trace!(round = ?p.round(), "sending historical value");
             conn.send(AcceptorMessage {
                 promised: None,
                 accepted: Some((p, m)),
@@ -62,11 +78,13 @@ where
         }
 
         // Then send the promise response
+        trace!("sending promise response");
         conn.send(round_state.into()).await?;
 
         break from_round;
     };
 
+    debug!("entering streaming mode");
     // Now run bidirectional streaming: handle requests + broadcast accepts
     run_streaming(&mut acceptor, &state, &mut conn, from_round).await
 }
@@ -88,12 +106,14 @@ where
         + Unpin,
 {
     let mut receiver = state.subscribe();
+    trace!("subscribed to broadcast channel");
 
     loop {
         select! {
             // Handle incoming requests
             msg = conn.next() => {
                 let Some(msg) = msg else {
+                    debug!("connection closed");
                     return Ok(());
                 };
                 handle_request(acceptor, state, conn, msg?).await?;
@@ -101,10 +121,12 @@ where
             // Forward broadcasts (accepts from other connections)
             broadcast = receiver.next() => {
                 let Some((proposal, message)) = broadcast else {
+                    debug!("broadcast channel closed");
                     return Ok(());
                 };
                 // Only forward if it's >= our sync point
                 if proposal.round() >= from_round {
+                    trace!(round = ?proposal.round(), "forwarding broadcast");
                     conn.send(AcceptorMessage {
                         promised: None,
                         accepted: Some((proposal, message)),
@@ -129,28 +151,42 @@ where
 {
     match msg {
         AcceptorRequest::Prepare(proposal) => {
+            trace!(round = ?proposal.round(), "received prepare");
             if !acceptor.validate(&proposal) {
+                warn!("rejecting invalid prepare");
                 return Ok(());
             }
 
             let round_state = match state.promise(&proposal) {
-                Ok(()) => state.get(proposal.round()),
-                Err(current) => current,
+                Ok(()) => {
+                    debug!(round = ?proposal.round(), "promised");
+                    state.get(proposal.round())
+                }
+                Err(current) => {
+                    trace!("promise failed, returning current state");
+                    current
+                }
             };
 
             conn.send(round_state.into()).await?;
         }
         AcceptorRequest::Accept(proposal, message) => {
+            trace!(round = ?proposal.round(), "received accept");
             if !acceptor.validate(&proposal) {
+                warn!("rejecting invalid accept");
                 return Ok(());
             }
 
             let round_state = match state.accept(&proposal, &message) {
                 Ok(()) => {
+                    debug!(round = ?proposal.round(), "accepted");
                     acceptor.accept(proposal.clone(), message).await?;
                     state.get(proposal.round())
                 }
-                Err(current) => current,
+                Err(current) => {
+                    trace!("accept failed, returning current state");
+                    current
+                }
             };
 
             conn.send(round_state.into()).await?;

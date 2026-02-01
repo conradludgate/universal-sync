@@ -12,6 +12,29 @@ use basic_paxos::{
 };
 use futures::{Sink, SinkExt, Stream, channel::mpsc};
 
+/// Initialize tracing for tests. Call at the start of each test.
+/// Uses RUST_LOG env var for filtering (defaults to "debug" for this crate).
+fn init_tracing() -> impl Sized {
+    use tracing::Dispatch;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("basic_paxos=debug")),
+        )
+        .with_span_events(FmtSpan::CLOSE)
+        .with_test_writer()
+        .finish();
+
+    // Use registry and set as the default for this thread only,
+    // using tracing::dispatcher::set_global_default will set for the whole process (not wanted).
+    // Instead, use set_default in a scope, but make it a no-op closure to persist it for this thread.
+    let dispatch = Dispatch::new(subscriber);
+    tracing::dispatcher::set_default(&dispatch)
+}
+
 // --- Test Proposal Implementation ---
 
 /// Proposal is just metadata (node_id, round, attempt) - the actual value is Message
@@ -71,7 +94,6 @@ impl Learner for TestState {
     type Proposal = TestProposal;
     type Message = String;
     type Error = io::Error;
-    type NodeId = IpAddr;
 
     fn current_round(&self) -> u64 {
         self.round
@@ -244,6 +266,7 @@ impl Connector<TestState> for ChannelConnector {
 
 #[tokio::test]
 async fn test_basic_consensus_channels() {
+    let _guard = init_tracing();
     let acceptor_addrs = vec![
         IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
         IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)),
@@ -302,6 +325,7 @@ async fn test_basic_consensus_channels() {
 
 #[tokio::test]
 async fn test_multiple_proposals() {
+    let _guard = init_tracing();
     let acceptor_addrs = vec![
         IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
         IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)),
@@ -357,6 +381,7 @@ async fn test_multiple_proposals() {
 
 #[tokio::test]
 async fn test_minority_slow() {
+    let _guard = init_tracing();
     // Test that consensus works even with one slow acceptor
     use std::time::Duration;
 
