@@ -1,0 +1,14 @@
+# TLC model checker output
+*.toolbox/
+.vscode/tlc/
+states/
+
+# TLC generated files
+*.out
+*_TTrace_*.tla
+*_TE.tla
+MC.out
+MC_TE.out
+
+# Counterexample traces
+*.tlc
