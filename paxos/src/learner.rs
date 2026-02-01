@@ -20,11 +20,15 @@ where
         + Sink<AcceptorRequest<L>, Error = L::Error>
         + Unpin,
 {
-    /// Create a new learner session and send sync requests to all acceptors.
+    /// Create a new learner session and send prepare requests to all acceptors.
+    ///
+    /// Sends a "dummy" prepare with the current round to trigger sync.
+    /// Acceptors will respond with all accepted values from that round onwards
+    /// and then stream live updates.
     ///
     /// # Errors
     ///
-    /// Returns an error if sending the sync request fails.
+    /// Returns an error if sending the prepare request fails.
     pub async fn new<I>(learner: &L, connections: I) -> Result<Self, L::Error>
     where
         I: IntoIterator<Item = C>,
@@ -32,13 +36,12 @@ where
         let mut connections: Vec<C> = connections.into_iter().collect();
         let tracker: QuorumTracker<L> = QuorumTracker::new(connections.len());
 
-        // Request sync from our current round on all connections
+        // Send a dummy prepare to trigger sync from our current round
+        // Using default attempt (0) - this is just for sync, not actual proposing
         let current_round = learner.current_round();
+        let dummy_proposal = learner.propose(<L::Proposal as Proposal>::AttemptId::default());
         for conn in &mut connections {
-            conn.send(AcceptorRequest::Sync {
-                from_round: current_round,
-            })
-            .await?;
+            conn.send(AcceptorRequest::Prepare(dummy_proposal.clone())).await?;
         }
 
         // Merge all streams into one

@@ -126,9 +126,20 @@ async fn run_actor<L, A>(
                     continue; // Connection failed, will retry on next state change
                 }
 
-                // Wait for promise
-                let Some(Ok(promise)) = conn.next().await else {
-                    continue;
+                // Wait for a valid promise (skip broadcasts that have no `promised` field)
+                let promise = loop {
+                    let Some(Ok(msg)) = conn.next().await else {
+                        break None;
+                    };
+                    // A valid promise response has `promised` set
+                    if msg.promised.is_some() {
+                        break Some(msg);
+                    }
+                    // Otherwise it's a broadcast - skip it
+                };
+
+                let Some(promise) = promise else {
+                    continue; // Connection failed
                 };
 
                 // Send to coordinator
@@ -151,19 +162,40 @@ async fn run_actor<L, A>(
                     }
 
                     // Check if we moved to Accept phase for current proposal
-                    if let Phase::Accept { proposal, message } = new_state.phase {
+                    if let Phase::Accept {
+                        proposal,
+                        message: msg_value,
+                    } = new_state.phase
+                    {
+                        let proposal_key = proposal.key();
+
                         // Send accept
                         if conn
-                            .send(AcceptorRequest::Accept(proposal, message))
+                            .send(AcceptorRequest::Accept(proposal, msg_value))
                             .await
                             .is_err()
                         {
                             break; // Connection failed
                         }
 
-                        // Wait for accepted
-                        let Some(Ok(accepted)) = conn.next().await else {
-                            break;
+                        // Wait for accepted response (skip stale broadcasts)
+                        let accepted = loop {
+                            let Some(Ok(msg)) = conn.next().await else {
+                                break None;
+                            };
+                            // Check if this is a response for our proposal or a higher one
+                            if let Some((accepted_p, _)) = &msg.accepted {
+                                // Skip broadcasts for lower proposals (stale)
+                                // Accept broadcasts for our proposal or higher (need to handle)
+                                if accepted_p.key() >= proposal_key {
+                                    break Some(msg);
+                                }
+                            }
+                            // Otherwise it's a stale broadcast - skip it
+                        };
+
+                        let Some(accepted) = accepted else {
+                            break; // Connection failed
                         };
 
                         // Send to coordinator
@@ -481,14 +513,26 @@ async fn run_proposal<L: Learner>(
             };
         }
 
-        // Check promise for higher proposals
-        if let Some(promised) = msg.promised
-            && learner.validate(&promised)
-            && promised.key() > proposal_key
-        {
+        // Check promise - must have a promised value to count as a valid promise
+        let Some(promised_p) = msg.promised else {
+            // No promise in message - this is just a broadcast, ignore it
+            continue;
+        };
+
+        if !learner.validate(&promised_p) {
+            continue;
+        }
+
+        // Check if the acceptor promised a higher proposal
+        if promised_p.key() > proposal_key {
             return ProposeResult::Rejected {
-                min_attempt: L::Proposal::next_attempt(promised.attempt()),
+                min_attempt: L::Proposal::next_attempt(promised_p.attempt()),
             };
+        }
+
+        // Only count if acceptor promised exactly our proposal
+        if promised_p.key() != proposal_key {
+            continue;
         }
 
         promises += 1;

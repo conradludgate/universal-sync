@@ -425,10 +425,6 @@ fn encode_acceptor_request(msg: &AcceptorRequest<TestState>) -> Vec<u8> {
             buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
             buf.extend_from_slice(message.as_bytes());
         }
-        AcceptorRequest::Sync { from_round } => {
-            buf.push(2);
-            buf.extend_from_slice(&from_round.to_le_bytes());
-        }
     }
     buf
 }
@@ -450,10 +446,6 @@ fn decode_acceptor_request(buf: &[u8]) -> Option<AcceptorRequest<TestState>> {
             pos += 4;
             let message = String::from_utf8(buf.get(pos..pos + len)?.to_vec()).ok()?;
             Some(AcceptorRequest::Accept(proposal, message))
-        }
-        2 => {
-            let from_round = u64::from_le_bytes(buf.get(pos..pos + 8)?.try_into().ok()?);
-            Some(AcceptorRequest::Sync { from_round })
         }
         _ => None,
     }

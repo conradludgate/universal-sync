@@ -1,14 +1,16 @@
 //! Acceptor implementation
 
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use tokio::select;
 
 use crate::{Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, Proposal};
 
 /// Run the acceptor loop with shared state.
 ///
-/// Handles both proposer requests (Prepare/Accept) and learner requests (Sync).
-/// When a `Sync` request is received, the connection switches to streaming mode
-/// and sends all historical + live accepted values.
+/// When a `Prepare` is received, the acceptor:
+/// 1. Sends all historical accepted values from that round onwards
+/// 2. Sends the promise response
+/// 3. Switches to bidirectional streaming mode (handles Accept requests + broadcasts)
 ///
 /// Uses shared state allowing multiple connections to the same acceptor to
 /// properly coordinate promises and accepts. When a proposal is accepted,
@@ -27,81 +29,132 @@ where
         + Sink<AcceptorMessage<A>, Error = A::Error>
         + Unpin,
 {
-    while let Some(msg) = conn.try_next().await? {
-        match msg {
-            AcceptorRequest::Prepare(proposal) => {
-                // Validate the signed proposal
-                if !acceptor.validate(&proposal) {
-                    continue;
-                }
+    // Wait for initial Prepare to establish the sync point
+    let from_round = loop {
+        let Some(msg) = conn.next().await else {
+            return Ok(());
+        };
+        let AcceptorRequest::Prepare(proposal) = msg? else {
+            // Ignore Accept before Prepare
+            continue;
+        };
 
-                // Try to promise - on success we get Ok, on rejection we get the current state
-                let round_state = match state.promise(&proposal) {
-                    Ok(()) => state.get(proposal.round()),
-                    Err(current) => current,
+        // Validate the signed proposal
+        if !acceptor.validate(&proposal) {
+            continue;
+        }
+
+        let from_round = proposal.round();
+
+        // Try to promise
+        let round_state = match state.promise(&proposal) {
+            Ok(()) => state.get(proposal.round()),
+            Err(current) => current,
+        };
+
+        // Send historical accepted values first
+        for (p, m) in state.accepted_from(from_round) {
+            conn.send(AcceptorMessage {
+                promised: None,
+                accepted: Some((p, m)),
+            })
+            .await?;
+        }
+
+        // Then send the promise response
+        conn.send(round_state.into()).await?;
+
+        break from_round;
+    };
+
+    // Now run bidirectional streaming: handle requests + broadcast accepts
+    run_streaming(&mut acceptor, &state, &mut conn, from_round).await
+}
+
+/// Bidirectional streaming mode.
+///
+/// Handles incoming Prepare/Accept requests while also forwarding broadcast accepts.
+async fn run_streaming<A, S, C>(
+    acceptor: &mut A,
+    state: &S,
+    conn: &mut C,
+    from_round: <A::Proposal as Proposal>::RoundId,
+) -> Result<(), A::Error>
+where
+    A: Acceptor,
+    S: AcceptorStateStore<A>,
+    C: Stream<Item = Result<AcceptorRequest<A>, A::Error>>
+        + Sink<AcceptorMessage<A>, Error = A::Error>
+        + Unpin,
+{
+    let mut receiver = state.subscribe();
+
+    loop {
+        select! {
+            // Handle incoming requests
+            msg = conn.next() => {
+                let Some(msg) = msg else {
+                    return Ok(());
                 };
-
-                conn.send(round_state.into()).await?;
+                handle_request(acceptor, state, conn, msg?).await?;
             }
-            AcceptorRequest::Accept(proposal, message) => {
-                // Validate the signed proposal
-                if !acceptor.validate(&proposal) {
-                    continue;
-                }
-
-                // Try to accept - on success persist, state broadcasts to learners automatically
-                let round_state = match state.accept(&proposal, &message) {
-                    Ok(()) => {
-                        // Persist before responding
-                        acceptor.accept(proposal.clone(), message).await?;
-                        state.get(proposal.round())
-                    }
-                    Err(current) => current,
+            // Forward broadcasts (accepts from other connections)
+            broadcast = receiver.next() => {
+                let Some((proposal, message)) = broadcast else {
+                    return Ok(());
                 };
-
-                conn.send(round_state.into()).await?;
-            }
-            AcceptorRequest::Sync { from_round } => {
-                // Switch to learner streaming mode
-                return stream_to_learner(&state, &mut conn, from_round).await;
+                // Only forward if it's >= our sync point
+                if proposal.round() >= from_round {
+                    conn.send(AcceptorMessage {
+                        promised: None,
+                        accepted: Some((proposal, message)),
+                    }).await?;
+                }
             }
         }
     }
-
-    Ok(())
 }
 
-/// Stream accepted values to a learner connection.
-///
-/// Sends all historical values from `from_round`, then streams live broadcasts.
-async fn stream_to_learner<L, S, C>(
+/// Handle a single Prepare or Accept request.
+async fn handle_request<A, S, C>(
+    acceptor: &mut A,
     state: &S,
     conn: &mut C,
-    from_round: <L::Proposal as Proposal>::RoundId,
-) -> Result<(), L::Error>
+    msg: AcceptorRequest<A>,
+) -> Result<(), A::Error>
 where
-    L: crate::Learner,
-    S: AcceptorStateStore<L>,
-    C: Sink<AcceptorMessage<L>, Error = L::Error> + Unpin,
+    A: Acceptor,
+    S: AcceptorStateStore<A>,
+    C: Sink<AcceptorMessage<A>, Error = A::Error> + Unpin,
 {
-    // Send all historical accepted values
-    let historical = state.accepted_from(from_round);
-    for (proposal, message) in historical {
-        conn.send(AcceptorMessage {
-            promised: None,
-            accepted: Some((proposal, message)),
-        })
-        .await?;
-    }
+    match msg {
+        AcceptorRequest::Prepare(proposal) => {
+            if !acceptor.validate(&proposal) {
+                return Ok(());
+            }
 
-    // Subscribe and stream live broadcasts
-    let mut receiver = state.subscribe();
-    while let Some((proposal, message)) = receiver.next().await {
-        conn.send(AcceptorMessage {
-            promised: None,
-            accepted: Some((proposal, message)),
-        })
-        .await?;
+            let round_state = match state.promise(&proposal) {
+                Ok(()) => state.get(proposal.round()),
+                Err(current) => current,
+            };
+
+            conn.send(round_state.into()).await?;
+        }
+        AcceptorRequest::Accept(proposal, message) => {
+            if !acceptor.validate(&proposal) {
+                return Ok(());
+            }
+
+            let round_state = match state.accept(&proposal, &message) {
+                Ok(()) => {
+                    acceptor.accept(proposal.clone(), message).await?;
+                    state.get(proposal.round())
+                }
+                Err(current) => current,
+            };
+
+            conn.send(round_state.into()).await?;
+        }
     }
 
     Ok(())

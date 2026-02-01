@@ -1,19 +1,19 @@
 //! Paxos protocol messages
 
-use crate::{Learner, Proposal, RoundState};
+use crate::{Learner, RoundState};
 
 /// Messages from proposer/learner to acceptor
+///
+/// Both proposers and learners use `Prepare` to initiate a connection.
+/// The acceptor responds with historical values and then streams live updates.
+/// Learners can send a "dummy" prepare with default `round`/`attempt`/`node_id`.
 #[derive(Debug)]
 pub enum AcceptorRequest<L: Learner> {
     /// Phase 1: Prepare request - sends signed proposal (can be validated)
+    /// Also triggers sync: acceptor sends all accepted values from this round onwards.
     Prepare(L::Proposal),
     /// Phase 2: Accept request - sends signed proposal + message value
     Accept(L::Proposal, L::Message),
-    /// Sync request from learner - switches connection to streaming mode
-    Sync {
-        /// The round to sync from (inclusive)
-        from_round: <L::Proposal as Proposal>::RoundId,
-    },
 }
 
 impl<L: Learner> Clone for AcceptorRequest<L> {
@@ -21,9 +21,6 @@ impl<L: Learner> Clone for AcceptorRequest<L> {
         match self {
             Self::Prepare(p) => Self::Prepare(p.clone()),
             Self::Accept(p, m) => Self::Accept(p.clone(), m.clone()),
-            Self::Sync { from_round } => Self::Sync {
-                from_round: *from_round,
-            },
         }
     }
 }
