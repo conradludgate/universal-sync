@@ -5,6 +5,7 @@
 //! - [`Proposal`]: A proposal that can be ordered and compared
 //! - [`ProposalKey`]: Ordering key for proposals
 //! - [`Learner`]: State machine that learns from consensus
+//! - [`Proposer`]: Extension of Learner that can create proposals
 //! - [`Acceptor`]: Acceptor that can persist accepted proposals
 //! - [`AcceptorStateStore`]: Shared state for acceptors
 //! - [`Connector`]: Connects to acceptors by node ID
@@ -138,16 +139,23 @@ pub trait Learner: Send + Sync + 'static {
     /// Current acceptor set based on learned state
     fn acceptors(&self) -> impl IntoIterator<Item = <Self::Proposal as Proposal>::NodeId>;
 
-    /// Create a signed proposal for the current round and attempt.
-    /// The message is sent separately during Accept phase.
-    fn propose(&self, attempt: <Self::Proposal as Proposal>::AttemptId) -> Self::Proposal;
-
     /// Apply a learned proposal + message to the state machine
     async fn apply(
         &mut self,
         proposal: Self::Proposal,
         message: Self::Message,
     ) -> Result<(), Self::Error>;
+}
+
+/// A learner that can also create proposals
+///
+/// This trait extends [`Learner`] with the ability to create signed proposals.
+/// Implementations are typically devices/clients that can propose values,
+/// not acceptors (which only validate and store proposals from others).
+pub trait Proposer: Learner {
+    /// Create a signed proposal for the current round and attempt.
+    /// The message is sent separately during Accept phase.
+    fn propose(&self, attempt: <Self::Proposal as Proposal>::AttemptId) -> Self::Proposal;
 }
 
 /// Acceptor that can persist accepted proposals

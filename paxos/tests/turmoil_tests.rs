@@ -23,6 +23,7 @@ use universal_sync_paxos::config::{BackoffConfig, ProposerConfig, Sleep};
 use universal_sync_paxos::proposer::Proposer;
 use universal_sync_paxos::{
     Acceptor, AcceptorMessage, AcceptorRequest, Connector, Learner, Proposal,
+    Proposer as ProposerTrait,
 };
 
 /// Initialize tracing for tests. Call at the start of each test.
@@ -179,14 +180,6 @@ impl Learner for TestState {
         self.acceptors.clone()
     }
 
-    fn propose(&self, attempt: u64) -> TestProposal {
-        TestProposal {
-            node_id: self.node_id,
-            round: self.current_round(),
-            attempt,
-        }
-    }
-
     async fn apply(&mut self, proposal: TestProposal, message: String) -> Result<(), io::Error> {
         // Only insert if not already learned (prevents duplicates with shared state)
         let round = proposal.round;
@@ -196,6 +189,16 @@ impl Learner for TestState {
             .entry(round)
             .or_insert(LearnedEntry { proposal, message });
         Ok(())
+    }
+}
+
+impl ProposerTrait for TestState {
+    fn propose(&self, attempt: u64) -> TestProposal {
+        TestProposal {
+            node_id: self.node_id,
+            round: self.current_round(),
+            attempt,
+        }
     }
 }
 
@@ -388,7 +391,7 @@ async fn run_proposer<L, C, M, S, R>(
     config: ProposerConfig<S, R>,
 ) -> Result<(), L::Error>
 where
-    L: Learner + Send + Sync + 'static,
+    L: ProposerTrait + Send + Sync + 'static,
     L::Message: Send + Sync + 'static,
     C: Connector<L> + Send + 'static,
     C::ConnectFuture: Send,

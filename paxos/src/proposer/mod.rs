@@ -34,7 +34,7 @@ use tracing::{debug, trace};
 use crate::config::{BackoffConfig, ProposerConfig, Sleep};
 use crate::core::{AcceptPhaseResult, PreparePhaseResult, ProposerCore};
 use crate::messages::AcceptorMessage;
-use crate::traits::{Connector, Learner, Proposal};
+use crate::traits::{Connector, Learner, Proposal, Proposer as ProposerTrait};
 
 // ============================================================================
 // Proposer Implementation
@@ -60,17 +60,17 @@ enum ProposeResult<L: Learner> {
 /// - **Learn values**: Call [`learn_one`](Self::learn_one) to wait for a quorum-confirmed value
 ///
 /// Learners are just proposers that never call `propose()`.
-pub struct Proposer<L: Learner, C: Connector<L>, S: Sleep, R: Rng = StdRng>
+pub struct Proposer<P: ProposerTrait, C: Connector<P>, S: Sleep, R: Rng = StdRng>
 where
-    L::Message: Send + Sync + 'static,
+    P::Message: Send + Sync + 'static,
     C::ConnectFuture: Send,
     C::Connection: Send,
 {
-    manager: ActorManager<L, C>,
-    msg_rx: mpsc::UnboundedReceiver<ActorMessage<L>>,
-    attempt: <L::Proposal as Proposal>::AttemptId,
+    manager: ActorManager<P, C>,
+    msg_rx: mpsc::UnboundedReceiver<ActorMessage<P>>,
+    attempt: <P::Proposal as Proposal>::AttemptId,
     /// Quorum tracker for learning - persists across `learn_one` calls to buffer future rounds
-    learn_tracker: QuorumTracker<L>,
+    learn_tracker: QuorumTracker<P>,
     /// Backoff configuration for retries
     backoff: BackoffConfig,
     /// Timeout for prepare/accept phases (None = no timeout)
@@ -81,11 +81,11 @@ where
     rng: R,
 }
 
-impl<L, C, S, R> Proposer<L, C, S, R>
+impl<P, C, S, R> Proposer<P, C, S, R>
 where
-    L: Learner + Send + Sync + 'static,
-    L::Message: Send + Sync + 'static,
-    C: Connector<L> + Send + 'static,
+    P: ProposerTrait + Send + Sync + 'static,
+    P::Message: Send + Sync + 'static,
+    C: Connector<P> + Send + 'static,
     C::ConnectFuture: Send,
     C::Connection: Send,
     S: Sleep,
@@ -97,18 +97,18 @@ where
     /// to establish connections to acceptors.
     #[must_use]
     pub fn new(
-        node_id: <L::Proposal as Proposal>::NodeId,
+        node_id: <P::Proposal as Proposal>::NodeId,
         connector: C,
         config: ProposerConfig<S, R>,
     ) -> Self {
         debug!("creating proposer");
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ActorMessage<L>>();
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ActorMessage<P>>();
         let manager = ActorManager::new(node_id, connector, msg_tx);
         // Initialize with 0 actors; learn_one() will reset with correct count
         Self {
             manager,
             msg_rx,
-            attempt: <L::Proposal as Proposal>::AttemptId::default(),
+            attempt: <P::Proposal as Proposal>::AttemptId::default(),
             learn_tracker: QuorumTracker::new(0),
             backoff: config.backoff,
             phase_timeout: config.phase_timeout,
@@ -123,7 +123,7 @@ where
     /// actors for acceptors no longer in the set.
     pub fn sync_actors(
         &mut self,
-        acceptors: impl IntoIterator<Item = <L::Proposal as Proposal>::NodeId>,
+        acceptors: impl IntoIterator<Item = <P::Proposal as Proposal>::NodeId>,
     ) {
         self.manager.sync_actors(acceptors);
     }
@@ -138,15 +138,20 @@ where
     ///
     /// This triggers acceptors to send historical values and then stream live updates.
     /// Call this once before calling `learn_one` in a loop.
-    pub fn start_sync(&mut self, learner: &L) {
+    ///
+    /// Note: Requires a [`ProposerTrait`] implementation to create the sync proposal.
+    pub fn start_sync(
+        &mut self,
+        proposer: &impl ProposerTrait<Proposal = P::Proposal, Message = P::Message, Error = P::Error>,
+    ) {
         // Reset the quorum tracker for learning
         let num_acceptors = self.manager.num_actors();
         self.learn_tracker = QuorumTracker::new(num_acceptors);
 
         // Start a "dummy" prepare to trigger sync from acceptors.
         // Using default attempt (0) - this is just for sync, not actual proposing.
-        let dummy_proposal = learner.propose(<L::Proposal as Proposal>::AttemptId::default());
-        self.manager.start_prepare(dummy_proposal);
+        let sync_proposal = proposer.propose(<P::Proposal as Proposal>::AttemptId::default());
+        self.manager.start_prepare(sync_proposal);
         debug!(num_acceptors, "started sync");
     }
 
@@ -170,7 +175,7 @@ where
     /// buffered in an internal tracker that persists across calls. If cancelled,
     /// calling `learn_one` again will first check for quorum from buffered messages
     /// before waiting for new ones, so no progress is lost.
-    pub async fn learn_one(&mut self, learner: &L) -> Option<(L::Proposal, L::Message)> {
+    pub async fn learn_one(&mut self, learner: &P) -> Option<(P::Proposal, P::Message)> {
         let current_round = learner.current_round();
 
         // Reinitialize tracker if actor count changed
@@ -240,23 +245,23 @@ where
     /// scratch.
     pub async fn propose(
         &mut self,
-        learner: &L,
-        message: L::Message,
-    ) -> Option<(L::Proposal, L::Message)> {
-        let round = learner.current_round();
+        proposer: &P,
+        message: P::Message,
+    ) -> Option<(P::Proposal, P::Message)> {
+        let round = proposer.current_round();
         let num_acceptors = self.manager.num_actors();
-        let mut tracker: QuorumTracker<L> = QuorumTracker::new(num_acceptors);
+        let mut tracker: QuorumTracker<P> = QuorumTracker::new(num_acceptors);
         debug!(?round, quorum = tracker.quorum(), "proposing");
 
         // Proposal loop with retries
         for consecutive_rejections in 0.. {
-            let proposal = learner.propose(self.attempt);
+            let proposal = proposer.propose(self.attempt);
             debug!(attempt = ?self.attempt, consecutive_rejections, "attempting proposal");
 
             let result = self
                 .run_proposal(
                     &mut tracker,
-                    learner,
+                    proposer,
                     proposal.clone(),
                     message.clone(),
                     round,
@@ -266,7 +271,7 @@ where
             match result {
                 ProposeResult::Accepted(proposal, message) => {
                     debug!("proposal accepted");
-                    self.attempt = <L::Proposal as Proposal>::AttemptId::default();
+                    self.attempt = <P::Proposal as Proposal>::AttemptId::default();
                     return Some((proposal, message));
                 }
                 ProposeResult::Rejected { min_attempt } => {
@@ -289,7 +294,7 @@ where
     }
 
     /// Receive and validate next actor message for proposal phase.
-    async fn recv_for_phase(&mut self, expected_seq: u64) -> RecvResult<L> {
+    async fn recv_for_phase(&mut self, expected_seq: u64) -> RecvResult<P> {
         let recv = if let Some(t) = self.phase_timeout {
             tokio::select! {
                 biased;
@@ -322,12 +327,12 @@ where
     /// Run a single proposal attempt through both phases using `ProposerCore`
     async fn run_proposal(
         &mut self,
-        tracker: &mut QuorumTracker<L>,
-        learner: &L,
-        proposal: L::Proposal,
-        message: L::Message,
-        round: <L::Proposal as Proposal>::RoundId,
-    ) -> ProposeResult<L> {
+        tracker: &mut QuorumTracker<P>,
+        learner: &impl Learner<Proposal = P::Proposal, Message = P::Message, Error = P::Error>,
+        proposal: P::Proposal,
+        message: P::Message,
+        round: <P::Proposal as Proposal>::RoundId,
+    ) -> ProposeResult<P> {
         let proposal_key = proposal.key();
         let mut core = ProposerCore::new(proposal_key, message.clone(), self.manager.num_actors());
         trace!(quorum = core.quorum(), "initialized proposer core");
@@ -343,7 +348,7 @@ where
                 RecvResult::Stale => continue,
                 RecvResult::Timeout => {
                     debug!("prepare phase timed out");
-                    let min_attempt = L::Proposal::next_attempt(proposal.attempt());
+                    let min_attempt = P::Proposal::next_attempt(proposal.attempt());
                     return ProposeResult::Rejected { min_attempt };
                 }
                 RecvResult::Closed => {
@@ -369,7 +374,7 @@ where
                 // Reject if a higher proposal was already accepted in this round
                 if accepted_p.key() >= proposal_key {
                     debug!("rejected: higher proposal already accepted");
-                    let min_attempt = L::Proposal::next_attempt(accepted_p.attempt());
+                    let min_attempt = P::Proposal::next_attempt(accepted_p.attempt());
                     return ProposeResult::Rejected { min_attempt };
                 }
             }
@@ -388,7 +393,7 @@ where
                 PreparePhaseResult::Quorum { value } => break value,
                 PreparePhaseResult::Rejected { superseded_by, .. } => {
                     debug!(?superseded_by, "rejected: higher proposal");
-                    let min_attempt = L::Proposal::next_attempt(superseded_by.attempt());
+                    let min_attempt = P::Proposal::next_attempt(superseded_by.attempt());
                     return ProposeResult::Rejected { min_attempt };
                 }
                 // Need more promises
@@ -410,7 +415,7 @@ where
                 RecvResult::Stale => continue,
                 RecvResult::Timeout => {
                     debug!("accept phase timed out");
-                    let min_attempt = L::Proposal::next_attempt(proposal.attempt());
+                    let min_attempt = P::Proposal::next_attempt(proposal.attempt());
                     return ProposeResult::Rejected { min_attempt };
                 }
                 RecvResult::Closed => {
@@ -438,7 +443,7 @@ where
                 }
                 AcceptPhaseResult::Rejected { superseded_by } => {
                     debug!(?superseded_by, "rejected: higher proposal accepted");
-                    let min_attempt = L::Proposal::next_attempt(superseded_by.attempt());
+                    let min_attempt = P::Proposal::next_attempt(superseded_by.attempt());
                     return ProposeResult::Rejected { min_attempt };
                 }
                 // Need more accepts
@@ -449,11 +454,11 @@ where
 }
 
 /// Result of receiving a message for a proposal phase.
-enum RecvResult<L: Learner> {
+enum RecvResult<P: Learner> {
     /// Received a valid message for current seq
     Message {
-        acceptor_id: <L::Proposal as Proposal>::NodeId,
-        msg: AcceptorMessage<L>,
+        acceptor_id: <P::Proposal as Proposal>::NodeId,
+        msg: AcceptorMessage<P>,
     },
     /// Message was stale (wrong seq), caller should continue
     Stale,

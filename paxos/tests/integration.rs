@@ -11,6 +11,7 @@ use universal_sync_paxos::config::ProposerConfig;
 use universal_sync_paxos::proposer::Proposer;
 use universal_sync_paxos::{
     Acceptor, AcceptorMessage, AcceptorRequest, Connector, Learner, Proposal,
+    Proposer as ProposerTrait,
 };
 
 /// Initialize tracing for tests. Call at the start of each test.
@@ -112,18 +113,20 @@ impl Learner for TestState {
         self.acceptors.clone()
     }
 
+    async fn apply(&mut self, _proposal: TestProposal, message: String) -> Result<(), io::Error> {
+        self.learned.lock().unwrap().push(message);
+        self.round += 1;
+        Ok(())
+    }
+}
+
+impl ProposerTrait for TestState {
     fn propose(&self, attempt: u64) -> TestProposal {
         TestProposal {
             node_id: self.node_id,
             round: self.round,
             attempt,
         }
-    }
-
-    async fn apply(&mut self, _proposal: TestProposal, message: String) -> Result<(), io::Error> {
-        self.learned.lock().unwrap().push(message);
-        self.round += 1;
-        Ok(())
     }
 }
 

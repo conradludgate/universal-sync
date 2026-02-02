@@ -43,5 +43,5 @@ mod traits;
 
 pub use messages::{AcceptorMessage, AcceptorRequest};
 pub use traits::{
-    Acceptor, AcceptorConn, AcceptorStateStore, Connector, Learner, Proposal, ProposalKey,
+    Acceptor, AcceptorConn, AcceptorStateStore, Connector, Learner, Proposal, ProposalKey, Proposer,
 };
