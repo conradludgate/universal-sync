@@ -21,7 +21,9 @@ mod quorum;
 mod state;
 mod traits;
 
-pub use acceptor::run_acceptor;
+pub use acceptor::{
+    AcceptError, AcceptOutcome, AcceptorHandler, InvalidProposal, PromiseOutcome, run_acceptor,
+};
 pub use config::{BackoffConfig, ProposerConfig, Sleep, TokioSleep};
 pub use connection::LazyConnection;
 pub use messages::{AcceptorMessage, AcceptorRequest};

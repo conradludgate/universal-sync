@@ -7,8 +7,8 @@ use std::{
 };
 
 use basic_paxos::{
-    Acceptor, AcceptorMessage, AcceptorRequest, Connector, Learner, Proposal, ProposerConfig,
-    SharedAcceptorState, run_acceptor, run_proposer,
+    Acceptor, AcceptorHandler, AcceptorMessage, AcceptorRequest, Connector, Learner, Proposal,
+    ProposerConfig, SharedAcceptorState, run_acceptor, run_proposer,
 };
 use futures::{Sink, SinkExt, Stream, channel::mpsc};
 
@@ -289,14 +289,9 @@ async fn test_basic_consensus_channels() {
         proposer_conns.push((*addr, proposer_conn));
 
         let state = TestState::new(*addr, acceptor_addrs.clone());
+        let handler = AcceptorHandler::new(state, SharedAcceptorState::new());
         let handle = tokio::spawn(async move {
-            let _ = run_acceptor(
-                state,
-                SharedAcceptorState::new(),
-                acceptor_conn,
-                proposer_id,
-            )
-            .await;
+            let _ = run_acceptor(handler, acceptor_conn, proposer_id).await;
         });
         acceptor_handles.push(handle);
     }
@@ -353,14 +348,9 @@ async fn test_multiple_proposals() {
         proposer_conns.push((*addr, proposer_conn));
 
         let state = TestState::new(*addr, acceptor_addrs.clone());
+        let handler = AcceptorHandler::new(state, SharedAcceptorState::new());
         let handle = tokio::spawn(async move {
-            let _ = run_acceptor(
-                state,
-                SharedAcceptorState::new(),
-                acceptor_conn,
-                proposer_id,
-            )
-            .await;
+            let _ = run_acceptor(handler, acceptor_conn, proposer_id).await;
         });
         acceptor_handles.push(handle);
     }
@@ -418,17 +408,12 @@ async fn test_minority_slow() {
         proposer_conns.push((*addr, proposer_conn));
 
         let state = TestState::new(*addr, acceptor_addrs.clone());
+        let handler = AcceptorHandler::new(state, SharedAcceptorState::new());
 
         if i < 2 {
             // Normal acceptors
             let handle = tokio::spawn(async move {
-                let _ = run_acceptor(
-                    state,
-                    SharedAcceptorState::new(),
-                    acceptor_conn,
-                    proposer_id,
-                )
-                .await;
+                let _ = run_acceptor(handler, acceptor_conn, proposer_id).await;
             });
             acceptor_handles.push(handle);
         } else {
@@ -436,13 +421,7 @@ async fn test_minority_slow() {
             let handle = tokio::spawn(async move {
                 // Keep connection alive but don't respond quickly enough
                 tokio::time::sleep(Duration::from_secs(100)).await;
-                let _ = run_acceptor(
-                    state,
-                    SharedAcceptorState::new(),
-                    acceptor_conn,
-                    proposer_id,
-                )
-                .await;
+                let _ = run_acceptor(handler, acceptor_conn, proposer_id).await;
             });
             acceptor_handles.push(handle);
         }

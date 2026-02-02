@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use futures::Stream;
+use futures::{Stream, StreamExt, stream};
 use tokio::sync::broadcast;
 
 use crate::core::{AcceptResult, AcceptorCore, PrepareResult};
@@ -145,11 +145,18 @@ where
     }
 }
 
+/// Stream of historical accepted values for in-memory state.
+pub type HistoricalStream<L> =
+    stream::Iter<std::vec::IntoIter<(<L as Learner>::Proposal, <L as Learner>::Message)>>;
+
+/// Combined subscription stream (historical + live).
+pub type AcceptorSubscription<L> = stream::Chain<HistoricalStream<L>, AcceptorReceiver<L>>;
+
 impl<L: Learner> AcceptorStateStore<L> for SharedAcceptorState<L>
 where
     (L::Proposal, L::Message): Send + 'static,
 {
-    type Receiver = AcceptorReceiver<L>;
+    type Subscription = AcceptorSubscription<L>;
 
     fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L> {
         let core = self.core.lock().unwrap();
@@ -164,22 +171,17 @@ where
     fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>> {
         self.store_proposal(proposal);
 
-        let mut core = self.core.lock().unwrap();
         let round = proposal.round();
         let key = proposal.key();
 
-        match core.prepare(round, key) {
+        let res = self.core.lock().unwrap().prepare(round, key);
+
+        match res {
             PrepareResult::Promised { .. } => Ok(()),
-            PrepareResult::Rejected {
-                promised: promised_key,
-                accepted,
-            } => {
-                drop(core); // Release lock before calling get_proposal
-                Err(RoundState {
-                    promised: self.get_proposal(&promised_key),
-                    accepted: accepted.and_then(|(k, m)| self.get_proposal(&k).map(|p| (p, m))),
-                })
-            }
+            PrepareResult::Rejected { promised, accepted } => Err(RoundState {
+                promised: self.get_proposal(&promised),
+                accepted: accepted.and_then(|(k, m)| self.get_proposal(&k).map(|p| (p, m))),
+            }),
         }
     }
 
@@ -207,21 +209,24 @@ where
         }
     }
 
-    fn subscribe(&self) -> Self::Receiver {
-        AcceptorReceiver {
-            inner: tokio_stream::wrappers::BroadcastStream::new(self.broadcast.subscribe()),
-        }
-    }
-
-    fn accepted_from(
-        &self,
-        from_round: <L::Proposal as Proposal>::RoundId,
-    ) -> Vec<(L::Proposal, L::Message)> {
+    fn subscribe_from(&self, from_round: <L::Proposal as Proposal>::RoundId) -> Self::Subscription {
+        // Collect historical values, skipping from_round (included in promise response)
         let core = self.core.lock().unwrap();
-        core.accepted_from(from_round)
+        let historical: Vec<_> = core
+            .accepted_from(from_round)
             .into_iter()
+            .filter(|(k, _)| k.round() != from_round)
             .filter_map(|(k, m)| self.get_proposal(&k).map(|p| (p, m)))
-            .collect()
+            .collect();
+        drop(core);
+
+        // Create live broadcast receiver
+        let live = AcceptorReceiver {
+            inner: tokio_stream::wrappers::BroadcastStream::new(self.broadcast.subscribe()),
+        };
+
+        // Chain historical (yields first) with live (yields after)
+        stream::iter(historical).chain(live)
     }
 
     fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId> {

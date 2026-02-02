@@ -94,7 +94,6 @@ impl<L: Learner> Clone for CoordinatorState<L> {
 /// This task lives as long as the acceptor is in the active set.
 /// It handles connection lifecycle and responds to coordinator commands.
 #[instrument(skip_all, name = "actor", fields(node_id = ?proposer_id, acceptor = ?acceptor_id))]
-#[allow(clippy::too_many_lines)]
 async fn run_actor<L, C>(
     proposer_id: <L::Proposal as Proposal>::NodeId,
     acceptor_id: <L::Proposal as Proposal>::NodeId,
@@ -653,7 +652,6 @@ where
 }
 
 /// Run a single proposal attempt through both phases using `ProposerCore`
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_proposal<L, C, S>(
     manager: &ActorManager<L, C>,
     msg_rx: &mut mpsc::UnboundedReceiver<ActorMessage<L>>,

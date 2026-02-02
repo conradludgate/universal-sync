@@ -409,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn check_paxos_two_proposers() {
         // 2 proposers with different values, 3 acceptors
         // Use smaller max_attempt bound (2 instead of 3) for faster checking

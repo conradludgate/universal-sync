@@ -14,8 +14,8 @@ use std::{
 };
 
 use basic_paxos::{
-    Acceptor, AcceptorMessage, AcceptorRequest, BackoffConfig, Connector, Learner, Proposal,
-    Proposer, ProposerConfig, SharedAcceptorState, Sleep, run_acceptor, run_proposer,
+    Acceptor, AcceptorHandler, AcceptorMessage, AcceptorRequest, BackoffConfig, Connector, Learner,
+    Proposal, Proposer, ProposerConfig, SharedAcceptorState, Sleep, run_acceptor, run_proposer,
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, Stream, channel::mpsc};
@@ -395,10 +395,9 @@ fn start_acceptor(
             let (stream, mut addr) = listener.accept().await?;
             addr.set_port(0);
             let conn = Framed::new(stream, AcceptorCodec::default());
-            let state = state.clone();
-            let shared = shared.clone();
+            let handler = AcceptorHandler::new(state.clone(), shared.clone());
             tokio::spawn(async move {
-                let _ = run_acceptor(state, shared, conn, addr).await;
+                let _ = run_acceptor(handler, conn, addr).await;
             });
         }
     });
@@ -663,10 +662,9 @@ fn turmoil_one_acceptor_slow() {
                 let (stream, mut addr) = listener.accept().await?;
                 addr.set_port(0);
                 let conn = Framed::new(stream, AcceptorCodec::default());
-                let state = state.clone();
-                let shared = shared.clone();
+                let handler = AcceptorHandler::new(state.clone(), shared.clone());
                 tokio::spawn(async move {
-                    let _ = run_acceptor(state, shared, conn, addr).await;
+                    let _ = run_acceptor(handler, conn, addr).await;
                 });
             }
         });
@@ -823,9 +821,9 @@ fn start_acceptor_with_learner_support(
             addr.set_port(0);
             let conn = Framed::new(stream, AcceptorCodec::default());
             let state = TestState::new(my_node_id, acceptor_addrs.clone());
-            let shared = shared.clone();
+            let handler = AcceptorHandler::new(state, shared.clone());
             tokio::spawn(async move {
-                let _ = run_acceptor(state, shared, conn, addr).await;
+                let _ = run_acceptor(handler, conn, addr).await;
             });
         }
     });

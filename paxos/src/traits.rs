@@ -167,8 +167,8 @@ pub trait Acceptor: Learner {
 /// Both `promise()` and `accept()` must be atomic with respect to the
 /// round's state. Use appropriate locking to prevent race conditions.
 pub trait AcceptorStateStore<L: Learner> {
-    /// Receiver type for learner subscriptions.
-    type Receiver: futures::Stream<Item = (L::Proposal, L::Message)> + Unpin;
+    /// Combined subscription stream (historical + live broadcasts).
+    type Subscription: futures::Stream<Item = (L::Proposal, L::Message)> + Unpin;
 
     /// Get the state for a specific round.
     fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> crate::RoundState<L>;
@@ -209,15 +209,12 @@ pub trait AcceptorStateStore<L: Learner> {
         message: &L::Message,
     ) -> Result<(), crate::RoundState<L>>;
 
-    /// Subscribe to receive accepted (proposal, message) pairs.
-    fn subscribe(&self) -> Self::Receiver;
-
-    /// Get accepted (proposal, message) pairs from a given round onwards (for learner sync).
-    /// Returns in round order.
-    fn accepted_from(
-        &self,
-        from_round: <L::Proposal as Proposal>::RoundId,
-    ) -> Vec<(L::Proposal, L::Message)>;
+    /// Subscribe to accepted (proposal, message) pairs from a given round onwards.
+    ///
+    /// Returns a stream that yields:
+    /// 1. Historical values first (rounds >= `from_round` that were already accepted)
+    /// 2. Live broadcasts (new accepts as they happen)
+    fn subscribe_from(&self, from_round: <L::Proposal as Proposal>::RoundId) -> Self::Subscription;
 
     /// Get the highest round that has been accepted (for sync complete message).
     fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
