@@ -18,3 +18,5 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 serde_json = "1"
 pin-project-lite = "0.2"
+fjall = "3"
+tempfile = "3"

@@ -4,5 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-zerocopy.workspace = true
+universal-sync-paxos = { path = "../paxos" }
+mls-rs = { version = "0.43", default-features = false, features = ["external_client"] }
+mls-rs-crypto-rustcrypto = "0.13"
+serde.workspace = true
+postcard.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+fjall.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
