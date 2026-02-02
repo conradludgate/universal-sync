@@ -15,6 +15,7 @@ mod acceptor;
 mod config;
 mod connection;
 pub mod core;
+mod fuse;
 mod messages;
 mod proposer;
 mod quorum;

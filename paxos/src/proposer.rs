@@ -14,7 +14,7 @@ use tracing::{debug, instrument, trace, warn};
 use crate::{
     AcceptorMessage, AcceptorRequest, Connector, LazyConnection, Learner, Proposal, ProposerConfig,
     Sleep,
-    core::{PreparePhaseResult, ProposerCore},
+    core::{AcceptPhaseResult, PreparePhaseResult, ProposerCore},
     quorum::QuorumTracker,
 };
 
@@ -656,6 +656,39 @@ struct ProposalContext<'a, L: Learner, C: Connector<L>, S> {
     phase_timeout: Option<Duration>,
 }
 
+impl<L: Learner, C: Connector<L>, S: Sleep> ProposalContext<'_, L, C, S> {
+    /// Receive and validate next actor message for proposal phase.
+    async fn recv_for_phase(&mut self, expected_seq: u64) -> RecvResult<L> {
+        let recv = if let Some(t) = self.phase_timeout {
+            tokio::select! {
+                biased;
+                msg = self.msg_rx.recv() => msg,
+                () = self.sleep.sleep(t) => return RecvResult::Timeout,
+            }
+        } else {
+            self.msg_rx.recv().await
+        };
+
+        let Some(actor_msg) = recv else {
+            return RecvResult::Closed;
+        };
+
+        if actor_msg.seq != expected_seq {
+            trace!(
+                expected = expected_seq,
+                got = actor_msg.seq,
+                "ignoring stale message"
+            );
+            return RecvResult::Stale;
+        }
+
+        RecvResult::Message {
+            acceptor_id: actor_msg.acceptor_id,
+            msg: actor_msg.msg,
+        }
+    }
+}
+
 /// Result of receiving a message for a proposal phase.
 enum RecvResult<L: Learner> {
     /// Received a valid message for current seq
@@ -669,42 +702,6 @@ enum RecvResult<L: Learner> {
     Timeout,
     /// Channel closed
     Closed,
-}
-
-/// Receive and validate next actor message for proposal phase.
-async fn recv_for_phase<L: Learner, S: Sleep>(
-    msg_rx: &mut mpsc::UnboundedReceiver<ActorMessage<L>>,
-    sleep: &S,
-    timeout: Option<Duration>,
-    expected_seq: u64,
-) -> RecvResult<L> {
-    let recv = if let Some(t) = timeout {
-        tokio::select! {
-            biased;
-            msg = msg_rx.recv() => msg,
-            () = sleep.sleep(t) => return RecvResult::Timeout,
-        }
-    } else {
-        msg_rx.recv().await
-    };
-
-    let Some(actor_msg) = recv else {
-        return RecvResult::Closed;
-    };
-
-    if actor_msg.seq != expected_seq {
-        trace!(
-            expected = expected_seq,
-            got = actor_msg.seq,
-            "ignoring stale message"
-        );
-        return RecvResult::Stale;
-    }
-
-    RecvResult::Message {
-        acceptor_id: actor_msg.acceptor_id,
-        msg: actor_msg.msg,
-    }
 }
 
 /// Run a single proposal attempt through both phases using `ProposerCore`
@@ -731,26 +728,24 @@ where
 
     // Prepare phase: collect promises
     let chosen_message = loop {
-        let (acceptor_id, msg) =
-            match recv_for_phase(ctx.msg_rx, ctx.sleep, ctx.phase_timeout, seq).await {
-                RecvResult::Message { acceptor_id, msg } => (acceptor_id, msg),
-                RecvResult::Stale => continue,
-                RecvResult::Timeout => {
-                    debug!("prepare phase timed out");
-                    return ProposeResult::Rejected {
-                        min_attempt: L::Proposal::next_attempt(proposal.attempt()),
-                    };
-                }
-                RecvResult::Closed => {
-                    debug!("message channel closed during prepare phase");
-                    return ProposeResult::Closed;
-                }
-            };
+        let (acc_id, msg) = match ctx.recv_for_phase(seq).await {
+            RecvResult::Message { acceptor_id, msg } => (acceptor_id, msg),
+            RecvResult::Stale => continue,
+            RecvResult::Timeout => {
+                debug!("prepare phase timed out");
+                let min_attempt = L::Proposal::next_attempt(proposal.attempt());
+                return ProposeResult::Rejected { min_attempt };
+            }
+            RecvResult::Closed => {
+                debug!("message channel closed during prepare phase");
+                return ProposeResult::Closed;
+            }
+        };
 
         // Check for already accepted values in this round (learning from others)
-        if let Some((accepted_p, accepted_m)) = msg.accepted.clone()
+        if let Some((accepted_p, accepted_m)) = &msg.accepted
             && accepted_p.round() == round
-            && ctx.learner.validate(&accepted_p)
+            && ctx.learner.validate(accepted_p)
         {
             trace!("found already accepted value in this round");
             if let Some((learned_p, learned_m)) =
@@ -764,40 +759,33 @@ where
             // Reject if a higher proposal was already accepted in this round
             if accepted_p.key() >= proposal_key {
                 debug!("rejected: higher proposal already accepted");
-                return ProposeResult::Rejected {
-                    min_attempt: L::Proposal::next_attempt(accepted_p.attempt()),
-                };
+                let min_attempt = L::Proposal::next_attempt(accepted_p.attempt());
+                return ProposeResult::Rejected { min_attempt };
             }
         }
 
-        let promised_p = &msg.promised;
-
         // Validate the promise
-        if !ctx.learner.validate(promised_p) {
+        if !ctx.learner.validate(&msg.promised) {
             trace!("ignoring invalid promise");
             continue;
         }
 
         // Use ProposerCore to handle the promise
-        let result =
-            core.handle_promise(acceptor_id, promised_p.key(), msg.accepted, Proposal::key);
+        let result = core.handle_promise(acc_id, msg.promised.key(), msg.accepted, Proposal::key);
 
         match result {
-            PreparePhaseResult::Quorum { value } => {
-                debug!(quorum = core.quorum(), "prepare phase complete");
-                break value;
-            }
+            PreparePhaseResult::Quorum { value } => break value,
             PreparePhaseResult::Rejected { superseded_by, .. } => {
                 debug!(?superseded_by, "rejected: higher proposal");
-                return ProposeResult::Rejected {
-                    min_attempt: L::Proposal::next_attempt(superseded_by.attempt()),
-                };
+                let min_attempt = L::Proposal::next_attempt(superseded_by.attempt());
+                return ProposeResult::Rejected { min_attempt };
             }
-            PreparePhaseResult::Pending => {
-                // Need more promises
-            }
+            // Need more promises
+            PreparePhaseResult::Pending => {}
         }
     };
+
+    debug!(quorum = core.quorum(), "prepare phase complete");
 
     // Start accept phase with the chosen message
     ctx.manager
@@ -806,21 +794,19 @@ where
 
     // Accept phase: collect accepts
     loop {
-        let (acceptor_id, msg) =
-            match recv_for_phase(ctx.msg_rx, ctx.sleep, ctx.phase_timeout, seq).await {
-                RecvResult::Message { acceptor_id, msg } => (acceptor_id, msg),
-                RecvResult::Stale => continue,
-                RecvResult::Timeout => {
-                    debug!("accept phase timed out");
-                    return ProposeResult::Rejected {
-                        min_attempt: L::Proposal::next_attempt(proposal.attempt()),
-                    };
-                }
-                RecvResult::Closed => {
-                    debug!("message channel closed during accept phase");
-                    return ProposeResult::Closed;
-                }
-            };
+        let (acceptor_id, msg) = match ctx.recv_for_phase(seq).await {
+            RecvResult::Message { acceptor_id, msg } => (acceptor_id, msg),
+            RecvResult::Stale => continue,
+            RecvResult::Timeout => {
+                debug!("accept phase timed out");
+                let min_attempt = L::Proposal::next_attempt(proposal.attempt());
+                return ProposeResult::Rejected { min_attempt };
+            }
+            RecvResult::Closed => {
+                debug!("message channel closed during accept phase");
+                return ProposeResult::Closed;
+            }
+        };
 
         // Get the accepted key if present
         let Some((accepted_p, _)) = &msg.accepted else {
@@ -833,21 +819,18 @@ where
         }
 
         let result = core.handle_accepted(acceptor_id, Some(accepted_p.key()), proposal.clone());
-
         match result {
-            crate::core::AcceptPhaseResult::Learned { proposal, value } => {
+            AcceptPhaseResult::Learned { proposal, value } => {
                 debug!(quorum = core.quorum(), "accept phase complete");
                 return ProposeResult::Accepted(proposal, value);
             }
-            crate::core::AcceptPhaseResult::Rejected { superseded_by } => {
+            AcceptPhaseResult::Rejected { superseded_by } => {
                 debug!(?superseded_by, "rejected: higher proposal accepted");
-                return ProposeResult::Rejected {
-                    min_attempt: L::Proposal::next_attempt(superseded_by.attempt()),
-                };
+                let min_attempt = L::Proposal::next_attempt(superseded_by.attempt());
+                return ProposeResult::Rejected { min_attempt };
             }
-            crate::core::AcceptPhaseResult::Pending => {
-                // Need more accepts
-            }
+            // Need more accepts
+            AcceptPhaseResult::Pending => {}
         }
     }
 }

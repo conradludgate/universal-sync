@@ -16,6 +16,7 @@ scopeguard.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
+pin-project-lite.workspace = true
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]

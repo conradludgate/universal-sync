@@ -53,6 +53,7 @@ dependencies = [
  "bytes",
  "futures",
  "num_cpus",
+ "pin-project-lite",
  "postcard",
  "rand",
  "scopeguard",

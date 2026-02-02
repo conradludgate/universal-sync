@@ -2,10 +2,12 @@
 
 use std::fmt;
 
+use futures::stream::FusedStream;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::select;
 use tracing::{debug, instrument, trace, warn};
 
+use crate::fuse::Fuse;
 use crate::{Acceptor, AcceptorMessage, AcceptorRequest, AcceptorStateStore, Proposal};
 
 /// Error returned when a proposal fails validation.
@@ -197,25 +199,21 @@ where
 {
     debug!("acceptor started");
 
-    // sync is None until we receive the initial Prepare
-    let mut sync: Option<S::Subscription> = None;
+    // sync is terminated until we receive the initial Prepare
+    let mut sync: Fuse<S::Subscription> = Fuse::terminated();
 
     loop {
-        // Poll both conn and sync (if available)
-        let msg = if let Some(ref mut subscription) = sync {
-            select! {
-                msg = conn.next() => msg,
-                Some((proposal, message)) = subscription.next() => {
-                    trace!(round = ?proposal.round(), "forwarding accepted value");
-                    conn.send(AcceptorMessage {
-                        promised: proposal.clone(),
-                        accepted: Some((proposal, message)),
-                    }).await?;
-                    continue;
-                }
+        // Poll both conn and sync
+        let msg = select! {
+            msg = conn.next() => msg,
+            Some((proposal, message)) = sync.next() => {
+                trace!(round = ?proposal.round(), "forwarding accepted value");
+                conn.send(AcceptorMessage {
+                    promised: proposal.clone(),
+                    accepted: Some((proposal, message)),
+                }).await?;
+                continue;
             }
-        } else {
-            conn.next().await
         };
 
         // Handle connection message
@@ -232,8 +230,8 @@ where
                     Ok(PromiseOutcome::Promised(msg)) => {
                         debug!(round = ?proposal.round(), "promised");
                         // Subscribe on first successful promise
-                        if sync.is_none() {
-                            sync = Some(handler.state().subscribe_from(proposal.round()));
+                        if sync.is_terminated() {
+                            sync = Fuse::new(handler.state().subscribe_from(proposal.round()));
                             debug!("subscribed to state");
                         }
                         msg
@@ -241,8 +239,8 @@ where
                     Ok(PromiseOutcome::Outdated(msg)) => {
                         trace!("promise rejected - outdated");
                         // Also subscribe on first outdated (learner still needs sync)
-                        if sync.is_none() {
-                            sync = Some(handler.state().subscribe_from(proposal.round()));
+                        if sync.is_terminated() {
+                            sync = Fuse::new(handler.state().subscribe_from(proposal.round()));
                             debug!("subscribed to state");
                         }
                         if msg.promised.round() != proposal.round() {
@@ -260,7 +258,7 @@ where
             }
             AcceptorRequest::Accept(proposal, message) => {
                 // Ignore Accept before initial Prepare
-                if sync.is_none() {
+                if sync.is_terminated() {
                     trace!("ignoring accept before initial prepare");
                     continue;
                 }
