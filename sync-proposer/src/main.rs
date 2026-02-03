@@ -20,7 +20,6 @@ use universal_sync_core::{
 };
 use universal_sync_proposer::connector::PAXOS_ALPN;
 use universal_sync_proposer::repl::ReplContext;
-use universal_sync_proposer::store::SharedProposerStore;
 
 /// Universal Sync Proposer REPL
 #[derive(Parser, Debug)]
@@ -104,10 +103,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("MLS client created");
 
-    // Open persistent store
-    info!(path = ?args.data, "Opening data directory");
-    let store = SharedProposerStore::open(&args.data).await?;
-
     // Create iroh endpoint
     let endpoint = Endpoint::builder()
         .secret_key(iroh_key)
@@ -123,7 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer: secret_key,
         cipher_suite,
         endpoint,
-        store,
         groups: HashMap::new(),
     };
 
@@ -187,10 +181,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = resp_tx.send(res).await;
     }
 
-    // Gracefully shutdown all groups
-    for (_, group) in context.groups.drain() {
-        group.shutdown().await;
-    }
+    // Groups are dropped here, which cancels their background tasks
+    // (use group.shutdown().await for graceful shutdown if needed)
 
     Ok(())
 }

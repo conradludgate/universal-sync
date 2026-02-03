@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_testing::{
     AcceptorId, AcceptorRegistry, Group, GroupId, PAXOS_ALPN, SharedFjallStateStore,
-    SharedProposerStore, accept_connection, test_cipher_suite, test_client, test_crypto_provider,
+    accept_connection, test_cipher_suite, test_client, test_crypto_provider,
     test_identity_provider,
 };
 
@@ -84,25 +84,17 @@ async fn test_state_store_group_persistence() {
 async fn test_mls_group_creation_with_group_api() {
     init_tracing();
 
-    // Setup directories
-    let proposer_dir = TempDir::new().unwrap();
-
     // Create client
     let client_endpoint = test_endpoint().await;
     let test_result = test_client("alice");
 
-    let proposer_store = SharedProposerStore::open(proposer_dir.path())
-        .await
-        .expect("open proposer store");
-
     // Create a group using the new Group API (no acceptors)
-    let group = Group::create(
+    let mut group = Group::create(
         &test_result.client,
         test_result.signer,
         test_result.cipher_suite,
         &client_endpoint,
         &[], // No acceptors
-        proposer_store,
     )
     .await
     .expect("create group");
@@ -165,10 +157,6 @@ async fn test_alice_adds_bob_with_group_api() {
     // --- Alice creates a group using the Group API ---
     let alice = test_client("alice");
     let alice_endpoint = test_endpoint().await;
-    let alice_dir = TempDir::new().unwrap();
-    let alice_store = SharedProposerStore::open(alice_dir.path())
-        .await
-        .expect("open alice store");
 
     // Create group without acceptors first
     let mut alice_group = Group::create(
@@ -177,7 +165,6 @@ async fn test_alice_adds_bob_with_group_api() {
         alice.cipher_suite.clone(),
         &alice_endpoint,
         &[],
-        alice_store,
     )
     .await
     .expect("alice create group");
@@ -218,18 +205,13 @@ async fn test_alice_adds_bob_with_group_api() {
 
     // --- Bob joins using the Group API ---
     let bob_endpoint = test_endpoint().await;
-    let bob_dir = TempDir::new().unwrap();
-    let bob_store = SharedProposerStore::open(bob_dir.path())
-        .await
-        .expect("open bob store");
 
-    let bob_group = Group::join(
+    let mut bob_group = Group::join(
         &bob.client,
         bob.signer,
         bob.cipher_suite.clone(),
         &bob_endpoint,
         &welcome,
-        bob_store,
     )
     .await
     .expect("bob join group");
@@ -238,13 +220,11 @@ async fn test_alice_adds_bob_with_group_api() {
     tracing::info!(epoch = ?bob_context.epoch, "Bob joined group");
 
     // Verify Bob got the acceptor
-    assert_eq!(
-        bob_context.acceptors.len(),
-        1,
-        "Bob should have 1 acceptor"
-    );
+    assert_eq!(bob_context.acceptors.len(), 1, "Bob should have 1 acceptor");
     assert!(
-        bob_context.acceptors.contains(&AcceptorId(*acceptor_addr.id.as_bytes())),
+        bob_context
+            .acceptors
+            .contains(&AcceptorId(*acceptor_addr.id.as_bytes())),
         "Bob should have the acceptor ID"
     );
 
@@ -361,10 +341,6 @@ async fn test_acceptor_add_remove() {
     // --- Alice creates a group and manages acceptors ---
     let alice = test_client("alice");
     let alice_endpoint = test_endpoint().await;
-    let alice_dir = TempDir::new().unwrap();
-    let alice_store = SharedProposerStore::open(alice_dir.path())
-        .await
-        .expect("open alice store");
 
     let mut group = Group::create(
         &alice.client,
@@ -372,7 +348,6 @@ async fn test_acceptor_add_remove() {
         alice.cipher_suite.clone(),
         &alice_endpoint,
         &[],
-        alice_store,
     )
     .await
     .expect("create group");

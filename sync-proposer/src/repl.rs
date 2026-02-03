@@ -15,7 +15,6 @@ use tracing::info;
 use universal_sync_core::{AcceptorId, GroupId};
 
 use crate::group::Group;
-use crate::store::SharedProposerStore;
 
 /// REPL context holding all state
 pub struct ReplContext<C, CS>
@@ -31,8 +30,6 @@ where
     pub cipher_suite: CS,
     /// Iroh endpoint for P2P connections
     pub endpoint: Endpoint,
-    /// Persistent store for group state
-    pub store: SharedProposerStore,
     /// Currently loaded groups
     pub groups: HashMap<GroupId, Group<C, CS>>,
 }
@@ -99,6 +96,20 @@ where
                 self.cmd_group_context(parts[1])
             }
             "list_groups" => Ok(self.cmd_list_groups()),
+            "send" => {
+                if parts.len() < 3 {
+                    return Err("Usage: send <group_id_hex> <message>".to_string());
+                }
+                // Join remaining parts as the message
+                let message = parts[2..].join(" ");
+                self.cmd_send_message(parts[1], &message).await
+            }
+            "recv" => {
+                if parts.len() < 2 {
+                    return Err("Usage: recv <group_id_hex>".to_string());
+                }
+                self.cmd_recv_message(parts[1]).await
+            }
             _ => Err(format!(
                 "Unknown command: {}. Type 'help' for available commands.",
                 parts[0]
@@ -118,6 +129,8 @@ where
   remove_member <group_id> <member_index>  - Remove a member from a group
   group_context <group_id>                 - Display group context
   list_groups                              - List all loaded groups
+  send <group_id> <message>                - Send an encrypted message to the group
+  recv <group_id>                          - Receive and decrypt the next message
   help                                     - Show this help
   exit / quit                              - Exit the REPL
 "
@@ -144,7 +157,6 @@ where
             self.cipher_suite.clone(),
             &self.endpoint,
             &[],
-            self.store.clone(),
         )
         .await
         .map_err(|e| format!("Failed to create group: {e:?}"))?;
@@ -166,24 +178,12 @@ where
             self.cipher_suite.clone(),
             &self.endpoint,
             &welcome_bytes,
-            self.store.clone(),
         )
         .await
         .map_err(|e| format!("Failed to join group: {e:?}"))?;
 
         let group_id = group.group_id();
-        let context = group.context();
-
-        let mut output = format!("Joined group: {}\n", hex::encode(group_id.as_bytes()));
-        let _ = writeln!(output, "Epoch: {}", context.epoch.0);
-        let _ = writeln!(output, "Members: {}", context.member_count);
-
-        if !context.acceptors.is_empty() {
-            output.push_str("Acceptors:\n");
-            for id in &context.acceptors {
-                let _ = writeln!(output, "  {}", hex::encode(id.as_bytes()));
-            }
-        }
+        let output = Self::print_group_context(&group.context_snapshot());
 
         self.groups.insert(group_id, group);
 
@@ -302,27 +302,42 @@ where
         Ok(format!("Removed member: {member_index}"))
     }
 
-    fn cmd_group_context(&self, group_id_hex: &str) -> Result<String, String> {
+    fn cmd_group_context(&mut self, group_id_hex: &str) -> Result<String, String> {
         let group_id = parse_group_id(group_id_hex)?;
 
         let group = self
             .groups
-            .get(&group_id)
+            .get_mut(&group_id)
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
-        let context = group.context();
+        Ok(Self::print_group_context(&group.context()))
+    }
 
+    fn print_group_context(context: &crate::GroupContext) -> String {
         let mut output = String::new();
-        let _ = writeln!(output, "Group ID: {}", hex::encode(context.group_id.as_bytes()));
+        let _ = writeln!(
+            output,
+            "Group ID: {}",
+            hex::encode(context.group_id.as_bytes())
+        );
         let _ = writeln!(output, "Epoch: {}", context.epoch.0);
+        let _ = writeln!(
+            output,
+            "Transcript: {}",
+            hex::encode(&context.confirmed_transcript_hash)
+        );
         let _ = writeln!(output, "Members: {}", context.member_count);
 
-        output.push_str("\nAcceptors:\n");
-        for acceptor_id in &context.acceptors {
-            let _ = writeln!(output, "  {}", hex::encode(acceptor_id.as_bytes()));
+        if context.acceptors.is_empty() {
+            output.push_str("Acceptors: none\n");
+        } else {
+            output.push_str("Acceptors:\n");
+            for acceptor_id in &context.acceptors {
+                let _ = writeln!(output, "  {}", hex::encode(acceptor_id.as_bytes()));
+            }
         }
 
-        Ok(output)
+        output
     }
 
     fn cmd_list_groups(&self) -> String {
@@ -337,6 +352,64 @@ where
         }
 
         output
+    }
+
+    async fn cmd_send_message(
+        &mut self,
+        group_id_hex: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let group_id = parse_group_id(group_id_hex)?;
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
+
+        group
+            .send_message(message.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to send message: {e:?}"))?;
+
+        Ok("Message sent".to_string())
+    }
+
+    async fn cmd_recv_message(&mut self, group_id_hex: &str) -> Result<String, String> {
+        use std::time::Duration;
+
+        use tokio::time::timeout;
+
+        let group_id = parse_group_id(group_id_hex)?;
+
+        let group = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
+
+        // Use a short timeout to avoid blocking the REPL forever
+        let result = timeout(Duration::from_secs(5), group.recv_message()).await;
+
+        match result {
+            Ok(Ok(Some(msg))) => {
+                let mut output = String::new();
+                let _ = writeln!(output, "From: member {}", msg.sender.0);
+                let _ = writeln!(output, "Epoch: {}", msg.epoch.0);
+                let _ = writeln!(output, "Index: {}", msg.index);
+                // Try to decode as UTF-8, fall back to hex
+                match std::str::from_utf8(&msg.data) {
+                    Ok(text) => {
+                        let _ = writeln!(output, "Data: {text}");
+                    }
+                    Err(_) => {
+                        let _ = writeln!(output, "Data (hex): {}", hex::encode(&msg.data));
+                    }
+                }
+                Ok(output)
+            }
+            Ok(Ok(None)) => Ok("No messages (channel closed)".to_string()),
+            Ok(Err(e)) => Err(format!("Failed to receive message: {e:?}")),
+            Err(_) => Ok("No messages (timeout)".to_string()),
+        }
     }
 }
 

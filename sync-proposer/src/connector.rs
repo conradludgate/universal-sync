@@ -191,7 +191,7 @@ where
             let mut writer = FramedWrite::new(send, codec);
 
             // Send the Join handshake
-            let handshake = Handshake::Join(group_id);
+            let handshake = Handshake::JoinProposals(group_id);
             let handshake_bytes = postcard::to_allocvec(&handshake)
                 .map_err(|e| ConnectorError::Codec(e.to_string()))?;
             writer
@@ -306,7 +306,7 @@ pub async fn register_group_with_addr(
     let mut writer = FramedWrite::new(send, codec);
 
     // Send the Create handshake
-    let handshake = Handshake::Create(group_info.to_vec());
+    let handshake = Handshake::CreateGroup(group_info.to_vec());
     let handshake_bytes =
         postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
     writer

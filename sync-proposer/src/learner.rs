@@ -195,6 +195,23 @@ where
         Epoch(self.group.context().epoch)
     }
 
+    /// Encrypt an application message using MLS.
+    ///
+    /// The `authenticated_data` is included in the signature but not encrypted.
+    /// It can be used for per-message metadata like message indices.
+    ///
+    /// # Errors
+    /// Returns an error if encryption fails.
+    pub fn encrypt_application_message(
+        &mut self,
+        message: &[u8],
+        authenticated_data: Vec<u8>,
+    ) -> Result<mls_rs::MlsMessage, LearnerError> {
+        self.group
+            .encrypt_application_message(message, authenticated_data)
+            .map_err(LearnerError::Mls)
+    }
+
     /// Check if a member ID is in the current roster
     fn is_member(&self, member_id: MemberId) -> bool {
         self.group

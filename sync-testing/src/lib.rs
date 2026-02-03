@@ -9,7 +9,7 @@ use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use universal_sync_core::{
-    ACCEPTORS_EXTENSION_TYPE, ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE,
+    ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
 };
 
 /// Default cipher suite for testing
@@ -102,8 +102,7 @@ pub use universal_sync_core::{
     AcceptorId, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, MemberId,
 };
 pub use universal_sync_proposer::{
-    ConnectorError, CreatedGroup, FlowError, Group, GroupContext, GroupError, GroupEvent,
-    GroupLearner, IrohConnection, IrohConnector, JoinedGroup, LearnerError, PAXOS_ALPN,
-    acceptors_extension, create_group, join_group, register_group, register_group_with_addr,
-    store::SharedProposerStore,
+    ConnectorError, Group, GroupContext, GroupError, GroupEvent, GroupLearner, IrohConnection,
+    IrohConnector, LearnerError, PAXOS_ALPN, acceptors_extension, register_group,
+    register_group_with_addr,
 };

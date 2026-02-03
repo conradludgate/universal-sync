@@ -14,8 +14,8 @@ pub use extension::{
     AcceptorAdd, AcceptorRemove, AcceptorsExt, ACCEPTORS_EXTENSION_TYPE,
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE,
 };
-pub use handshake::{GroupId, Handshake, HandshakeResponse};
-pub use message::GroupMessage;
+pub use handshake::{GroupId, Handshake, HandshakeResponse, StreamType};
+pub use message::{EncryptedAppMessage, GroupMessage, MessageId, MessageRequest, MessageResponse};
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub mod util;
 

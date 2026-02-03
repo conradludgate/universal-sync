@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use futures::{Stream, StreamExt, stream};
 use tokio::sync::broadcast;
-use universal_sync_core::{Epoch, GroupId, GroupMessage, GroupProposal};
+use universal_sync_core::{EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal};
 use universal_sync_paxos::acceptor::RoundState;
 use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
 
@@ -28,10 +28,12 @@ type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal
 ///
 /// Supports multiple groups - keys are prefixed with group ID.
 ///
-/// Uses three separate keyspaces:
+/// Uses separate keyspaces:
 /// - `promised`: (`group_id`, epoch) -> proposal
 /// - `accepted`: (`group_id`, epoch) -> (proposal, message)
 /// - `groups`: `group_id` -> `GroupInfo` bytes (for registry persistence)
+/// - `messages`: (`group_id`, `arrival_seq`) -> `EncryptedAppMessage`
+/// - `message_seq`: `group_id` -> next sequence number
 pub struct FjallStateStore {
     /// The fjall database
     db: Database,
@@ -41,8 +43,14 @@ pub struct FjallStateStore {
     accepted: Keyspace,
     /// Keyspace for registered groups (`GroupInfo` bytes)
     groups: Keyspace,
-    /// Per-group broadcast channels for live subscriptions
+    /// Keyspace for application messages: (`group_id`, `arrival_seq`) -> message
+    messages: Keyspace,
+    /// Keyspace for per-group sequence counters: `group_id` -> next seq
+    message_seq: Keyspace,
+    /// Per-group broadcast channels for live subscriptions (proposals)
     broadcasts: GroupBroadcasts,
+    /// Per-group broadcast channels for application messages
+    message_broadcasts: RwLock<HashMap<[u8; 32], broadcast::Sender<EncryptedAppMessage>>>,
 }
 
 impl FjallStateStore {
@@ -69,13 +77,18 @@ impl FjallStateStore {
         let promised = db.keyspace("promised", KeyspaceCreateOptions::default)?;
         let accepted = db.keyspace("accepted", KeyspaceCreateOptions::default)?;
         let groups = db.keyspace("groups", KeyspaceCreateOptions::default)?;
+        let messages = db.keyspace("messages", KeyspaceCreateOptions::default)?;
+        let message_seq = db.keyspace("message_seq", KeyspaceCreateOptions::default)?;
 
         Ok(Self {
             db,
             promised,
             accepted,
             groups,
+            messages,
+            message_seq,
             broadcasts: RwLock::new(HashMap::new()),
+            message_broadcasts: RwLock::new(HashMap::new()),
         })
     }
 
@@ -121,6 +134,128 @@ impl FjallStateStore {
     /// Deserialize a message from storage
     fn deserialize_message(bytes: &[u8]) -> Option<GroupMessage> {
         postcard::from_bytes(bytes).ok()
+    }
+
+    // --- Application Message Helpers ---
+
+    /// Build a key for application messages: `group_id` + `arrival_seq`
+    fn build_message_key(group_id: &GroupId, seq: u64) -> [u8; 40] {
+        let mut key = [0u8; 40];
+        key[..32].copy_from_slice(group_id.as_bytes());
+        key[32..].copy_from_slice(&seq.to_be_bytes());
+        key
+    }
+
+    /// Serialize an encrypted app message for storage
+    fn serialize_app_message(msg: &EncryptedAppMessage) -> Vec<u8> {
+        postcard::to_allocvec(msg).expect("serialization should not fail")
+    }
+
+    /// Deserialize an encrypted app message from storage
+    fn deserialize_app_message(bytes: &[u8]) -> Option<EncryptedAppMessage> {
+        postcard::from_bytes(bytes).ok()
+    }
+
+    /// Get the next sequence number for a group and increment it
+    fn next_message_seq(&self, group_id: &GroupId) -> Result<u64, fjall::Error> {
+        let key = group_id.as_bytes();
+
+        // Get current value or default to 0
+        let current = self.message_seq.get(key)?.map_or(0, |bytes| {
+            if bytes.len() >= 8 {
+                u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            }
+        });
+
+        // Store incremented value
+        self.message_seq.insert(key, (current + 1).to_be_bytes())?;
+
+        Ok(current)
+    }
+
+    /// Store an application message.
+    ///
+    /// Returns the arrival sequence number for the message.
+    /// Deduplication is handled by clients, not the acceptor.
+    ///
+    /// # Errors
+    /// Returns an error if storage operations fail.
+    pub fn store_app_message(
+        &self,
+        group_id: &GroupId,
+        msg: &EncryptedAppMessage,
+    ) -> Result<u64, fjall::Error> {
+        // Get next sequence number
+        let seq = self.next_message_seq(group_id)?;
+
+        // Store the message
+        let msg_key = Self::build_message_key(group_id, seq);
+        let msg_bytes = Self::serialize_app_message(msg);
+        self.messages.insert(msg_key, &msg_bytes)?;
+
+        // Persist
+        self.db.persist(PersistMode::SyncAll)?;
+
+        // Broadcast to subscribers
+        if let Ok(broadcasts) = self.message_broadcasts.read()
+            && let Some(tx) = broadcasts.get(group_id.as_bytes())
+        {
+            let _ = tx.send(msg.clone());
+        }
+
+        Ok(seq)
+    }
+
+    /// Get messages for a group starting from a sequence number
+    pub fn get_messages_since(
+        &self,
+        group_id: &GroupId,
+        since_seq: u64,
+    ) -> Vec<(u64, EncryptedAppMessage)> {
+        let start_key = Self::build_message_key(group_id, since_seq);
+        let prefix = Self::build_group_prefix(group_id);
+
+        let mut messages = Vec::new();
+
+        for guard in self.messages.range(start_key..) {
+            let Ok((key, value)) = guard.into_inner() else {
+                continue;
+            };
+
+            // Check if still in the same group
+            if key.len() < 32 || &key[..32] != prefix.as_slice() {
+                break;
+            }
+
+            // Parse sequence from key
+            if key.len() >= 40 {
+                let seq = u64::from_be_bytes(key[32..40].try_into().unwrap_or([0; 8]));
+                if let Some(msg) = Self::deserialize_app_message(&value) {
+                    messages.push((seq, msg));
+                }
+            }
+        }
+
+        messages
+    }
+
+    /// Subscribe to new application messages for a group
+    ///
+    /// # Panics
+    /// Panics if the internal lock is poisoned.
+    pub fn subscribe_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> broadcast::Receiver<EncryptedAppMessage> {
+        let mut broadcasts = self.message_broadcasts.write().unwrap();
+        let key = *group_id.as_bytes();
+
+        broadcasts
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(256).0)
+            .subscribe()
     }
 
     /// Get promised proposal for a (group, round) (synchronous)
@@ -375,6 +510,39 @@ impl SharedFjallStateStore {
     /// Returns an error if removing from the database fails.
     pub fn remove_group(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
         self.inner.remove_group_sync(group_id)
+    }
+
+    // ========== Application Message Methods ==========
+
+    /// Store an application message.
+    ///
+    /// # Errors
+    /// Returns an error if persisting to the database fails.
+    pub fn store_app_message(
+        &self,
+        group_id: &GroupId,
+        msg: &EncryptedAppMessage,
+    ) -> Result<u64, fjall::Error> {
+        self.inner.store_app_message(group_id, msg)
+    }
+
+    /// Get messages since a sequence number.
+    #[must_use]
+    pub fn get_messages_since(
+        &self,
+        group_id: &GroupId,
+        since_seq: u64,
+    ) -> Vec<(u64, EncryptedAppMessage)> {
+        self.inner.get_messages_since(group_id, since_seq)
+    }
+
+    /// Subscribe to new messages for a group.
+    #[must_use]
+    pub fn subscribe_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> broadcast::Receiver<EncryptedAppMessage> {
+        self.inner.subscribe_messages(group_id)
     }
 }
 

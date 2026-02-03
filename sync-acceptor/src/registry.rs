@@ -218,4 +218,29 @@ where
 
         Ok((group_id, acceptor, state))
     }
+
+    fn store_message(
+        &self,
+        group_id: &GroupId,
+        msg: &universal_sync_core::EncryptedAppMessage,
+    ) -> Result<u64, String> {
+        self.state_store
+            .store_app_message(group_id, msg)
+            .map_err(|e| format!("failed to store message: {e}"))
+    }
+
+    fn get_messages_since(
+        &self,
+        group_id: &GroupId,
+        since_seq: u64,
+    ) -> Result<Vec<(u64, universal_sync_core::EncryptedAppMessage)>, String> {
+        Ok(self.state_store.get_messages_since(group_id, since_seq))
+    }
+
+    fn subscribe_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> tokio::sync::broadcast::Receiver<universal_sync_core::EncryptedAppMessage> {
+        self.state_store.subscribe_messages(group_id)
+    }
 }

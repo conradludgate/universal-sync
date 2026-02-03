@@ -10,7 +10,8 @@ path = "src/main.rs"
 [dependencies]
 universal-sync-core = { path = "../sync-core" }
 universal-sync-paxos = { path = "../paxos" }
-mls-rs = { version = "0.43", default-features = false }
+mls-rs = { version = "0.43", default-features = false, features = ["prior_epoch", "private_message"] }
+mls-rs-core = "0.20"
 mls-rs-crypto-rustcrypto = { version = "0.13", default-features = false }
 serde.workspace = true
 postcard.workspace = true
@@ -28,3 +29,7 @@ hex = "0.4"
 fjall.workspace = true
 rand.workspace = true
 error-stack.workspace = true
+async-stream.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
