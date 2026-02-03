@@ -195,16 +195,23 @@ pub trait Acceptor: Learner {}
 /// 2. Use `fsync`/`sync_all` to ensure durability
 /// 3. On restart, reload state before accepting new requests
 ///
+/// # Async Requirements
+///
+/// Methods are async to support implementations that use `spawn_blocking`
+/// for filesystem operations. In-memory implementations can simply return
+/// ready futures.
+///
 /// # Concurrency Safety
 ///
 /// Both `promise()` and `accept()` must be atomic with respect to the
 /// round's state. Use appropriate locking to prevent race conditions.
-pub trait AcceptorStateStore<L: Learner> {
+#[expect(async_fn_in_trait)]
+pub trait AcceptorStateStore<L: Learner>: Send + Sync {
     /// Combined subscription stream (historical + live broadcasts).
-    type Subscription: futures::Stream<Item = (L::Proposal, L::Message)>;
+    type Subscription: futures::Stream<Item = (L::Proposal, L::Message)> + Send;
 
     /// Get the state for a specific round.
-    fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L>;
+    async fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L>;
 
     /// Try to promise this proposal for a round.
     ///
@@ -219,7 +226,7 @@ pub trait AcceptorStateStore<L: Learner> {
     ///
     /// # Errors
     /// Returns `Err(current_state)` if the proposal is dominated.
-    fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>>;
+    async fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>>;
 
     /// Try to accept this proposal + message for a round.
     /// On success, broadcasts to all subscribed learners.
@@ -236,17 +243,24 @@ pub trait AcceptorStateStore<L: Learner> {
     ///
     /// # Errors
     /// Returns `Err(current_state)` if the proposal is dominated.
-    fn accept(&self, proposal: &L::Proposal, message: &L::Message) -> Result<(), RoundState<L>>;
+    async fn accept(
+        &self,
+        proposal: &L::Proposal,
+        message: &L::Message,
+    ) -> Result<(), RoundState<L>>;
 
     /// Subscribe to accepted (proposal, message) pairs from a given round onwards.
     ///
     /// Returns a stream that yields:
     /// 1. Historical values first (rounds >= `from_round` that were already accepted)
     /// 2. Live broadcasts (new accepts as they happen)
-    fn subscribe_from(&self, from_round: <L::Proposal as Proposal>::RoundId) -> Self::Subscription;
+    async fn subscribe_from(
+        &self,
+        from_round: <L::Proposal as Proposal>::RoundId,
+    ) -> Self::Subscription;
 
     /// Get the highest round that has been accepted (for sync complete message).
-    fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
+    async fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
 }
 
 /// Connects to acceptors by their ID.

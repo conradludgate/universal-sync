@@ -72,7 +72,7 @@ where
     /// # Errors
     ///
     /// Returns `Err(InvalidProposal)` if the proposal fails validation.
-    pub fn handle_prepare(
+    pub async fn handle_prepare(
         &mut self,
         proposal: &A::Proposal,
     ) -> Result<PromiseOutcome<A>, InvalidProposal> {
@@ -80,10 +80,10 @@ where
             return Err(InvalidProposal);
         }
 
-        match self.state.promise(proposal) {
+        match self.state.promise(proposal).await {
             Ok(()) => {
                 trace!(round = ?proposal.round(), "promised");
-                let state = self.state.get(proposal.round());
+                let state = self.state.get(proposal.round()).await;
                 Ok(PromiseOutcome::Promised(AcceptorMessage::from_round_state(
                     state,
                 )))
@@ -109,7 +109,7 @@ where
     /// # Errors
     ///
     /// - `Err(InvalidProposal)` if validation fails.
-    pub fn handle_accept(
+    pub async fn handle_accept(
         &mut self,
         proposal: &A::Proposal,
         message: &A::Message,
@@ -118,13 +118,13 @@ where
             return Err(InvalidProposal);
         }
 
-        match self.state.accept(proposal, message) {
+        match self.state.accept(proposal, message).await {
             Ok(()) => {
                 trace!(round = ?proposal.round(), "accepted");
                 // Note: We do NOT call acceptor.apply() here!
                 // The value is persisted by the state store and broadcast.
                 // Application should only happen when quorum is confirmed.
-                let state = self.state.get(proposal.round());
+                let state = self.state.get(proposal.round()).await;
                 Ok(AcceptOutcome::Accepted(AcceptorMessage::from_round_state(
                     state,
                 )))

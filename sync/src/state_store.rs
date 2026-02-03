@@ -485,111 +485,136 @@ where
 {
     type Subscription = GroupSubscription;
 
-    fn get(&self, round: Epoch) -> RoundState<L> {
-        let promised = self.inner.get_promised_sync(&self.group_id, round);
-        let accepted = self.inner.get_accepted_sync(&self.group_id, round);
+    async fn get(&self, round: Epoch) -> RoundState<L> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
 
-        RoundState { promised, accepted }
+        tokio::task::spawn_blocking(move || {
+            let promised = inner.get_promised_sync(&group_id, round);
+            let accepted = inner.get_accepted_sync(&group_id, round);
+            RoundState { promised, accepted }
+        })
+        .await
+        .expect("spawn_blocking panicked")
     }
 
-    fn promise(&self, proposal: &GroupProposal) -> Result<(), RoundState<L>> {
-        let epoch = proposal.epoch;
-        let key = proposal.key();
+    async fn promise(&self, proposal: &GroupProposal) -> Result<(), RoundState<L>> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+        let proposal = proposal.clone();
 
-        // Check current state
-        let current_promised = self.inner.get_promised_sync(&self.group_id, epoch);
-        let current_accepted = self.inner.get_accepted_sync(&self.group_id, epoch);
+        tokio::task::spawn_blocking(move || {
+            let epoch = proposal.epoch;
+            let key = proposal.key();
 
-        // Reject if a higher proposal was already promised
-        if let Some(ref promised) = current_promised
-            && promised.key() >= key
-        {
-            return Err(RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            });
-        }
+            // Check current state
+            let current_promised = inner.get_promised_sync(&group_id, epoch);
+            let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-        // Reject if a higher proposal was already accepted
-        if let Some((ref accepted, _)) = current_accepted
-            && accepted.key() >= key
-        {
-            return Err(RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            });
-        }
+            // Reject if a higher proposal was already promised
+            if let Some(ref promised) = current_promised
+                && promised.key() >= key
+            {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
 
-        // Persist the promise
-        self.inner
-            .set_promised_sync(&self.group_id, proposal)
-            .map_err(|_| RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            })?;
+            // Reject if a higher proposal was already accepted
+            if let Some((ref accepted, _)) = current_accepted
+                && accepted.key() >= key
+            {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
 
-        Ok(())
+            // Persist the promise
+            inner
+                .set_promised_sync(&group_id, &proposal)
+                .map_err(|_| RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                })?;
+
+            Ok(())
+        })
+        .await
+        .expect("spawn_blocking panicked")
     }
 
-    fn accept(
+    async fn accept(
         &self,
         proposal: &GroupProposal,
         message: &GroupMessage,
     ) -> Result<(), RoundState<L>> {
-        let epoch = proposal.epoch;
-        let key = proposal.key();
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+        let proposal = proposal.clone();
+        let message = message.clone();
 
-        // Check current state
-        let current_promised = self.inner.get_promised_sync(&self.group_id, epoch);
-        let current_accepted = self.inner.get_accepted_sync(&self.group_id, epoch);
+        tokio::task::spawn_blocking(move || {
+            let epoch = proposal.epoch;
+            let key = proposal.key();
 
-        // Reject if a higher proposal was already promised
-        if let Some(ref promised) = current_promised
-            && promised.key() > key
-        {
-            return Err(RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            });
-        }
+            // Check current state
+            let current_promised = inner.get_promised_sync(&group_id, epoch);
+            let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-        // Reject if a higher proposal was already accepted
-        if let Some((ref accepted, _)) = current_accepted
-            && accepted.key() >= key
-        {
-            return Err(RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            });
-        }
+            // Reject if a higher proposal was already promised
+            if let Some(ref promised) = current_promised
+                && promised.key() > key
+            {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
 
-        // Persist the accept
-        self.inner
-            .set_accepted_sync(&self.group_id, proposal, message)
-            .map_err(|_| RoundState {
-                promised: current_promised,
-                accepted: current_accepted,
-            })?;
+            // Reject if a higher proposal was already accepted
+            if let Some((ref accepted, _)) = current_accepted
+                && accepted.key() >= key
+            {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
 
-        // Also update promised to match
-        let _ = self.inner.set_promised_sync(&self.group_id, proposal);
+            // Persist the accept
+            inner
+                .set_accepted_sync(&group_id, &proposal, &message)
+                .map_err(|_| RoundState {
+                    promised: current_promised.clone(),
+                    accepted: current_accepted.clone(),
+                })?;
 
-        // Broadcast to learners for this group
-        let _ = self
-            .inner
-            .get_broadcast(&self.group_id)
-            .send((proposal.clone(), message.clone()));
+            // Also update promised to match
+            let _ = inner.set_promised_sync(&group_id, &proposal);
 
-        Ok(())
+            // Broadcast to learners for this group
+            let _ = inner.get_broadcast(&group_id).send((proposal, message));
+
+            Ok(())
+        })
+        .await
+        .expect("spawn_blocking panicked")
     }
 
-    fn subscribe_from(&self, from_round: Epoch) -> Self::Subscription {
-        // Get historical values
-        let historical = self
-            .inner
-            .get_accepted_from_sync(&self.group_id, from_round);
+    async fn subscribe_from(&self, from_round: Epoch) -> Self::Subscription {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
 
-        // Create live receiver
+        // Get historical values in a blocking task
+        let historical = tokio::task::spawn_blocking(move || {
+            inner.get_accepted_from_sync(&group_id, from_round)
+        })
+        .await
+        .expect("spawn_blocking panicked");
+
+        // Create live receiver (this is just channel subscription, no blocking IO)
         let live = GroupReceiver {
             inner: tokio_stream::wrappers::BroadcastStream::new(
                 self.inner.get_broadcast(&self.group_id).subscribe(),
@@ -599,8 +624,13 @@ where
         stream::iter(historical).chain(live)
     }
 
-    fn highest_accepted_round(&self) -> Option<Epoch> {
-        self.inner.highest_accepted_round_sync(&self.group_id)
+    async fn highest_accepted_round(&self) -> Option<Epoch> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+
+        tokio::task::spawn_blocking(move || inner.highest_accepted_round_sync(&group_id))
+            .await
+            .expect("spawn_blocking panicked")
     }
 }
 
@@ -634,9 +664,13 @@ mod tests {
         let store = shared.for_group(test_group_id(1));
 
         let proposal = test_proposal(1, 1);
-        assert!(AcceptorStateStore::<FjallLearner>::promise(&store, &proposal).is_ok());
+        assert!(
+            AcceptorStateStore::<FjallLearner>::promise(&store, &proposal)
+                .await
+                .is_ok()
+        );
 
-        let state = AcceptorStateStore::<FjallLearner>::get(&store, Epoch(1));
+        let state = AcceptorStateStore::<FjallLearner>::get(&store, Epoch(1)).await;
         assert!(state.promised.is_some());
         assert_eq!(state.promised.unwrap().epoch, Epoch(1));
     }
@@ -648,10 +682,14 @@ mod tests {
         let store = shared.for_group(test_group_id(1));
 
         let proposal1 = test_proposal(1, 2);
-        assert!(AcceptorStateStore::<FjallLearner>::promise(&store, &proposal1).is_ok());
+        assert!(
+            AcceptorStateStore::<FjallLearner>::promise(&store, &proposal1)
+                .await
+                .is_ok()
+        );
 
         let proposal2 = test_proposal(1, 1);
-        let result = AcceptorStateStore::<FjallLearner>::promise(&store, &proposal2);
+        let result = AcceptorStateStore::<FjallLearner>::promise(&store, &proposal2).await;
         assert!(result.is_err());
     }
 
@@ -665,14 +703,18 @@ mod tests {
 
         // Promise in group 1
         let proposal = test_proposal(1, 1);
-        assert!(AcceptorStateStore::<FjallLearner>::promise(&store1, &proposal).is_ok());
+        assert!(
+            AcceptorStateStore::<FjallLearner>::promise(&store1, &proposal)
+                .await
+                .is_ok()
+        );
 
         // Group 2 should not see it
-        let state = AcceptorStateStore::<FjallLearner>::get(&store2, Epoch(1));
+        let state = AcceptorStateStore::<FjallLearner>::get(&store2, Epoch(1)).await;
         assert!(state.promised.is_none());
 
         // Group 1 should see it
-        let state = AcceptorStateStore::<FjallLearner>::get(&store1, Epoch(1));
+        let state = AcceptorStateStore::<FjallLearner>::get(&store1, Epoch(1)).await;
         assert!(state.promised.is_some());
     }
 
@@ -684,18 +726,22 @@ mod tests {
 
         // Initially no accepted rounds
         assert_eq!(
-            AcceptorStateStore::<FjallLearner>::highest_accepted_round(&store),
+            AcceptorStateStore::<FjallLearner>::highest_accepted_round(&store).await,
             None
         );
 
         // Accept at epoch 5 (need a proper message)
         // For now just test with promise
         let proposal = test_proposal(5, 1);
-        assert!(AcceptorStateStore::<FjallLearner>::promise(&store, &proposal).is_ok());
+        assert!(
+            AcceptorStateStore::<FjallLearner>::promise(&store, &proposal)
+                .await
+                .is_ok()
+        );
 
         // After promise, still no accepted
         assert_eq!(
-            AcceptorStateStore::<FjallLearner>::highest_accepted_round(&store),
+            AcceptorStateStore::<FjallLearner>::highest_accepted_round(&store).await,
             None
         );
     }

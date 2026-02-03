@@ -70,12 +70,14 @@ where
             AcceptorRequest::Prepare(proposal) => {
                 trace!(round = ?proposal.round(), "received prepare");
 
-                let response = match handler.handle_prepare(&proposal) {
+                let response = match handler.handle_prepare(&proposal).await {
                     Ok(PromiseOutcome::Promised(msg)) => {
                         debug!(round = ?proposal.round(), "promised");
                         // Subscribe on first successful promise
                         if sync.is_terminated() {
-                            sync.set(Fuse::new(handler.state().subscribe_from(proposal.round())));
+                            sync.set(Fuse::new(
+                                handler.state().subscribe_from(proposal.round()).await,
+                            ));
                             debug!("subscribed to state");
                         }
                         msg
@@ -84,7 +86,9 @@ where
                         trace!("promise rejected - outdated");
                         // Also subscribe on first outdated (learner still needs sync)
                         if sync.is_terminated() {
-                            sync.set(Fuse::new(handler.state().subscribe_from(proposal.round())));
+                            sync.set(Fuse::new(
+                                handler.state().subscribe_from(proposal.round()).await,
+                            ));
                             debug!("subscribed to state");
                         }
                         if msg.promised.round() != proposal.round() {
@@ -109,7 +113,7 @@ where
 
                 trace!(round = ?proposal.round(), "received accept");
 
-                let response = match handler.handle_accept(&proposal, &message) {
+                let response = match handler.handle_accept(&proposal, &message).await {
                     Ok(AcceptOutcome::Accepted(msg)) => {
                         debug!(round = ?proposal.round(), "accepted");
                         msg

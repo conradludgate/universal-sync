@@ -156,7 +156,7 @@ where
 {
     type Subscription = AcceptorSubscription<L>;
 
-    fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L> {
+    async fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L> {
         let core = self.core.lock().unwrap();
         let (promised_key, accepted) = core.get(round);
 
@@ -166,7 +166,7 @@ where
         }
     }
 
-    fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>> {
+    async fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>> {
         self.store_proposal(proposal);
 
         let round = proposal.round();
@@ -183,7 +183,11 @@ where
         }
     }
 
-    fn accept(&self, proposal: &L::Proposal, message: &L::Message) -> Result<(), RoundState<L>> {
+    async fn accept(
+        &self,
+        proposal: &L::Proposal,
+        message: &L::Message,
+    ) -> Result<(), RoundState<L>> {
         self.store_proposal(proposal);
 
         let mut core = self.core.lock().unwrap();
@@ -207,7 +211,10 @@ where
         }
     }
 
-    fn subscribe_from(&self, from_round: <L::Proposal as Proposal>::RoundId) -> Self::Subscription {
+    async fn subscribe_from(
+        &self,
+        from_round: <L::Proposal as Proposal>::RoundId,
+    ) -> Self::Subscription {
         // Collect historical values, skipping from_round (included in promise response)
         let core = self.core.lock().unwrap();
         let historical: Vec<_> = core
@@ -227,7 +234,7 @@ where
         stream::iter(historical).chain(live)
     }
 
-    fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId> {
+    async fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId> {
         let core = self.core.lock().unwrap();
         core.highest_accepted_round()
     }

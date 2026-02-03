@@ -522,7 +522,7 @@ type FileBackedSubscription = stream::Chain<HistoricalStream, FileBackedReceiver
 impl AcceptorStateStore<TestState> for FileBackedAcceptorState {
     type Subscription = FileBackedSubscription;
 
-    fn get(&self, round: u64) -> RoundState<TestState> {
+    async fn get(&self, round: u64) -> RoundState<TestState> {
         self.inner
             .lock()
             .unwrap()
@@ -531,7 +531,7 @@ impl AcceptorStateStore<TestState> for FileBackedAcceptorState {
             .unwrap_or_default()
     }
 
-    fn promise(&self, proposal: &TestProposal) -> Result<(), RoundState<TestState>> {
+    async fn promise(&self, proposal: &TestProposal) -> Result<(), RoundState<TestState>> {
         let mut inner = self.inner.lock().unwrap();
         let round = proposal.round();
         let state = inner.entry(round).or_default();
@@ -566,7 +566,7 @@ impl AcceptorStateStore<TestState> for FileBackedAcceptorState {
         Ok(())
     }
 
-    fn accept(
+    async fn accept(
         &self,
         proposal: &TestProposal,
         message: &String,
@@ -609,7 +609,7 @@ impl AcceptorStateStore<TestState> for FileBackedAcceptorState {
         Ok(())
     }
 
-    fn subscribe_from(&self, from_round: u64) -> Self::Subscription {
+    async fn subscribe_from(&self, from_round: u64) -> Self::Subscription {
         // Collect historical values, skipping from_round (included in promise response)
         let historical: Vec<_> = self
             .inner
@@ -635,7 +635,7 @@ impl AcceptorStateStore<TestState> for FileBackedAcceptorState {
         stream::iter(historical).chain(live)
     }
 
-    fn highest_accepted_round(&self) -> Option<u64> {
+    async fn highest_accepted_round(&self) -> Option<u64> {
         self.inner
             .lock()
             .unwrap()
