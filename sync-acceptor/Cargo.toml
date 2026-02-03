@@ -3,7 +3,15 @@ name = "universal-sync-acceptor"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "acceptor"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rand.workspace = true
+tracing-subscriber.workspace = true
 universal-sync-core = { path = "../sync-core" }
 universal-sync-paxos = { path = "../paxos" }
 mls-rs = { version = "0.43", default-features = false, features = ["external_client"] }

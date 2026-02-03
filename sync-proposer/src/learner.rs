@@ -1,7 +1,8 @@
 //! `GroupLearner` - implements paxos Learner for MLS group members (devices)
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
+use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs::group::proposal::Proposal as MlsProposal;
@@ -26,21 +27,14 @@ pub enum LearnerError {
 impl std::fmt::Display for LearnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LearnerError::Mls(e) => write!(f, "MLS error: {e}"),
+            LearnerError::Mls(e) => write!(f, "MLS error: {e:?}"),
             LearnerError::Crypto(e) => write!(f, "crypto error: {e}"),
             LearnerError::UnexpectedMessageType => write!(f, "unexpected message type"),
         }
     }
 }
 
-impl std::error::Error for LearnerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LearnerError::Mls(e) => Some(e),
-            LearnerError::Crypto(_) | LearnerError::UnexpectedMessageType => None,
-        }
-    }
-}
+impl std::error::Error for LearnerError {}
 
 impl From<mls_rs::error::MlsError> for LearnerError {
     fn from(e: mls_rs::error::MlsError) -> Self {
@@ -75,8 +69,8 @@ where
     /// Cipher suite provider for signing operations
     cipher_suite: CS,
 
-    /// Current set of acceptor IDs (iroh public keys)
-    acceptors: BTreeSet<AcceptorId>,
+    /// Current set of acceptors with their endpoint addresses
+    acceptors: BTreeMap<AcceptorId, EndpointAddr>,
 }
 
 impl<C, CS> GroupLearner<C, CS>
@@ -90,18 +84,21 @@ where
     /// * `group` - The MLS group
     /// * `signer` - The signing secret key for this member
     /// * `cipher_suite` - Cipher suite provider for crypto operations
-    /// * `acceptors` - Initial set of acceptor IDs
+    /// * `acceptors` - Initial set of acceptor endpoint addresses
     pub fn new(
         group: Group<C>,
         signer: SignatureSecretKey,
         cipher_suite: CS,
-        acceptors: impl IntoIterator<Item = AcceptorId>,
+        acceptors: impl IntoIterator<Item = EndpointAddr>,
     ) -> Self {
         Self {
             group,
             signer,
             cipher_suite,
-            acceptors: acceptors.into_iter().collect(),
+            acceptors: acceptors
+                .into_iter()
+                .map(|addr| (AcceptorId::from_bytes(*addr.id.as_bytes()), addr))
+                .collect(),
         }
     }
 
@@ -116,18 +113,51 @@ where
     }
 
     /// Get the current set of acceptor IDs
-    pub fn acceptor_ids(&self) -> &BTreeSet<AcceptorId> {
+    pub fn acceptor_ids(&self) -> impl Iterator<Item = AcceptorId> + '_ {
+        self.acceptors.keys().copied()
+    }
+
+    /// Get the current set of acceptors with their addresses
+    pub fn acceptors(&self) -> &BTreeMap<AcceptorId, EndpointAddr> {
         &self.acceptors
     }
 
     /// Add an acceptor to the set
-    fn add_acceptor(&mut self, acceptor_id: AcceptorId) {
-        self.acceptors.insert(acceptor_id);
+    fn add_acceptor(&mut self, addr: EndpointAddr) {
+        let id = AcceptorId::from_bytes(*addr.id.as_bytes());
+        self.acceptors.insert(id, addr);
     }
 
     /// Remove an acceptor from the set
     fn remove_acceptor(&mut self, acceptor_id: &AcceptorId) {
         self.acceptors.remove(acceptor_id);
+    }
+
+    /// Apply a pending commit that this member created
+    ///
+    /// This processes `AcceptorAdd` and `AcceptorRemove` extensions to update
+    /// the internal acceptor set.
+    ///
+    /// # Errors
+    /// Returns an error if applying the pending commit fails.
+    pub fn apply_pending_commit(&mut self) -> Result<(), LearnerError> {
+        let commit_output = self.group.apply_pending_commit()?;
+        self.process_commit_effect(&commit_output.effect);
+        Ok(())
+    }
+
+    /// Clear any pending commit without applying it
+    ///
+    /// Call this when another proposer's value won consensus and we need
+    /// to discard our pending commit before processing the winning value.
+    pub fn clear_pending_commit(&mut self) {
+        self.group.clear_pending_commit();
+    }
+
+    /// Check if we have a pending commit
+    #[must_use]
+    pub fn has_pending_commit(&self) -> bool {
+        self.group.has_pending_commit()
     }
 
     /// Process a commit effect to update the acceptor set
@@ -148,7 +178,7 @@ where
                 // Check for AcceptorAdd
                 if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
                     tracing::debug!(acceptor_id = ?add.acceptor_id(), "adding acceptor");
-                    self.add_acceptor(add.acceptor_id());
+                    self.add_acceptor(add.0.clone());
                 }
 
                 // Check for AcceptorRemove
@@ -244,7 +274,7 @@ where
     }
 
     fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId> {
-        self.acceptors.iter().copied()
+        self.acceptors.keys().copied()
     }
 
     fn propose(&self, attempt: Attempt) -> GroupProposal {
@@ -275,31 +305,47 @@ where
 
     async fn apply(
         &mut self,
-        _proposal: GroupProposal,
+        proposal: GroupProposal,
         message: GroupMessage,
     ) -> Result<(), LearnerError> {
-        // Process the MLS message from GroupMessage
-        let result = self.group.process_incoming_message(message.mls_message)?;
+        // Check if this is our own proposal
+        let my_proposal = proposal.member_id == MemberId(self.group.current_member_index());
 
-        // Handle the result and update acceptor set if needed
-        match result {
-            ReceivedMessage::Commit(commit_desc) => {
-                tracing::debug!(epoch = self.group.context().epoch, "applied commit");
+        if my_proposal && self.has_pending_commit() {
+            // This is our proposal and we have a pending commit - apply it
+            tracing::debug!("applying our own pending commit");
+            self.apply_pending_commit()
+        } else {
+            // This is someone else's proposal, or we don't have a pending commit
+            // Clear any pending commit we might have and process the incoming message
+            if self.has_pending_commit() {
+                tracing::debug!("clearing pending commit - another proposal won");
+                self.clear_pending_commit();
+            }
 
-                // Process acceptor changes from applied proposals
-                self.process_commit_effect(&commit_desc.effect);
+            // Process the MLS message from GroupMessage
+            let result = self.group.process_incoming_message(message.mls_message)?;
+
+            // Handle the result and update acceptor set if needed
+            match result {
+                ReceivedMessage::Commit(commit_desc) => {
+                    tracing::debug!(epoch = self.group.context().epoch, "applied commit");
+
+                    // Process acceptor changes from applied proposals
+                    self.process_commit_effect(&commit_desc.effect);
+                }
+                ReceivedMessage::Proposal(_) => {
+                    tracing::debug!("applied proposal");
+                }
+                ReceivedMessage::ApplicationMessage(_) => {
+                    tracing::debug!("applied application message");
+                }
+                _ => {
+                    tracing::debug!("applied other message type");
+                }
             }
-            ReceivedMessage::Proposal(_) => {
-                tracing::debug!("applied proposal");
-            }
-            ReceivedMessage::ApplicationMessage(_) => {
-                tracing::debug!("applied application message");
-            }
-            _ => {
-                tracing::debug!("applied other message type");
-            }
+
+            Ok(())
         }
-
-        Ok(())
     }
 }

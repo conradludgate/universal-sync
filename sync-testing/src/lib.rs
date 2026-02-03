@@ -99,6 +99,6 @@ pub use universal_sync_core::{
 };
 pub use universal_sync_proposer::{
     ConnectorError, CreatedGroup, FlowError, GroupLearner, IrohConnection, IrohConnector,
-    JoinedGroup, LearnerError, PAXOS_ALPN, acceptors_extension, create_group,
-    create_group_with_addrs, join_group, register_group, register_group_with_addr,
+    JoinedGroup, LearnerError, PAXOS_ALPN, acceptors_extension, create_group, join_group,
+    register_group, register_group_with_addr,
 };

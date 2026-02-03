@@ -3,6 +3,10 @@ name = "universal-sync-proposer"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "proposer"
+path = "src/main.rs"
+
 [dependencies]
 universal-sync-core = { path = "../sync-core" }
 universal-sync-paxos = { path = "../paxos" }
@@ -13,7 +17,13 @@ postcard.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 tokio-util.workspace = true
 iroh.workspace = true
 bytes.workspace = true
 pin-project-lite.workspace = true
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+hex = "0.4"
+fjall.workspace = true
+rand.workspace = true

@@ -31,12 +31,12 @@ mod mls_bytes {
     pub fn serialize<T: MlsEncode, S: Serializer>(value: &T, ser: S) -> Result<S::Ok, S::Error> {
         let bytes = value
             .mls_encode_to_vec()
-            .map_err(serde::ser::Error::custom)?;
+            .map_err(|e| serde::ser::Error::custom(format!("{e:?}")))?;
         bytes.serialize(ser)
     }
 
     pub fn deserialize<'de, T: MlsDecode, D: Deserializer<'de>>(de: D) -> Result<T, D::Error> {
         let bytes = Vec::<u8>::deserialize(de)?;
-        T::mls_decode(&mut bytes.as_slice()).map_err(serde::de::Error::custom)
+        T::mls_decode(&mut bytes.as_slice()).map_err(|e| serde::de::Error::custom(format!("{e:?}")))
     }
 }

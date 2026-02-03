@@ -11,8 +11,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_paxos::Learner;
 use universal_sync_testing::{
     AcceptorId, AcceptorRegistry, GroupId, GroupMessage, IrohConnector, PAXOS_ALPN,
-    SharedFjallStateStore, accept_connection, acceptors_extension, create_group_with_addrs,
-    join_group, register_group_with_addr, test_cipher_suite, test_client, test_crypto_provider,
+    SharedFjallStateStore, accept_connection, acceptors_extension, create_group, join_group,
+    register_group_with_addr, test_cipher_suite, test_client, test_crypto_provider,
     test_identity_provider,
 };
 
@@ -83,7 +83,6 @@ async fn test_state_store_group_persistence() {
 }
 
 #[tokio::test]
-#[ignore = "requires network - run with --ignored"]
 async fn test_mls_group_registration() {
     init_tracing();
 
@@ -158,7 +157,6 @@ async fn test_mls_group_registration() {
 }
 
 #[tokio::test]
-#[ignore = "requires network - run with --ignored"]
 async fn test_alice_adds_bob_with_paxos() {
     use universal_sync_paxos::config::ProposerConfig;
     use universal_sync_paxos::proposer::Proposer;
@@ -211,10 +209,10 @@ async fn test_alice_adds_bob_with_paxos() {
     let alice = test_client("alice");
     let alice_endpoint = test_endpoint().await;
 
-    let acceptor_id = AcceptorId::from_bytes(*acceptor_addr.id.as_bytes());
-    let acceptors = [(acceptor_id, acceptor_addr.clone())];
+    // let acceptor_id = AcceptorId::from_bytes(*acceptor_addr.id.as_bytes());
+    let acceptors = [acceptor_addr.clone()];
 
-    let mut created = create_group_with_addrs(
+    let mut created = create_group(
         &alice.client,
         alice.signer,
         alice.cipher_suite.clone(),
@@ -236,7 +234,7 @@ async fn test_alice_adds_bob_with_paxos() {
         connector,
         ProposerConfig::default(),
     );
-    proposer.sync_actors(created.learner.acceptor_ids().iter().copied());
+    proposer.sync_actors(created.learner.acceptor_ids());
 
     // --- Alice adds Bob ---
     let bob = test_client("bob");
@@ -250,7 +248,7 @@ async fn test_alice_adds_bob_with_paxos() {
         .expect("bob key package");
 
     // Build the commit with acceptors in GroupInfo extensions
-    let acceptors_ext = acceptors_extension(created.learner.acceptor_ids().iter().copied());
+    let acceptors_ext = acceptors_extension(created.learner.acceptors().values().cloned());
 
     let commit_output = created
         .learner
@@ -301,12 +299,15 @@ async fn test_alice_adds_bob_with_paxos() {
 
     // Verify Bob got the acceptors from the GroupInfo
     assert_eq!(
-        joined.learner.acceptor_ids().len(),
+        joined.learner.acceptors().len(),
         1,
         "Bob should have 1 acceptor"
     );
     assert!(
-        joined.learner.acceptor_ids().contains(&acceptor_id),
+        joined
+            .learner
+            .acceptors()
+            .contains_key(&AcceptorId(*acceptor_addr.id.as_bytes())),
         "Bob should have the acceptor ID"
     );
 
@@ -361,17 +362,13 @@ async fn test_alice_adds_bob_with_paxos() {
 
     let bob_endpoint = test_endpoint().await;
     // Bob needs address hints since iroh discovery isn't available in tests
-    let bob_connector = IrohConnector::with_address_hints(
-        bob_endpoint.clone(),
-        joined.group_id,
-        [(acceptor_id, acceptor_addr.clone())],
-    );
+    let bob_connector = IrohConnector::new(bob_endpoint.clone(), joined.group_id);
     let mut bob_proposer = Proposer::new(
         joined.learner.node_id(),
         bob_connector,
         ProposerConfig::default(),
     );
-    bob_proposer.sync_actors(joined.learner.acceptor_ids().iter().copied());
+    bob_proposer.sync_actors(joined.learner.acceptor_ids());
 
     // Start sync to receive historical values
     bob_proposer.start_sync(&joined.learner);
@@ -385,7 +382,7 @@ async fn test_alice_adds_bob_with_paxos() {
 
     tracing::info!(?learned_proposal, "Bob learned update from acceptor");
 
-    // Apply the learned message to Bob
+    // Apply the learned message to Bob (it's not Bob's proposal, it's Alice's)
     joined
         .learner
         .apply(learned_proposal, learned_msg)

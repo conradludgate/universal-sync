@@ -95,7 +95,7 @@ where
                 && let Ok(acceptors_ext) =
                     AcceptorsExt::mls_decode(&mut ext.extension_data.as_slice())
             {
-                return acceptors_ext.0;
+                return acceptors_ext.acceptor_ids();
             }
         }
         vec![]

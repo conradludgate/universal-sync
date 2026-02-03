@@ -12,14 +12,16 @@
 pub mod connector;
 pub mod flows;
 pub mod learner;
+pub mod repl;
+pub mod store;
 
 pub use connector::{
     ConnectorError, IrohConnection, IrohConnector, PAXOS_ALPN, register_group,
     register_group_with_addr,
 };
+#[allow(deprecated)]
 pub use flows::{
-    CreatedGroup, FlowError, JoinedGroup, acceptors_extension, create_group,
-    create_group_with_addrs, join_group,
+    CreatedGroup, FlowError, JoinedGroup, acceptors_extension, create_group, join_group,
 };
 pub use learner::{GroupLearner, LearnerError};
 // Re-export core types for convenience

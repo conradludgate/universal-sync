@@ -8,3 +8,4 @@ universal-sync-paxos = { path = "../paxos" }
 mls-rs = { version = "0.43", default-features = false }
 serde.workspace = true
 postcard.workspace = true
+iroh.workspace = true

@@ -110,27 +110,27 @@ impl<L> IrohConnector<L> {
         }
     }
 
-    /// Create a new connector with address hints
-    ///
-    /// Use this when iroh discovery is not available and you have
-    /// the full endpoint addresses for acceptors.
-    ///
-    /// # Arguments
-    /// * `endpoint` - The iroh endpoint to use for connections
-    /// * `group_id` - The group to join
-    /// * `address_hints` - Map of acceptor IDs to their endpoint addresses
-    pub fn with_address_hints(
-        endpoint: Endpoint,
-        group_id: GroupId,
-        address_hints: impl IntoIterator<Item = (AcceptorId, EndpointAddr)>,
-    ) -> Self {
-        Self {
-            endpoint,
-            group_id,
-            address_hints: Arc::new(address_hints.into_iter().collect()),
-            _marker: PhantomData,
-        }
-    }
+    // /// Create a new connector with address hints
+    // ///
+    // /// Use this when iroh discovery is not available and you have
+    // /// the full endpoint addresses for acceptors.
+    // ///
+    // /// # Arguments
+    // /// * `endpoint` - The iroh endpoint to use for connections
+    // /// * `group_id` - The group to join
+    // /// * `address_hints` - Map of acceptor IDs to their endpoint addresses
+    // pub fn with_address_hints(
+    //     endpoint: Endpoint,
+    //     group_id: GroupId,
+    //     address_hints: impl IntoIterator<Item = (AcceptorId, EndpointAddr)>,
+    // ) -> Self {
+    //     Self {
+    //         endpoint,
+    //         group_id,
+    //         address_hints: Arc::new(address_hints.into_iter().collect()),
+    //         _marker: PhantomData,
+    //     }
+    // }
 
     /// Get the underlying iroh endpoint
     #[must_use]

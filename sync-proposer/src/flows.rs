@@ -7,9 +7,9 @@ use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::SignatureSecretKey;
 use mls_rs::{CipherSuiteProvider, Client, ExtensionList, MlsMessage};
-use universal_sync_core::{AcceptorId, AcceptorsExt, GroupId};
+use universal_sync_core::{AcceptorsExt, GroupId};
 
-use crate::connector::{ConnectorError, register_group, register_group_with_addr};
+use crate::connector::{ConnectorError, register_group_with_addr};
 use crate::learner::GroupLearner;
 
 /// Error type for flow operations
@@ -28,7 +28,7 @@ pub enum FlowError {
 impl std::fmt::Display for FlowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FlowError::Mls(e) => write!(f, "MLS error: {e}"),
+            FlowError::Mls(e) => write!(f, "MLS error: {e:?}"),
             FlowError::Connector(e) => write!(f, "connector error: {e}"),
             FlowError::NoAcceptors => write!(f, "no acceptors provided"),
             FlowError::GroupInfo(e) => write!(f, "failed to generate GroupInfo: {e}"),
@@ -39,9 +39,8 @@ impl std::fmt::Display for FlowError {
 impl std::error::Error for FlowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            FlowError::Mls(e) => Some(e),
             FlowError::Connector(e) => Some(e),
-            _ => None,
+            FlowError::Mls(_) | FlowError::NoAcceptors | FlowError::GroupInfo(_) => None,
         }
     }
 }
@@ -89,7 +88,7 @@ where
 /// * `signer` - The signing key for this device
 /// * `cipher_suite` - The cipher suite provider
 /// * `endpoint` - The iroh endpoint for connecting to acceptors
-/// * `acceptors` - The set of acceptors to register with
+/// * `acceptors` - The endpoint addresses of acceptors to register with
 ///
 /// # Returns
 /// A [`CreatedGroup`] containing the learner, group ID, and `GroupInfo`.
@@ -105,7 +104,7 @@ where
 ///     signer,
 ///     cipher_suite,
 ///     &endpoint,
-///     &acceptor_ids,
+///     &acceptor_addrs,
 /// ).await?;
 ///
 /// // Share created.group_info with other devices so they can join
@@ -116,7 +115,7 @@ pub async fn create_group<C, CS>(
     signer: SignatureSecretKey,
     cipher_suite: CS,
     endpoint: &Endpoint,
-    acceptors: &[AcceptorId],
+    acceptors: &[EndpointAddr],
 ) -> Result<CreatedGroup<C, CS>, FlowError>
 where
     C: MlsConfig + Clone,
@@ -138,68 +137,12 @@ where
     let group_id = GroupId::from_slice(&mls_group_id);
 
     // Register with all acceptors
-    for acceptor_id in acceptors {
-        register_group(endpoint, acceptor_id, &group_info).await?;
-    }
-
-    // Create the learner
-    let learner = GroupLearner::new(group, signer, cipher_suite, acceptors.iter().copied());
-
-    Ok(CreatedGroup {
-        learner,
-        group_id,
-        group_info,
-    })
-}
-
-/// Create a new MLS group and register it with acceptors using full addresses
-///
-/// Like [`create_group`] but accepts `(AcceptorId, EndpointAddr)` pairs for
-/// testing environments where discovery may not be available.
-///
-/// # Arguments
-/// * `client` - The MLS client to use for creating the group
-/// * `signer` - The signing key for this device
-/// * `cipher_suite` - The cipher suite provider
-/// * `endpoint` - The iroh endpoint for connecting to acceptors
-/// * `acceptors` - List of `(AcceptorId, EndpointAddr)` pairs
-///
-/// # Errors
-/// Returns an error if group creation, `GroupInfo` generation, or acceptor registration fails.
-pub async fn create_group_with_addrs<C, CS>(
-    client: &Client<C>,
-    signer: SignatureSecretKey,
-    cipher_suite: CS,
-    endpoint: &Endpoint,
-    acceptors: &[(AcceptorId, EndpointAddr)],
-) -> Result<CreatedGroup<C, CS>, FlowError>
-where
-    C: MlsConfig + Clone,
-    CS: CipherSuiteProvider + Clone,
-{
-    if acceptors.is_empty() {
-        return Err(FlowError::NoAcceptors);
-    }
-
-    // Create a new MLS group
-    let group = client.create_group(ExtensionList::default(), ExtensionList::default())?;
-
-    // Generate GroupInfo for external observers (acceptors)
-    let group_info_msg = group.group_info_message(true)?;
-    let group_info = group_info_msg.to_bytes()?;
-
-    // Extract the group ID
-    let mls_group_id = group.context().group_id.clone();
-    let group_id = GroupId::from_slice(&mls_group_id);
-
-    // Register with all acceptors using their full addresses
-    for (_, addr) in acceptors {
+    for addr in acceptors {
         register_group_with_addr(endpoint, addr.clone(), &group_info).await?;
     }
 
-    // Create the learner with just the acceptor IDs
-    let acceptor_ids = acceptors.iter().map(|(id, _)| *id);
-    let learner = GroupLearner::new(group, signer, cipher_suite, acceptor_ids);
+    // Create the learner
+    let learner = GroupLearner::new(group, signer, cipher_suite, acceptors.iter().cloned());
 
     Ok(CreatedGroup {
         learner,
@@ -219,7 +162,7 @@ where
 /// # Example
 ///
 /// ```ignore
-/// let ext = acceptors_extension(learner.acceptor_ids());
+/// let ext = acceptors_extension(learner.acceptors().values().cloned());
 /// let commit = group
 ///     .commit_builder()
 ///     .add_member(key_package)
@@ -229,7 +172,7 @@ where
 ///     .unwrap();
 /// ```
 #[must_use]
-pub fn acceptors_extension(acceptors: impl IntoIterator<Item = AcceptorId>) -> ExtensionList {
+pub fn acceptors_extension(acceptors: impl IntoIterator<Item = EndpointAddr>) -> ExtensionList {
     let acceptors_ext = AcceptorsExt::new(acceptors);
     let mut extensions = ExtensionList::default();
     extensions
@@ -310,7 +253,7 @@ where
     let acceptors = info
         .group_info_extensions
         .get_as::<AcceptorsExt>()
-        .map_err(|e| FlowError::GroupInfo(format!("failed to read acceptors extension: {e}")))?
+        .map_err(|e| FlowError::GroupInfo(format!("failed to read acceptors extension: {e:?}")))?
         .map(|ext| ext.0)
         .unwrap_or_default();
 
