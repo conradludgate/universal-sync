@@ -137,6 +137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1094,6 +1100,16 @@ name = "error-code"
 version = "3.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+
+[[package]]
+name = "error-stack"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe413319145d1063f080f27556fd30b1d70b01e2ba10c2a6e40d4be982ffc5d1"
+dependencies = [
+ "anyhow",
+ "rustc_version",
+]
 
 [[package]]
 name = "ext-trait"
@@ -4569,6 +4585,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "error-stack",
  "fjall",
  "futures",
  "hex",
@@ -4593,6 +4610,8 @@ dependencies = [
 name = "universal-sync-core"
 version = "0.1.0"
 dependencies = [
+ "error-stack",
+ "hex",
  "iroh",
  "mls-rs",
  "postcard",
@@ -4605,6 +4624,7 @@ name = "universal-sync-paxos"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "error-stack",
  "futures",
  "num_cpus",
  "pin-project-lite",
@@ -4628,6 +4648,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "error-stack",
  "fjall",
  "futures",
  "hex",

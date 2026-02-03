@@ -184,8 +184,14 @@ impl Learner for TestState {
         }
     }
 
-    fn validate(&self, _proposal: &TestProposal) -> bool {
-        true
+    fn validate(
+        &self,
+        _proposal: &TestProposal,
+    ) -> Result<
+        universal_sync_paxos::Validated,
+        error_stack::Report<universal_sync_paxos::ValidationError>,
+    > {
+        Ok(universal_sync_paxos::Validated::assert_valid())
     }
 
     async fn apply(&mut self, proposal: TestProposal, message: String) -> Result<(), io::Error> {

@@ -76,7 +76,7 @@ where
         &mut self,
         proposal: &A::Proposal,
     ) -> Result<PromiseOutcome<A>, InvalidProposal> {
-        if !self.acceptor.validate(proposal) {
+        if self.acceptor.validate(proposal).is_err() {
             return Err(InvalidProposal);
         }
 
@@ -114,7 +114,7 @@ where
         proposal: &A::Proposal,
         message: &A::Message,
     ) -> Result<AcceptOutcome<A>, InvalidProposal> {
-        if !self.acceptor.validate(proposal) {
+        if self.acceptor.validate(proposal).is_err() {
             return Err(InvalidProposal);
         }
 

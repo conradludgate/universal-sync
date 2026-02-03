@@ -27,3 +27,4 @@ rustyline = "15"
 hex = "0.4"
 fjall.workspace = true
 rand.workspace = true
+error-stack.workspace = true

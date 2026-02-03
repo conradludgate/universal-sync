@@ -222,7 +222,16 @@ where
         unsigned.with_signature(signature.to_bytes().to_vec())
     }
 
-    fn validate(&self, proposal: &GroupProposal) -> bool {
+    fn validate(
+        &self,
+        proposal: &GroupProposal,
+    ) -> Result<
+        universal_sync_paxos::Validated,
+        error_stack::Report<universal_sync_paxos::ValidationError>,
+    > {
+        use error_stack::Report;
+        use universal_sync_paxos::{Validated, ValidationError};
+
         tracing::debug!(
             proposal = ?proposal,
             "validating proposal"
@@ -238,51 +247,63 @@ where
             // Check this is a known acceptor
             if !self.is_known_acceptor(&acceptor_id) {
                 tracing::debug!(?acceptor_id, "sync proposal from unknown acceptor");
-                return false;
+                return Err(Report::new(ValidationError)
+                    .attach_printable("sync proposal from unknown acceptor")
+                    .attach_printable(format!("acceptor_id: {acceptor_id:?}")));
             }
 
             // Verify the iroh ed25519 signature
-            let Ok(public_key) = PublicKey::from_bytes(&proposal.message_hash) else {
+            let public_key = PublicKey::from_bytes(&proposal.message_hash).map_err(|_| {
                 tracing::debug!("invalid public key in message_hash");
-                return false;
-            };
+                Report::new(ValidationError).attach_printable("invalid public key in message_hash")
+            })?;
 
             // Signature must be exactly 64 bytes (ed25519)
-            let Ok(sig_bytes): Result<[u8; Signature::LENGTH], _> =
-                proposal.signature.as_slice().try_into()
-            else {
-                tracing::debug!("invalid signature length");
-                return false;
-            };
+            let sig_bytes: [u8; Signature::LENGTH] =
+                proposal.signature.as_slice().try_into().map_err(|_| {
+                    tracing::debug!("invalid signature length");
+                    Report::new(ValidationError).attach_printable({
+                        format!(
+                            "invalid signature length: expected {}, got {}",
+                            Signature::LENGTH,
+                            proposal.signature.len()
+                        )
+                    })
+                })?;
             let signature = Signature::from_bytes(&sig_bytes);
 
             let data = proposal.unsigned().to_bytes();
-            if public_key.verify(&data, &signature).is_err() {
+            public_key.verify(&data, &signature).map_err(|_| {
                 tracing::debug!("sync proposal signature verification failed");
-                return false;
-            }
+                Report::new(ValidationError)
+                    .attach_printable("sync proposal signature verification failed")
+            })?;
 
             tracing::debug!(?acceptor_id, "accepting sync proposal from known acceptor");
-            return true;
+            return Ok(Validated::assert_valid());
         }
 
         // Regular proposals from MLS group members
-        let Some(public_key) = self.get_member_public_key(proposal.member_id) else {
-            tracing::debug!("proposal member not found in roster");
-            return false;
-        };
+        let public_key = self
+            .get_member_public_key(proposal.member_id)
+            .ok_or_else(|| {
+                tracing::debug!("proposal member not found in roster");
+                Report::new(ValidationError).attach_printable({
+                    format!("member {:?} not found in roster", proposal.member_id)
+                })
+            })?;
 
         let data = proposal.unsigned().to_bytes();
 
-        let Ok(()) = self
-            .cipher_suite
+        self.cipher_suite
             .verify(&public_key, &proposal.signature, &data)
-        else {
-            tracing::debug!("proposal signature verification failed");
-            return false;
-        };
+            .map_err(|_| {
+                tracing::debug!("proposal signature verification failed");
+                Report::new(ValidationError)
+                    .attach_printable("proposal signature verification failed")
+            })?;
 
-        true
+        Ok(Validated::assert_valid())
     }
 
     async fn apply(

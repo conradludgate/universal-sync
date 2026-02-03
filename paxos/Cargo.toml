@@ -18,6 +18,7 @@ tokio-stream.workspace = true
 tracing.workspace = true
 pin-project-lite.workspace = true
 serde = { workspace = true, optional = true }
+error-stack.workspace = true
 
 [dev-dependencies]
 turmoil.workspace = true

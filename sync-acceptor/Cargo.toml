@@ -27,6 +27,7 @@ fjall.workspace = true
 iroh.workspace = true
 bytes.workspace = true
 pin-project-lite.workspace = true
+error-stack.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -8,7 +8,9 @@ use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use universal_sync_core::ACCEPTORS_EXTENSION_TYPE;
+use universal_sync_core::{
+    ACCEPTORS_EXTENSION_TYPE, ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE,
+};
 
 /// Default cipher suite for testing
 pub const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
@@ -80,6 +82,8 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
         .identity_provider(test_identity_provider())
         .signing_identity(signing_identity, secret_key.clone(), TEST_CIPHER_SUITE)
         .extension_type(ACCEPTORS_EXTENSION_TYPE)
+        .extension_type(ACCEPTOR_ADD_EXTENSION_TYPE)
+        .extension_type(ACCEPTOR_REMOVE_EXTENSION_TYPE)
         .build();
 
     TestClientResult {
@@ -98,7 +102,8 @@ pub use universal_sync_core::{
     AcceptorId, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, MemberId,
 };
 pub use universal_sync_proposer::{
-    ConnectorError, CreatedGroup, FlowError, GroupLearner, IrohConnection, IrohConnector,
-    JoinedGroup, LearnerError, PAXOS_ALPN, acceptors_extension, create_group, join_group,
-    register_group, register_group_with_addr,
+    ConnectorError, CreatedGroup, FlowError, Group, GroupContext, GroupError, GroupEvent,
+    GroupLearner, IrohConnection, IrohConnector, JoinedGroup, LearnerError, PAXOS_ALPN,
+    acceptors_extension, create_group, join_group, register_group, register_group_with_addr,
+    store::SharedProposerStore,
 };

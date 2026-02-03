@@ -441,8 +441,15 @@ impl Learner for FjallLearner {
         .with_signature(vec![])
     }
 
-    fn validate(&self, _proposal: &GroupProposal) -> bool {
-        true
+    fn validate(
+        &self,
+        _proposal: &GroupProposal,
+    ) -> Result<
+        universal_sync_paxos::Validated,
+        error_stack::Report<universal_sync_paxos::ValidationError>,
+    > {
+        // Internal learner for state store - always accepts
+        Ok(universal_sync_paxos::Validated::assert_valid())
     }
 
     async fn apply(

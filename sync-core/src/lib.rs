@@ -17,3 +17,6 @@ pub use extension::{
 pub use handshake::{GroupId, Handshake, HandshakeResponse};
 pub use message::GroupMessage;
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
+pub mod util;
+
+pub use util::{load_secret_key, KeyLoadError};

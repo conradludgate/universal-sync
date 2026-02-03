@@ -122,14 +122,14 @@ where
         &self.acceptors
     }
 
-    /// Add an acceptor to the set
-    fn add_acceptor(&mut self, addr: EndpointAddr) {
+    /// Add an acceptor to the set by endpoint address
+    pub fn add_acceptor_addr(&mut self, addr: EndpointAddr) {
         let id = AcceptorId::from_bytes(*addr.id.as_bytes());
         self.acceptors.insert(id, addr);
     }
 
-    /// Remove an acceptor from the set
-    fn remove_acceptor(&mut self, acceptor_id: &AcceptorId) {
+    /// Remove an acceptor from the set by ID
+    pub fn remove_acceptor_id(&mut self, acceptor_id: &AcceptorId) {
         self.acceptors.remove(acceptor_id);
     }
 
@@ -178,13 +178,13 @@ where
                 // Check for AcceptorAdd
                 if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
                     tracing::debug!(acceptor_id = ?add.acceptor_id(), "adding acceptor");
-                    self.add_acceptor(add.0.clone());
+                    self.add_acceptor_addr(add.0.clone());
                 }
 
                 // Check for AcceptorRemove
                 if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
                     tracing::debug!(acceptor_id = ?remove.acceptor_id(), "removing acceptor");
-                    self.remove_acceptor(&remove.acceptor_id());
+                    self.remove_acceptor_id(&remove.acceptor_id());
                 }
             }
         }
@@ -239,10 +239,15 @@ where
     }
 
     /// Verify a proposal's signature
-    fn verify_proposal(&self, proposal: &GroupProposal) -> Result<bool, LearnerError> {
-        let Some(public_key) = self.get_member_public_key(proposal.member_id) else {
-            return Ok(false);
-        };
+    fn verify_proposal(&self, proposal: &GroupProposal) -> Result<(), LearnerError> {
+        let public_key = self
+            .get_member_public_key(proposal.member_id)
+            .ok_or_else(|| {
+                LearnerError::Crypto(format!(
+                    "member {:?} not found in roster",
+                    proposal.member_id
+                ))
+            })?;
 
         let data = proposal.unsigned().to_bytes();
 
@@ -250,7 +255,7 @@ where
             .verify(&public_key, &proposal.signature, &data)
             .map_err(|e| LearnerError::Crypto(format!("{e:?}")))?;
 
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -283,24 +288,49 @@ where
             .expect("signing should not fail")
     }
 
-    fn validate(&self, proposal: &GroupProposal) -> bool {
+    fn validate(
+        &self,
+        proposal: &GroupProposal,
+    ) -> Result<
+        universal_sync_paxos::Validated,
+        error_stack::Report<universal_sync_paxos::ValidationError>,
+    > {
+        use error_stack::Report;
+        use universal_sync_paxos::{Validated, ValidationError};
+
         // Check epoch matches current
         if proposal.epoch.0 != self.group.context().epoch {
-            return false;
+            return Err(Report::new(ValidationError).attach_printable({
+                format!(
+                    "epoch mismatch: expected {}, got {}",
+                    self.group.context().epoch,
+                    proposal.epoch.0
+                )
+            }));
         }
 
         // Check sender is a valid group member
         if !self.is_member(proposal.member_id) {
-            return false;
+            return Err(Report::new(ValidationError).attach_printable({
+                format!("member {:?} not found in roster", proposal.member_id)
+            }));
         }
 
         // All proposals must have signatures
         if proposal.signature.is_empty() {
-            return false;
+            return Err(
+                Report::new(ValidationError).attach_printable("proposal has empty signature")
+            );
         }
 
         // Verify the signature
-        self.verify_proposal(proposal).unwrap_or(false)
+        self.verify_proposal(proposal).map_err(|e| {
+            Report::new(ValidationError)
+                .attach_printable("signature verification failed")
+                .attach_printable(e.to_string())
+        })?;
+
+        Ok(Validated::assert_valid())
     }
 
     async fn apply(

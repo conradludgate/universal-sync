@@ -203,7 +203,7 @@ where
                 continue;
             }
 
-            if !learner.validate(&proposal) {
+            if learner.validate(&proposal).is_err() {
                 trace!("ignoring invalid proposal");
                 continue;
             }
@@ -247,6 +247,14 @@ where
     ) -> Option<(P::Proposal, P::Message)> {
         let round = proposer.current_round();
         let num_acceptors = self.manager.num_actors();
+
+        // With no acceptors, no consensus is needed - accept immediately
+        if num_acceptors == 0 {
+            let proposal = proposer.propose(self.attempt);
+            debug!(?round, "no acceptors, accepting proposal locally");
+            return Some((proposal, message));
+        }
+
         let mut tracker: QuorumTracker<P> = QuorumTracker::new(num_acceptors);
         debug!(?round, quorum = tracker.quorum(), "proposing");
 
@@ -357,7 +365,7 @@ where
             // Check for already accepted values in this round (learning from others)
             if let Some((accepted_p, accepted_m)) = &msg.accepted
                 && accepted_p.round() == round
-                && learner.validate(accepted_p)
+                && learner.validate(accepted_p).is_ok()
             {
                 trace!("found already accepted value in this round");
                 if let Some((learned_p, learned_m)) =
@@ -377,7 +385,7 @@ where
             }
 
             // Validate the promise
-            if !learner.validate(&msg.promised) {
+            if learner.validate(&msg.promised).is_err() {
                 trace!("ignoring invalid promise");
                 continue;
             }
@@ -426,7 +434,7 @@ where
                 continue;
             };
 
-            if !learner.validate(accepted_p) {
+            if learner.validate(accepted_p).is_err() {
                 trace!("ignoring invalid accepted");
                 continue;
             }

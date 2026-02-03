@@ -20,3 +20,6 @@ pin-project-lite = "0.2"
 fjall = "3"
 tempfile = "3"
 iroh = "0.95"
+
+error-stack = "0.5"
+hex = "0.4"

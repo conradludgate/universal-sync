@@ -4,6 +4,7 @@
 //!
 //! - [`Proposal`]: A proposal that can be ordered and compared
 //! - [`ProposalKey`]: Ordering key for proposals
+//! - [`Validated`]: Marker type proving validation was performed
 //! - [`Learner`]: State machine that learns from consensus and can create proposals
 //! - [`Acceptor`]: Marker for a Learner that can act as an acceptor
 //! - [`AcceptorStateStore`]: Shared state for acceptors
@@ -14,10 +15,60 @@ use core::fmt;
 use core::future::Future;
 use core::hash::Hash;
 
+use error_stack::Report;
 use futures::{Sink, Stream};
 
 use crate::acceptor::RoundState;
 use crate::messages::{AcceptorMessage, AcceptorRequest};
+
+/// Error type for proposal validation failures.
+///
+/// Use `error_stack` attachments to provide context about why validation failed.
+#[derive(Debug)]
+pub struct ValidationError;
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("proposal validation failed")
+    }
+}
+
+impl core::error::Error for ValidationError {}
+
+/// Marker type proving that validation was performed.
+///
+/// This type cannot be constructed outside of validation functions,
+/// ensuring that code receiving a `Validated` value knows that
+/// validation actually occurred.
+///
+/// # Example
+///
+/// ```ignore
+/// fn validate(&self, proposal: &Self::Proposal) -> Result<Validated, Report<ValidationError>> {
+///     if proposal.epoch != self.current_epoch() {
+///         return Err(Report::new(ValidationError)
+///             .attach_printable("epoch mismatch"));
+///     }
+///     // ... more checks ...
+///     Ok(Validated::assert_valid())
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Validated(());
+
+impl Validated {
+    /// Assert that validation has been performed.
+    ///
+    /// # Safety (logical)
+    ///
+    /// Only call this after actually performing all validation checks.
+    /// Calling this without proper validation defeats the purpose of
+    /// the marker type.
+    #[must_use]
+    pub fn assert_valid() -> Self {
+        Self(())
+    }
+}
 
 /// A proposal that can be ordered by (`node_id`, round, attempt)
 pub trait Proposal: Clone {
@@ -153,7 +204,13 @@ pub trait Learner: Send + Sync + 'static {
     fn propose(&self, attempt: <Self::Proposal as Proposal>::AttemptId) -> Self::Proposal;
 
     /// Validate a proposal (signatures, authorization, etc.)
-    fn validate(&self, proposal: &Self::Proposal) -> bool;
+    ///
+    /// Returns a [`Validated`] marker on success, proving validation occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ValidationError`] with context explaining why validation failed.
+    fn validate(&self, proposal: &Self::Proposal) -> Result<Validated, Report<ValidationError>>;
 
     /// Apply a learned proposal + message to the state machine
     async fn apply(

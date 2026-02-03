@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Parser;
-use futures::StreamExt;
 use iroh::{Endpoint, SecretKey};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
@@ -17,6 +16,7 @@ use rustyline::error::ReadlineError;
 use tracing::info;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
+    load_secret_key,
 };
 use universal_sync_proposer::connector::PAXOS_ALPN;
 use universal_sync_proposer::repl::ReplContext;
@@ -39,34 +39,6 @@ struct Args {
     /// Name for this client identity
     #[arg(short, long, default_value = "proposer")]
     name: String,
-}
-
-/// Load a secret key from a file
-fn load_secret_key(path: &PathBuf) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    let contents = std::fs::read(path)?;
-
-    // Try parsing as raw bytes first
-    if contents.len() == 32 {
-        let bytes: [u8; 32] = contents.try_into().unwrap();
-        return Ok(bytes);
-    }
-
-    // Try parsing as hex
-    let hex_str = String::from_utf8(contents)?;
-    let hex_str = hex_str.trim();
-    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-
-    if hex_str.len() != 64 {
-        return Err(format!(
-            "Invalid key file: expected 32 raw bytes or 64 hex characters, got {} bytes",
-            hex_str.len()
-        )
-        .into());
-    }
-
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(hex_str, &mut bytes)?;
-    Ok(bytes)
 }
 
 #[tokio::main]
@@ -136,10 +108,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(path = ?args.data, "Opening data directory");
     let store = SharedProposerStore::open(&args.data).await?;
 
-    // List existing groups
-    let groups = store.list_groups();
-    info!(count = groups.len(), "Found stored groups");
-
     // Create iroh endpoint
     let endpoint = Endpoint::builder()
         .secret_key(iroh_key)
@@ -156,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cipher_suite,
         endpoint,
         store,
-        loaded_groups: HashMap::new(),
+        groups: HashMap::new(),
     };
 
     // Run REPL
@@ -168,8 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history_path = args.data.join(".history");
     let _ = rl.load_history(&history_path);
 
-    let (tx1, mut rx1) = tokio::sync::mpsc::channel::<String>(1);
-    let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1);
 
     tokio::task::spawn_blocking(move || {
         loop {
@@ -180,23 +148,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
 
-                    if line == "exit" {
+                    if line == "exit" || line == "quit" {
                         break;
                     }
 
                     let _ = rl.add_history_entry(line);
-                    tx1.blocking_send(line.to_string()).unwrap();
-                    let msg = rx2.blocking_recv().unwrap();
+                    if tx.blocking_send(line.to_string()).is_err() {
+                        break;
+                    }
 
-                    match msg {
-                        Ok(output) => {
-                            if !output.is_empty() {
-                                println!("{output}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                        }
+                    match resp_rx.blocking_recv() {
+                        Some(Ok(output)) if !output.is_empty() => println!("{output}"),
+                        Some(Err(e)) => eprintln!("Error: {e}"),
+                        _ => {}
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -216,37 +180,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = rl.save_history(&history_path);
     });
 
-    loop {
-        let mut learn =
-            futures::stream::iter(context.loaded_groups.values_mut().flat_map(|group| {
-                group
-                    .proposer
-                    .as_mut()
-                    .map(|proposer| (proposer, &mut group.learner))
-            }))
-            .map(|(proposer, learner)| async move {
-                proposer
-                    .learn_one(learner)
-                    .await
-                    .map(|(p, m)| (proposer, learner, p, m))
-            })
-            .buffer_unordered(16);
+    // Main loop - just handle commands
+    // Group learning happens in background tasks managed by each Group
+    while let Some(line) = rx.recv().await {
+        let res = context.execute(&line).await;
+        let _ = resp_tx.send(res).await;
+    }
 
-        tokio::select! {
-            Some(res) = learn.next() => {
-                if let Some((proposer, learner, p, m)) = res {
-                    use universal_sync_paxos::Learner;
-                    learner.apply(p, m).await.unwrap();
-                    proposer.sync_actors(Learner::acceptors(learner));
-                }
-            }
-            Some(line) = rx1.recv() => {
-                drop(learn);
-                let res = context.execute(&line).await;
-                tx2.send(res).await.unwrap();
-            }
-            else => break,
-        }
+    // Gracefully shutdown all groups
+    for (_, group) in context.groups.drain() {
+        group.shutdown().await;
     }
 
     Ok(())

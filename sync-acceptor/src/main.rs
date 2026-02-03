@@ -15,6 +15,7 @@ use tracing::{error, info};
 use universal_sync_acceptor::{
     AcceptorRegistry, PAXOS_ALPN, SharedFjallStateStore, accept_connection,
 };
+use universal_sync_core::load_secret_key;
 
 /// Universal Sync Acceptor Server
 #[derive(Parser, Debug)]
@@ -35,38 +36,6 @@ struct Args {
     bind: String,
 }
 
-/// Load a secret key from a file
-///
-/// Supports:
-/// - Raw 32 bytes
-/// - Hex-encoded 64 characters (with optional 0x prefix)
-fn load_secret_key(path: &PathBuf) -> Result<SecretKey, Box<dyn std::error::Error>> {
-    let contents = std::fs::read(path)?;
-
-    // Try parsing as raw bytes first
-    if contents.len() == 32 {
-        let bytes: [u8; 32] = contents.try_into().unwrap();
-        return Ok(SecretKey::from_bytes(&bytes));
-    }
-
-    // Try parsing as hex
-    let hex_str = String::from_utf8(contents)?;
-    let hex_str = hex_str.trim();
-    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-
-    if hex_str.len() != 64 {
-        return Err(format!(
-            "Invalid key file: expected 32 raw bytes or 64 hex characters, got {} bytes",
-            hex_str.len()
-        )
-        .into());
-    }
-
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(hex_str, &mut bytes)?;
-    Ok(SecretKey::from_bytes(&bytes))
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
@@ -82,7 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load or generate secret key
     let secret_key = if let Some(ref key_path) = args.key_file {
         info!(?key_path, "Loading secret key from file");
-        load_secret_key(key_path)?
+        let bytes = load_secret_key(key_path)?;
+        SecretKey::from_bytes(&bytes)
     } else {
         let key = SecretKey::generate(&mut rand::rng());
         info!(
