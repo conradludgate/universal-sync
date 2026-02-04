@@ -61,6 +61,15 @@ impl From<std::io::Error> for ConnectorError {
     }
 }
 
+impl From<ConnectorError> for std::io::Error {
+    fn from(e: ConnectorError) -> Self {
+        match e {
+            ConnectorError::Io(io_err) => io_err,
+            other => std::io::Error::other(other),
+        }
+    }
+}
+
 /// Iroh-based connector for Paxos acceptors
 ///
 /// Connects to acceptors using iroh's p2p QUIC connections.
@@ -367,4 +376,45 @@ where
         FramedWrite::new(send, PostcardCodec::new()),
         FramedRead::new(recv, PostcardCodec::new()),
     ))
+}
+
+// =============================================================================
+// Simplified proposal stream types (for push-based proposer)
+// =============================================================================
+
+/// Wire format for proposal requests (independent of Learner type)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProposalRequest {
+    /// Phase 1: Prepare
+    Prepare(GroupProposal),
+    /// Phase 2: Accept
+    Accept(GroupProposal, GroupMessage),
+}
+
+/// Wire format for proposal responses (independent of Learner type)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProposalResponse {
+    /// Highest promised proposal
+    pub promised: GroupProposal,
+    /// Highest accepted (proposal, message) pair
+    pub accepted: Option<(GroupProposal, GroupMessage)>,
+}
+
+/// Writer for proposal requests
+pub type ProposalWriter = FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>>;
+
+/// Reader for proposal responses
+pub type ProposalReader = FramedRead<iroh::endpoint::RecvStream, PostcardCodec<ProposalResponse>>;
+
+/// Create proposal stream readers/writers from raw iroh streams
+#[must_use]
+pub fn make_proposal_streams(
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+) -> (ProposalWriter, ProposalReader) {
+    (
+        FramedWrite::new(send, PostcardCodec::new()),
+        FramedRead::new(recv, PostcardCodec::new()),
+    )
 }

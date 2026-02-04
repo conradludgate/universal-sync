@@ -99,7 +99,7 @@ async fn test_mls_group_creation_with_group_api() {
     .await
     .expect("create group");
 
-    let context = group.context();
+    let context = group.context().await.expect("get context");
     tracing::info!(group_id = ?context.group_id, epoch = ?context.epoch, "Group created");
 
     assert_eq!(context.member_count, 1, "Should have 1 member (creator)");
@@ -178,7 +178,7 @@ async fn test_alice_adds_bob_with_group_api() {
         .await
         .expect("add acceptor");
 
-    let context = alice_group.context();
+    let context = alice_group.context().await.expect("get context");
     assert_eq!(context.acceptors.len(), 1, "Should have 1 acceptor");
     tracing::info!("Alice added acceptor");
 
@@ -216,7 +216,7 @@ async fn test_alice_adds_bob_with_group_api() {
     .await
     .expect("bob join group");
 
-    let bob_context = bob_group.context();
+    let bob_context = bob_group.context().await.expect("bob context");
     tracing::info!(epoch = ?bob_context.epoch, "Bob joined group");
 
     // Verify Bob got the acceptor
@@ -229,7 +229,7 @@ async fn test_alice_adds_bob_with_group_api() {
     );
 
     // Verify epochs match
-    let alice_context = alice_group.context();
+    let alice_context = alice_group.context().await.expect("alice context");
     assert_eq!(
         alice_context.epoch, bob_context.epoch,
         "Alice and Bob should be at the same epoch"
@@ -238,7 +238,10 @@ async fn test_alice_adds_bob_with_group_api() {
     // --- Alice updates keys ---
     alice_group.update_keys().await.expect("alice update keys");
 
-    let alice_context = alice_group.context();
+    let alice_context = alice_group
+        .context()
+        .await
+        .expect("alice context after update");
     tracing::info!(epoch = ?alice_context.epoch, "Alice updated keys");
 
     // Give a moment for sync
@@ -358,7 +361,7 @@ async fn test_acceptor_add_remove() {
         .await
         .expect("add acceptor 1");
 
-    let context = group.context();
+    let context = group.context().await.expect("context after add1");
     assert_eq!(context.acceptors.len(), 1);
     tracing::info!("Added first acceptor");
 
@@ -370,7 +373,7 @@ async fn test_acceptor_add_remove() {
         .await
         .expect("add acceptor 2");
 
-    let context = group.context();
+    let context = group.context().await.expect("context after add2");
     assert_eq!(context.acceptors.len(), 2);
     tracing::info!("Added second acceptor");
 
@@ -383,7 +386,7 @@ async fn test_acceptor_add_remove() {
         .await
         .expect("remove acceptor 1");
 
-    let context = group.context();
+    let context = group.context().await.expect("context after remove");
     assert_eq!(context.acceptors.len(), 1);
     assert!(!context.acceptors.contains(&acceptor1_id));
     tracing::info!("Removed first acceptor");

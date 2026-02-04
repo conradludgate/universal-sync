@@ -1,9 +1,23 @@
 //! High-level synchronized group API
 //!
 //! This module provides a self-driving [`Group`] wrapper that:
-//! - Spawns a background task to learn updates from acceptors
-//! - Automatically retries proposals on contention
-//! - Provides a simple API for group operations
+//! - Spawns a background actor to manage MLS group state
+//! - Spawns per-acceptor actors for network I/O
+//! - Provides a simple API for group operations via message passing
+//!
+//! # Architecture
+//!
+//! ```text
+//! Group (handle)
+//!   │
+//!   ├─► GroupActor (owns GroupLearner, Proposer, QuorumTracker)
+//!   │     │
+//!   │     ├─► AcceptorActor[0] ──► iroh connection to acceptor 0
+//!   │     ├─► AcceptorActor[1] ──► iroh connection to acceptor 1
+//!   │     └─► AcceptorActor[n] ──► iroh connection to acceptor n
+//!   │
+//!   └─► app_message_rx (receives decrypted messages)
+//! ```
 //!
 //! # Example
 //!
@@ -25,6 +39,8 @@
 //! group.shutdown().await;
 //! ```
 
+use std::collections::{HashMap, HashSet};
+
 use error_stack::Report;
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::MlsConfig;
@@ -32,27 +48,99 @@ use mls_rs::crypto::SignatureSecretKey;
 use mls_rs::group::proposal::Proposal as MlsProposal;
 use mls_rs::group::{CommitEffect, ReceivedMessage};
 use mls_rs::{CipherSuiteProvider, Client, MlsMessage};
-use rand::rngs::StdRng;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
     GroupProposal, MemberId, MessageId,
 };
-use universal_sync_paxos::Learner;
-use universal_sync_paxos::config::{ProposerConfig, TokioSleep};
-use universal_sync_paxos::proposer::Proposer;
+use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
+use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
 
 use crate::connection::ConnectionManager;
-use crate::connector::IrohConnector;
+use crate::connector::{ProposalRequest, ProposalResponse};
 use crate::error::GroupError;
 use crate::flows::acceptors_extension;
 use crate::learner::GroupLearner;
 
-/// Type alias for the proposer with concrete types
-type GroupProposer<C, CS> =
-    Proposer<GroupLearner<C, CS>, IrohConnector<GroupLearner<C, CS>>, TokioSleep, StdRng>;
+// =============================================================================
+// Actor Message Types
+// =============================================================================
+
+/// Request sent to the `GroupActor`
+enum GroupRequest<C, CS>
+where
+    C: MlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Send + Sync + 'static,
+{
+    /// Get current group context
+    GetContext {
+        reply: oneshot::Sender<GroupContext>,
+    },
+    /// Add a member to the group
+    AddMember {
+        key_package: Box<MlsMessage>,
+        reply: oneshot::Sender<Result<Vec<u8>, Report<GroupError>>>,
+    },
+    /// Remove a member from the group
+    RemoveMember {
+        member_index: u32,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    },
+    /// Update this member's keys
+    UpdateKeys {
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    },
+    /// Send an encrypted application message
+    SendMessage {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<EncryptedAppMessage, Report<GroupError>>>,
+    },
+    /// Add an acceptor to the federation
+    AddAcceptor {
+        addr: EndpointAddr,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    },
+    /// Remove an acceptor from the federation
+    RemoveAcceptor {
+        acceptor_id: AcceptorId,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    },
+    /// Shutdown the actor
+    Shutdown,
+    /// Marker for generic types
+    #[allow(dead_code)]
+    _Marker(std::marker::PhantomData<(C, CS)>),
+}
+
+/// Messages from `AcceptorActor`s to `GroupActor`
+#[allow(clippy::large_enum_variant)]
+enum AcceptorInbound {
+    /// Paxos response from an acceptor
+    ProposalResponse {
+        acceptor_id: AcceptorId,
+        response: ProposalResponse,
+    },
+    /// Encrypted application message received from an acceptor
+    EncryptedMessage { msg: EncryptedAppMessage },
+    /// Acceptor connection failed or closed
+    Disconnected { acceptor_id: AcceptorId },
+}
+
+/// Messages from `GroupActor` to `AcceptorActor`s
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+enum AcceptorOutbound {
+    /// Send a Paxos proposal request
+    ProposalRequest { request: ProposalRequest },
+    /// Send an encrypted application message
+    AppMessage { msg: EncryptedAppMessage },
+}
+
+// =============================================================================
+// Public Types
+// =============================================================================
 
 /// A decrypted application message received from the group.
 #[derive(Debug, Clone)]
@@ -121,55 +209,42 @@ pub struct GroupContext {
     pub confirmed_transcript_hash: Vec<u8>,
 }
 
+// =============================================================================
+// Group Handle (public API)
+// =============================================================================
+
 /// A synchronized MLS group that automatically handles consensus.
 ///
-/// Spawns a background task to learn updates from acceptors.
-/// All mutation methods automatically propose via Paxos with retry.
+/// This is a handle to a background actor that manages the MLS group state.
+/// All mutation methods send requests to the actor and await responses.
 ///
 /// # Lifecycle
 ///
-/// - On `Drop`: Sends cancel signal to background task, does NOT wait
+/// - On `Drop`: Sends cancel signal to background actors, does NOT wait
 /// - On [`shutdown()`](Self::shutdown): Sends cancel signal and waits for clean termination
+#[allow(clippy::struct_field_names)]
 pub struct Group<C, CS>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Send + Sync + 'static,
 {
-    /// The underlying learner
-    learner: GroupLearner<C, CS>,
+    /// Channel to send requests to the `GroupActor`
+    request_tx: mpsc::Sender<GroupRequest<C, CS>>,
 
-    /// The Paxos proposer (works with or without acceptors)
-    proposer: GroupProposer<C, CS>,
-
-    /// Connector for creating new proposers (used when rebuilding after acceptor changes)
-    connector: IrohConnector<GroupLearner<C, CS>>,
-
-    /// Connection manager for multiplexed streams
-    connection_manager: ConnectionManager,
-
-    /// Receiver for learned proposals from the background task
-    learned_rx: tokio::sync::mpsc::Receiver<(GroupProposal, GroupMessage)>,
-
-    /// Background task handle
-    learn_task: Option<JoinHandle<()>>,
-
-    /// Cancellation token for the background task
-    cancel_token: CancellationToken,
+    /// Receiver for decrypted application messages
+    app_message_rx: mpsc::Receiver<ReceivedAppMessage>,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<GroupEvent>,
 
-    /// Receiver for encrypted application messages (from background task)
-    encrypted_message_rx: tokio::sync::mpsc::Receiver<EncryptedAppMessage>,
+    /// Cancellation token for all actors
+    cancel_token: CancellationToken,
 
-    /// Deduplication: seen message identities (sender, epoch, index)
-    seen_messages: std::collections::HashSet<(MemberId, Epoch, u32)>,
+    /// Handle to the group actor task
+    actor_handle: Option<JoinHandle<()>>,
 
-    /// Per-epoch message index counter (resets on epoch change)
-    message_index: u32,
-
-    /// The epoch for which `message_index` is valid
-    message_epoch: Epoch,
+    /// Cached group ID (immutable after creation)
+    group_id: GroupId,
 }
 
 impl<C, CS> Drop for Group<C, CS>
@@ -216,7 +291,6 @@ where
     /// * `cipher_suite` - The cipher suite provider
     /// * `endpoint` - The iroh endpoint for p2p connections
     /// * `acceptors` - Endpoint addresses of acceptors to register with (can be empty)
-    /// * `store` - Persistent storage for group state
     ///
     /// # Errors
     /// Returns an error if group creation or acceptor registration fails.
@@ -268,7 +342,9 @@ where
             Ok::<_, Report<GroupError>>((learner, group_id, group_info_bytes))
         })?;
 
-        // Register with acceptors (async network I/O)
+        let connection_manager = ConnectionManager::new(endpoint.clone());
+
+        // Register with acceptors (async network I/O) and add address hints
         if let Some(group_info_bytes) = group_info_bytes {
             for addr in acceptors {
                 register_group_with_addr(endpoint, addr.clone(), &group_info_bytes)
@@ -280,10 +356,17 @@ where
             }
         }
 
-        let connector = IrohConnector::new(endpoint.clone(), group_id);
-        let connection_manager = ConnectionManager::new(endpoint.clone());
+        // Add address hints for all acceptors to the connection manager
+        for (id, addr) in learner.acceptors() {
+            connection_manager.add_address_hint(*id, addr.clone()).await;
+        }
 
-        Ok(Self::from_learner(learner, connector, connection_manager))
+        Ok(Self::spawn_actors(
+            learner,
+            group_id,
+            endpoint.clone(),
+            connection_manager,
+        ))
     }
 
     /// Join an existing group from a Welcome message.
@@ -294,7 +377,6 @@ where
     /// * `cipher_suite` - The cipher suite provider
     /// * `endpoint` - The iroh endpoint for p2p connections
     /// * `welcome` - The Welcome message bytes
-    /// * `store` - Persistent storage for group state
     ///
     /// # Errors
     /// Returns an error if joining fails.
@@ -344,257 +426,55 @@ where
             Ok::<_, Report<GroupError>>((learner, group_id))
         })?;
 
-        let connector = IrohConnector::new(endpoint.clone(), group_id);
         let connection_manager = ConnectionManager::new(endpoint.clone());
 
-        Ok(Self::from_learner(learner, connector, connection_manager))
+        // Add address hints for all acceptors to the connection manager
+        for (id, addr) in learner.acceptors() {
+            connection_manager.add_address_hint(*id, addr.clone()).await;
+        }
+
+        Ok(Self::spawn_actors(
+            learner,
+            group_id,
+            endpoint.clone(),
+            connection_manager,
+        ))
     }
 
-    /// Create a Group from an existing learner
-    fn from_learner(
+    /// Spawn all actors and return a Group handle
+    fn spawn_actors(
         learner: GroupLearner<C, CS>,
-        connector: IrohConnector<GroupLearner<C, CS>>,
+        group_id: GroupId,
+        endpoint: Endpoint,
         connection_manager: ConnectionManager,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
-        let (learned_tx, learned_rx) = tokio::sync::mpsc::channel(64);
-        let (encrypted_message_tx, encrypted_message_rx) = tokio::sync::mpsc::channel(256);
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let (app_message_tx, app_message_rx) = mpsc::channel(256);
 
-        // Create the proposer (works with or without acceptors)
-        let node_id = learner.node_id();
-        let group_id = GroupId::from_slice(&learner.group().context().group_id);
-        let acceptor_ids: Vec<_> = learner.acceptor_ids().collect();
-        let mut proposer = Proposer::new(node_id, connector.clone(), ProposerConfig::default());
-        proposer.sync_actors(acceptor_ids.clone());
+        // Spawn the group actor
+        let actor = GroupActor::new(
+            learner,
+            group_id,
+            endpoint,
+            connection_manager,
+            request_rx,
+            app_message_tx,
+            event_tx.clone(),
+            cancel_token.clone(),
+        );
 
-        // Spawn the background learning task
-        let task_cancel = cancel_token.clone();
-        let task_connector = connector.clone();
-        let task_connection_manager = connection_manager.clone();
-        let task = tokio::spawn(async move {
-            Self::background_loop(
-                node_id,
-                group_id,
-                acceptor_ids,
-                task_connector,
-                task_connection_manager,
-                task_cancel,
-                learned_tx,
-                encrypted_message_tx,
-            )
-            .await;
-        });
-
-        let message_epoch = learner.mls_epoch();
+        let actor_handle = tokio::spawn(actor.run());
 
         Self {
-            learner,
-            proposer,
-            connector,
-            connection_manager,
-            learned_rx,
-            learn_task: Some(task),
-            cancel_token,
+            request_tx,
+            app_message_rx,
             event_tx,
-            encrypted_message_rx,
-            seen_messages: std::collections::HashSet::new(),
-            message_index: 0,
-            message_epoch,
+            cancel_token,
+            actor_handle: Some(actor_handle),
+            group_id,
         }
-    }
-
-    /// Background task that handles learning and message subscription
-    #[allow(clippy::too_many_arguments)]
-    async fn background_loop(
-        node_id: universal_sync_core::MemberId,
-        group_id: GroupId,
-        acceptor_ids: Vec<AcceptorId>,
-        connector: IrohConnector<GroupLearner<C, CS>>,
-        connection_manager: ConnectionManager,
-        cancel_token: CancellationToken,
-        learned_tx: tokio::sync::mpsc::Sender<(GroupProposal, GroupMessage)>,
-        encrypted_message_tx: tokio::sync::mpsc::Sender<EncryptedAppMessage>,
-    ) {
-        use futures::StreamExt;
-
-        // Create a dedicated proposer for learning
-        let mut proposer: GroupProposer<C, CS> =
-            Proposer::new(node_id, connector, ProposerConfig::default());
-        proposer.sync_actors(acceptor_ids.clone());
-
-        // Subscribe to message streams from each acceptor
-        let mut message_streams = futures::stream::SelectAll::new();
-        for acceptor_id in &acceptor_ids {
-            let stream = subscribe_to_acceptor_messages(
-                connection_manager.clone(),
-                *acceptor_id,
-                group_id,
-                cancel_token.clone(),
-            );
-            // Box::pin to make the stream Unpin for SelectAll
-            message_streams.push(Box::pin(stream));
-        }
-
-        loop {
-            tokio::select! {
-                biased;
-
-                () = cancel_token.cancelled() => {
-                    tracing::debug!("background loop cancelled");
-                    break;
-                }
-
-                // Receive messages from acceptors
-                Some(msg) = message_streams.next() => {
-                    if encrypted_message_tx.send(msg).await.is_err() {
-                        tracing::debug!("message channel closed");
-                        break;
-                    }
-                }
-
-                // Note: Learning is still handled via polling in apply_pending_learned
-                // A full implementation would share state for learn_one
-                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    // Polling placeholder
-                }
-            }
-        }
-
-        drop(learned_tx);
-    }
-
-    /// Apply any pending learned proposals from the background task
-    fn apply_pending_learned(&mut self) -> Result<Vec<GroupEvent>, Report<GroupError>> {
-        let mut events = Vec::new();
-
-        while let Ok((proposal, message)) = self.learned_rx.try_recv() {
-            let new_events = self.apply_proposal(&proposal, message)?;
-            events.extend(new_events);
-        }
-
-        Ok(events)
-    }
-
-    /// Apply a proposal and message, returning the events generated
-    fn apply_proposal(
-        &mut self,
-        proposal: &GroupProposal,
-        message: GroupMessage,
-    ) -> Result<Vec<GroupEvent>, Report<GroupError>> {
-        // Check if this is our own proposal
-        let my_proposal = proposal.member_id == self.learner.node_id();
-
-        // Apply the proposal (blocking I/O via storage)
-        let effect = blocking(|| {
-            if my_proposal && self.learner.has_pending_commit() {
-                // This is our proposal and we have a pending commit - apply it
-                tracing::debug!("applying our own pending commit");
-                let effect = self
-                    .learner
-                    .group_mut()
-                    .apply_pending_commit()
-                    .map_err(|e| {
-                        Report::new(GroupError)
-                            .attach_printable(format!("apply pending commit failed: {e:?}"))
-                    })?;
-
-                Ok::<_, Report<GroupError>>(Some(effect.effect))
-            } else {
-                // This is someone else's proposal, or we don't have a pending commit
-                if self.learner.has_pending_commit() {
-                    tracing::debug!("clearing pending commit - another proposal won");
-                    self.learner.clear_pending_commit();
-                }
-
-                // Process the MLS message
-                let result = self
-                    .learner
-                    .group_mut()
-                    .process_incoming_message(message.mls_message)
-                    .map_err(|e| {
-                        Report::new(GroupError)
-                            .attach_printable(format!("process message failed: {e:?}"))
-                    })?;
-
-                match result {
-                    ReceivedMessage::Commit(commit_desc) => {
-                        tracing::debug!(
-                            epoch = self.learner.group().context().epoch,
-                            "applied commit"
-                        );
-                        Ok(Some(commit_desc.effect))
-                    }
-                    _ => Ok(None),
-                }
-            }
-        })?;
-
-        let events = if let Some(effect) = effect {
-            self.process_commit_effect(&effect)
-        } else {
-            Vec::new()
-        };
-
-        self.sync_proposer_actors();
-        Ok(events)
-    }
-
-    /// Process a commit effect and return events for each applied proposal
-    fn process_commit_effect(&mut self, effect: &CommitEffect) -> Vec<GroupEvent> {
-        let applied_proposals = match effect {
-            CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
-                &new_epoch.applied_proposals
-            }
-            CommitEffect::ReInit(_) => {
-                return vec![GroupEvent::ReInitiated];
-            }
-        };
-
-        let mut events = Vec::new();
-
-        for proposal_info in applied_proposals {
-            let event = match &proposal_info.proposal {
-                MlsProposal::Add(add_proposal) => {
-                    // Get the member index from the key package
-                    // For now, we use a placeholder - real implementation would track this
-                    let _ = add_proposal;
-                    GroupEvent::MemberAdded { index: 0 }
-                }
-                MlsProposal::Remove(remove_proposal) => GroupEvent::MemberRemoved {
-                    index: remove_proposal.to_remove(),
-                },
-                MlsProposal::ReInit(_) => GroupEvent::ReInitiated,
-                MlsProposal::ExternalInit(_) => GroupEvent::ExternalInit,
-                MlsProposal::GroupContextExtensions(extensions) => {
-                    // Check for AcceptorAdd
-                    if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
-                        let id = add.acceptor_id();
-                        self.learner.add_acceptor_addr(add.0.clone());
-                        GroupEvent::AcceptorAdded { id }
-                    } else if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
-                        let id = remove.acceptor_id();
-                        self.learner.remove_acceptor_id(&id);
-                        GroupEvent::AcceptorRemoved { id }
-                    } else {
-                        GroupEvent::ExtensionsUpdated
-                    }
-                }
-                _ => GroupEvent::Unknown,
-            };
-
-            events.push(event.clone());
-
-            // Broadcast each event
-            let _ = self.event_tx.send(event);
-        }
-
-        events
-    }
-
-    /// Sync the proposer's actor set with the current acceptors
-    fn sync_proposer_actors(&mut self) {
-        self.proposer.sync_actors(self.learner.acceptor_ids());
     }
 
     /// Add a member to the group.
@@ -614,40 +494,18 @@ where
         &mut self,
         key_package: MlsMessage,
     ) -> Result<Vec<u8>, Report<GroupError>> {
-        self.propose_with_retry(|learner| {
-            // Collect acceptors first to avoid borrow conflicts
-            let acceptors_ext = acceptors_extension(learner.acceptors().values().cloned());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::AddMember {
+                key_package: Box::new(key_package),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-            // Build the commit with acceptors extension
-            let commit_output = learner
-                .group_mut()
-                .commit_builder()
-                .add_member(key_package.clone())
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("add_member failed: {e:?}"))
-                })?
-                .set_group_info_ext(acceptors_ext)
-                .build()
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
-                })?;
-
-            // Extract the welcome message
-            let welcome = commit_output
-                .welcome_messages
-                .first()
-                .ok_or_else(|| {
-                    Report::new(GroupError).attach_printable("no welcome message generated")
-                })?
-                .to_bytes()
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach_printable(format!("welcome serialization failed: {e:?}"))
-                })?;
-
-            Ok((commit_output, welcome))
-        })
-        .await
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Remove a member from the group.
@@ -660,22 +518,18 @@ where
     /// # Errors
     /// Returns an error if the operation fails after retries.
     pub async fn remove_member(&mut self, member_index: u32) -> Result<(), Report<GroupError>> {
-        self.propose_with_retry(|learner| {
-            let commit_output = learner
-                .group_mut()
-                .commit_builder()
-                .remove_member(member_index)
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("remove_member failed: {e:?}"))
-                })?
-                .build()
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
-                })?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::RemoveMember {
+                member_index,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-            Ok((commit_output, ()))
-        })
-        .await
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Update this member's keys (forward secrecy).
@@ -685,14 +539,15 @@ where
     /// # Errors
     /// Returns an error if the operation fails after retries.
     pub async fn update_keys(&mut self) -> Result<(), Report<GroupError>> {
-        self.propose_with_retry(|learner| {
-            let commit_output = learner.group_mut().commit_builder().build().map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
-            })?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::UpdateKeys { reply: reply_tx })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-            Ok((commit_output, ()))
-        })
-        .await
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Send an encrypted application message to the group.
@@ -709,154 +564,30 @@ where
     ///
     /// # Errors
     /// Returns an error if encryption or sending fails.
-    #[allow(clippy::unused_async)] // Async for future improvements; spawned tasks don't count
     pub async fn send_message(
         &mut self,
         data: &[u8],
     ) -> Result<EncryptedAppMessage, Report<GroupError>> {
-        // Apply any pending learned proposals first
-        self.apply_pending_learned()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::SendMessage {
+                data: data.to_vec(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-        // Get current epoch and check if we need to reset the message counter
-        let current_epoch = self.learner.mls_epoch();
-        if current_epoch != self.message_epoch {
-            self.message_index = 0;
-            self.message_epoch = current_epoch;
-        }
-
-        // Get message ID components
-        let group_id = self.group_id();
-        let epoch = current_epoch;
-        let sender = MemberId(self.learner.group().current_member_index());
-        let index = self.message_index;
-
-        // Increment the index for next message
-        self.message_index = self.message_index.wrapping_add(1);
-
-        // Only include the index in authenticated data - MLS already embeds
-        // group_id, epoch, and sender in the ciphertext
-        let authenticated_data = index.to_be_bytes().to_vec();
-
-        // Encrypt the message (blocking I/O via storage)
-        let mls_message = blocking(|| {
-            self.learner
-                .encrypt_application_message(data, authenticated_data)
-        })
-        .map_err(|e| {
-            Report::new(GroupError).attach_printable(format!("failed to encrypt message: {e}"))
-        })?;
-
-        // Serialize the MLS message to ciphertext bytes
-        let ciphertext = mls_message.to_bytes().map_err(|e| {
-            Report::new(GroupError)
-                .attach_printable(format!("failed to serialize ciphertext: {e:?}"))
-        })?;
-
-        let encrypted_msg = EncryptedAppMessage { ciphertext };
-
-        // Select acceptors using rendezvous hashing
-        // We construct a MessageId just for hashing - it's not stored in the message
-        let message_id = MessageId {
-            group_id,
-            epoch,
-            sender,
-            index,
-        };
-        let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
-        let delivery_count = crate::rendezvous::delivery_count(acceptor_ids.len());
-        let selected_acceptors =
-            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
-
-        // Send to selected acceptors (fire-and-forget style)
-        // We spawn tasks to send in parallel but don't wait for all of them
-        for acceptor_id in selected_acceptors {
-            let connection_manager = self.connection_manager.clone();
-            let msg = encrypted_msg.clone();
-            let gid = group_id;
-
-            tokio::spawn(async move {
-                if let Err(e) =
-                    send_message_to_acceptor(&connection_manager, &acceptor_id, gid, msg).await
-                {
-                    tracing::warn!(?acceptor_id, ?e, "failed to send message to acceptor");
-                }
-            });
-        }
-
-        Ok(encrypted_msg)
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Receive the next decrypted application message.
     ///
-    /// This receives encrypted messages from acceptors (via background subscription),
-    /// decrypts them using MLS, deduplicates, and returns the plaintext.
-    ///
+    /// This receives messages that were decrypted by the group actor.
     /// Returns `None` if the channel is closed (group shutting down).
-    ///
-    /// # Errors
-    /// Returns an error if decryption fails.
-    pub async fn recv_message(&mut self) -> Result<Option<ReceivedAppMessage>, Report<GroupError>> {
-        use mls_rs::MlsMessage;
-
-        loop {
-            // Apply any pending learned proposals first
-            self.apply_pending_learned()?;
-
-            // Try to receive an encrypted message
-            let Some(encrypted) = self.encrypted_message_rx.recv().await else {
-                return Ok(None); // Channel closed
-            };
-
-            // Deserialize the MLS message
-            let mls_message = MlsMessage::from_bytes(&encrypted.ciphertext).map_err(|e| {
-                Report::new(GroupError)
-                    .attach_printable(format!("failed to deserialize MLS message: {e:?}"))
-            })?;
-
-            // Process through MLS (blocking I/O via storage)
-            let received = blocking(|| {
-                self.learner
-                    .group_mut()
-                    .process_incoming_message(mls_message)
-            })
-            .map_err(|e| {
-                Report::new(GroupError)
-                    .attach_printable(format!("failed to process message: {e:?}"))
-            })?;
-
-            // Extract application data
-            let ReceivedMessage::ApplicationMessage(app_msg) = received else {
-                // Not an application message (shouldn't happen on message stream)
-                tracing::debug!("received non-application message on message stream");
-                continue;
-            };
-
-            // Extract message identity from authenticated data (message index)
-            let index = if app_msg.authenticated_data.len() >= 4 {
-                u32::from_be_bytes(app_msg.authenticated_data[..4].try_into().unwrap_or([0; 4]))
-            } else {
-                0
-            };
-
-            let sender = MemberId(app_msg.sender_index);
-            // Use current group epoch as approximation (exact epoch isn't in ApplicationMessageDescription)
-            let epoch = self.learner.mls_epoch();
-
-            // Deduplicate by (sender, epoch, index)
-            let key = (sender, epoch, index);
-            if self.seen_messages.contains(&key) {
-                tracing::trace!(?sender, ?epoch, index, "duplicate message, skipping");
-                continue;
-            }
-            self.seen_messages.insert(key);
-
-            return Ok(Some(ReceivedAppMessage {
-                sender,
-                epoch,
-                index,
-                data: app_msg.data().to_vec(),
-            }));
-        }
+    pub async fn recv_message(&mut self) -> Option<ReceivedAppMessage> {
+        self.app_message_rx.recv().await
     }
 
     /// Add an acceptor to the federation.
@@ -870,53 +601,18 @@ where
     /// # Errors
     /// Returns an error if the operation fails.
     pub async fn add_acceptor(&mut self, addr: EndpointAddr) -> Result<(), Report<GroupError>> {
-        use mls_rs::ExtensionList;
-        use universal_sync_core::AcceptorAdd;
-
-        use crate::connector::register_group_with_addr;
-
-        // Build commit with AcceptorAdd extension
-        self.propose_with_retry(|learner| {
-            let add_ext = AcceptorAdd::new(addr.clone());
-            let mut extensions = ExtensionList::default();
-            extensions.set_from(add_ext).map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("extension failed: {e:?}"))
-            })?;
-
-            let commit_output = learner
-                .group_mut()
-                .commit_builder()
-                .set_group_context_ext(extensions)
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("set extension failed: {e:?}"))
-                })?
-                .build()
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
-                })?;
-
-            Ok((commit_output, ()))
-        })
-        .await?;
-
-        // Get GroupInfo for registration (blocking I/O)
-        let group_info_bytes = blocking(|| {
-            let group_info = self.learner.group().group_info_message(true).map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("group info failed: {e:?}"))
-            })?;
-            group_info.to_bytes().map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("serialization failed: {e:?}"))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::AddAcceptor {
+                addr,
+                reply: reply_tx,
             })
-        })?;
-
-        // Register group with the new acceptor
-        register_group_with_addr(self.connector.endpoint(), addr, &group_info_bytes)
             .await
-            .map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("registration failed: {e}"))
-            })?;
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-        Ok(())
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Remove an acceptor from the federation.
@@ -930,32 +626,18 @@ where
         &mut self,
         acceptor_id: AcceptorId,
     ) -> Result<(), Report<GroupError>> {
-        use mls_rs::ExtensionList;
-        use universal_sync_core::AcceptorRemove;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::RemoveAcceptor {
+                acceptor_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-        // Build commit with AcceptorRemove extension
-        self.propose_with_retry(|learner| {
-            let remove_ext = AcceptorRemove::new(acceptor_id);
-            let mut extensions = ExtensionList::default();
-            extensions.set_from(remove_ext).map_err(|e| {
-                Report::new(GroupError).attach_printable(format!("extension failed: {e:?}"))
-            })?;
-
-            let commit_output = learner
-                .group_mut()
-                .commit_builder()
-                .set_group_context_ext(extensions)
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("set extension failed: {e:?}"))
-                })?
-                .build()
-                .map_err(|e| {
-                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
-                })?;
-
-            Ok((commit_output, ()))
-        })
-        .await
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))?
     }
 
     /// Subscribe to group state changes (informational).
@@ -969,22 +651,385 @@ where
 
     /// Get current group context (epoch, members, acceptors).
     ///
-    /// This applies any pending learned proposals before returning.
-    pub fn context(&mut self) -> GroupContext {
-        // Apply any pending learned proposals first
-        let _ = self.apply_pending_learned();
+    /// This queries the group actor for the current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the group actor has been closed.
+    pub async fn context(&mut self) -> Result<GroupContext, Report<GroupError>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::GetContext { reply: reply_tx })
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor closed"))?;
 
-        self.context_snapshot()
+        reply_rx
+            .await
+            .map_err(|_| Report::new(GroupError).attach_printable("group actor dropped reply"))
     }
 
-    /// Get a snapshot of the group context without applying pending updates.
-    ///
-    /// Use [`context`] to also apply pending learned proposals.
+    /// Get the group ID
     #[must_use]
-    pub fn context_snapshot(&self) -> GroupContext {
+    pub fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    /// Gracefully shut down the background actors.
+    ///
+    /// Unlike `Drop`, this waits for actors to complete.
+    pub async fn shutdown(mut self) {
+        // Send shutdown request
+        let _ = self.request_tx.send(GroupRequest::Shutdown).await;
+        self.cancel_token.cancel();
+        if let Some(handle) = self.actor_handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+// =============================================================================
+// GroupActor
+// =============================================================================
+
+/// The main actor that owns all MLS group state
+struct GroupActor<C, CS>
+where
+    C: MlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Send + Sync + 'static,
+{
+    /// The underlying MLS learner
+    learner: GroupLearner<C, CS>,
+
+    /// Paxos proposer
+    proposer: Proposer<GroupLearner<C, CS>>,
+
+    /// Quorum tracker for learning from acceptors
+    quorum_tracker: QuorumTracker<GroupLearner<C, CS>>,
+
+    /// Current attempt number for proposals
+    attempt: universal_sync_core::Attempt,
+
+    /// Group ID
+    group_id: GroupId,
+
+    /// Iroh endpoint for registering new acceptors
+    #[allow(dead_code)]
+    endpoint: Endpoint,
+
+    /// Connection manager for opening streams
+    connection_manager: ConnectionManager,
+
+    /// Receiver for requests from the Group handle
+    request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
+
+    /// Sender for decrypted application messages
+    app_message_tx: mpsc::Sender<ReceivedAppMessage>,
+
+    /// Event broadcaster
+    event_tx: broadcast::Sender<GroupEvent>,
+
+    /// Cancellation token
+    cancel_token: CancellationToken,
+
+    /// Channels to acceptor actors (for sending outbound messages)
+    acceptor_txs: HashMap<AcceptorId, mpsc::Sender<AcceptorOutbound>>,
+
+    /// Receiver for inbound messages from acceptor actors
+    acceptor_rx: mpsc::Receiver<AcceptorInbound>,
+
+    /// Sender for acceptor inbound (cloned to acceptor actors)
+    acceptor_inbound_tx: mpsc::Sender<AcceptorInbound>,
+
+    /// Handles to acceptor actor tasks
+    acceptor_handles: HashMap<AcceptorId, JoinHandle<()>>,
+
+    /// Per-epoch message index counter (resets on epoch change)
+    message_index: u32,
+
+    /// The epoch for which `message_index` is valid
+    message_epoch: Epoch,
+
+    /// Deduplication: seen message identities (sender, epoch, index)
+    seen_messages: HashSet<(MemberId, Epoch, u32)>,
+
+    /// Pending encrypted messages for future epochs (buffered until we advance)
+    pending_messages: Vec<EncryptedAppMessage>,
+
+    /// Active proposal state (waiting for quorum)
+    active_proposal: Option<ActiveProposal>,
+}
+
+/// State for an active proposal waiting for quorum
+struct ActiveProposal {
+    /// The proposal we're waiting for (stored for debugging)
+    #[allow(dead_code)]
+    proposal: GroupProposal,
+    /// The message associated with the proposal (needed for retry)
+    message: GroupMessage,
+    /// The kind of reply to send when complete
+    reply_kind: ProposalReplyKind,
+    /// When this proposal started (for timeout)
+    started_at: std::time::Instant,
+    /// Number of retry attempts
+    retries: u32,
+}
+
+/// Different kinds of replies for proposals
+enum ProposalReplyKind {
+    /// Simple success/failure reply
+    Simple(oneshot::Sender<Result<(), Report<GroupError>>>),
+    /// Reply with data (e.g., Welcome message)
+    WithData {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, Report<GroupError>>>,
+    },
+}
+
+/// Maximum number of proposal retry attempts
+const MAX_PROPOSAL_RETRIES: u32 = 3;
+/// Timeout for proposal to reach quorum
+const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl<C, CS> GroupActor<C, CS>
+where
+    C: MlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Send + Sync + 'static,
+{
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        learner: GroupLearner<C, CS>,
+        group_id: GroupId,
+        endpoint: Endpoint,
+        connection_manager: ConnectionManager,
+        request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
+        app_message_tx: mpsc::Sender<ReceivedAppMessage>,
+        event_tx: broadcast::Sender<GroupEvent>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        let num_acceptors = learner.acceptor_ids().count();
+        let message_epoch = learner.mls_epoch();
+        let (acceptor_inbound_tx, acceptor_rx) = mpsc::channel(256);
+
+        Self {
+            learner,
+            proposer: Proposer::new(),
+            quorum_tracker: QuorumTracker::new(num_acceptors),
+            attempt: universal_sync_core::Attempt::default(),
+            group_id,
+            endpoint,
+            connection_manager,
+            request_rx,
+            app_message_tx,
+            event_tx,
+            cancel_token,
+            acceptor_txs: HashMap::new(),
+            acceptor_rx,
+            acceptor_inbound_tx,
+            acceptor_handles: HashMap::new(),
+            message_index: 0,
+            message_epoch,
+            seen_messages: HashSet::new(),
+            pending_messages: Vec::new(),
+            active_proposal: None,
+        }
+    }
+
+    /// Run the actor's main loop
+    async fn run(mut self) {
+        // Spawn acceptor actors for all known acceptors
+        self.spawn_acceptor_actors().await;
+
+        // Interval for checking proposal timeouts
+        let mut timeout_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                () = self.cancel_token.cancelled() => {
+                    tracing::debug!("group actor cancelled");
+                    break;
+                }
+
+                // Handle requests from the Group handle
+                Some(request) = self.request_rx.recv() => {
+                    if self.handle_request(request).await {
+                        break; // Shutdown requested
+                    }
+                }
+
+                // Handle messages from acceptor actors
+                Some(inbound) = self.acceptor_rx.recv() => {
+                    self.handle_acceptor_inbound(inbound).await;
+                }
+
+                // Check for proposal timeout
+                _ = timeout_check.tick() => {
+                    self.check_proposal_timeout();
+                }
+            }
+        }
+
+        // Cleanup: cancel all acceptor actors
+        for (_, handle) in self.acceptor_handles.drain() {
+            handle.abort();
+        }
+    }
+
+    /// Check if the active proposal has timed out
+    fn check_proposal_timeout(&mut self) {
+        let timed_out = self
+            .active_proposal
+            .as_ref()
+            .is_some_and(|a| a.started_at.elapsed() > PROPOSAL_TIMEOUT);
+
+        if timed_out {
+            tracing::warn!("proposal timed out, failing");
+            self.learner.clear_pending_commit();
+            if let Some(active) = self.active_proposal.take() {
+                Self::complete_proposal_error(active, "proposal timed out");
+            }
+        }
+    }
+
+    /// Spawn acceptor actors for all known acceptors
+    async fn spawn_acceptor_actors(&mut self) {
+        let acceptors: Vec<_> = self.learner.acceptors().clone().into_iter().collect();
+        for (acceptor_id, addr) in acceptors {
+            self.spawn_acceptor_actor(acceptor_id, addr).await;
+        }
+    }
+
+    /// Spawn a single acceptor actor
+    async fn spawn_acceptor_actor(&mut self, acceptor_id: AcceptorId, addr: EndpointAddr) {
+        self.spawn_acceptor_actor_inner(acceptor_id, addr, false)
+            .await;
+    }
+
+    /// Spawn a single acceptor actor, optionally registering the group first
+    async fn spawn_acceptor_actor_with_registration(
+        &mut self,
+        acceptor_id: AcceptorId,
+        addr: EndpointAddr,
+    ) {
+        self.spawn_acceptor_actor_inner(acceptor_id, addr, true)
+            .await;
+    }
+
+    /// Inner implementation for spawning acceptor actors
+    #[allow(clippy::collapsible_if)]
+    async fn spawn_acceptor_actor_inner(
+        &mut self,
+        acceptor_id: AcceptorId,
+        addr: EndpointAddr,
+        register: bool,
+    ) {
+        // Add address hint
+        self.connection_manager
+            .add_address_hint(acceptor_id, addr.clone())
+            .await;
+
+        // Register the group with the new acceptor if needed
+        if register {
+            if let Err(e) = self.register_group_with_acceptor(&addr).await {
+                tracing::warn!(
+                    ?acceptor_id,
+                    ?e,
+                    "failed to register group with new acceptor"
+                );
+                // Continue anyway - the acceptor actor will retry connections
+            }
+        }
+
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        self.acceptor_txs.insert(acceptor_id, outbound_tx);
+
+        let actor = AcceptorActor {
+            acceptor_id,
+            group_id: self.group_id,
+            connection_manager: self.connection_manager.clone(),
+            outbound_rx,
+            inbound_tx: self.acceptor_inbound_tx.clone(),
+            cancel_token: self.cancel_token.clone(),
+        };
+
+        let handle = tokio::spawn(actor.run());
+        self.acceptor_handles.insert(acceptor_id, handle);
+    }
+
+    /// Register this group with an acceptor
+    async fn register_group_with_acceptor(
+        &self,
+        addr: &EndpointAddr,
+    ) -> Result<(), Report<GroupError>> {
+        use crate::connector::register_group_with_addr;
+
+        // Get GroupInfo for registration (blocking I/O)
+        let group_info_bytes = blocking(|| {
+            let group_info = self.learner.group().group_info_message(true).map_err(|e| {
+                Report::new(GroupError).attach_printable(format!("group info failed: {e:?}"))
+            })?;
+            group_info.to_bytes().map_err(|e| {
+                Report::new(GroupError).attach_printable(format!("serialization failed: {e:?}"))
+            })
+        })?;
+
+        // Register with the acceptor
+        register_group_with_addr(
+            self.connection_manager.endpoint(),
+            addr.clone(),
+            &group_info_bytes,
+        )
+        .await
+        .map_err(|e| {
+            Report::new(GroupError).attach_printable(format!("registration failed: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    /// Handle a request from the Group handle. Returns true if shutdown was requested.
+    async fn handle_request(&mut self, request: GroupRequest<C, CS>) -> bool {
+        match request {
+            GroupRequest::GetContext { reply } => {
+                let context = self.get_context();
+                let _ = reply.send(context);
+            }
+            GroupRequest::AddMember { key_package, reply } => {
+                self.handle_add_member(*key_package, reply).await;
+            }
+            GroupRequest::RemoveMember {
+                member_index,
+                reply,
+            } => {
+                self.handle_remove_member(member_index, reply).await;
+            }
+            GroupRequest::UpdateKeys { reply } => {
+                self.handle_update_keys(reply).await;
+            }
+            GroupRequest::SendMessage { data, reply } => {
+                self.handle_send_message(&data, reply);
+            }
+            GroupRequest::AddAcceptor { addr, reply } => {
+                self.handle_add_acceptor(addr, reply).await;
+            }
+            GroupRequest::RemoveAcceptor { acceptor_id, reply } => {
+                self.handle_remove_acceptor(acceptor_id, reply).await;
+            }
+            GroupRequest::Shutdown => {
+                return true;
+            }
+            GroupRequest::_Marker(_) => unreachable!(),
+        }
+        false
+    }
+
+    /// Get the current group context
+    fn get_context(&self) -> GroupContext {
         let mls_context = self.learner.group().context();
         GroupContext {
-            group_id: self.group_id(),
+            group_id: self.group_id,
             epoch: self.learner.mls_epoch(),
             member_count: self.learner.group().roster().members().len(),
             acceptors: self.learner.acceptor_ids().collect(),
@@ -992,212 +1037,1047 @@ where
         }
     }
 
-    /// Get the group ID
-    #[must_use]
-    pub fn group_id(&self) -> GroupId {
-        let mls_group_id = self.learner.group().context().group_id.clone();
-        GroupId::from_slice(&mls_group_id)
-    }
+    /// Handle add member request
+    async fn handle_add_member(
+        &mut self,
+        key_package: MlsMessage,
+        reply: oneshot::Sender<Result<Vec<u8>, Report<GroupError>>>,
+    ) {
+        // Build the commit
+        let result = blocking(|| {
+            let acceptors_ext = acceptors_extension(self.learner.acceptors().values().cloned());
 
-    /// Gracefully shut down the background task.
-    ///
-    /// Unlike `Drop`, this waits for the background task to complete.
-    pub async fn shutdown(mut self) {
-        self.cancel_token.cancel();
-        if let Some(task) = self.learn_task.take() {
-            let _ = task.await;
+            let commit_output = self
+                .learner
+                .group_mut()
+                .commit_builder()
+                .add_member(key_package)
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("add_member failed: {e:?}"))
+                })?
+                .set_group_info_ext(acceptors_ext)
+                .build()
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
+                })?;
+
+            // Extract the welcome message bytes for later
+            let welcome = commit_output
+                .welcome_messages
+                .first()
+                .ok_or_else(|| {
+                    Report::new(GroupError).attach_printable("no welcome message generated")
+                })?
+                .to_bytes()
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach_printable(format!("welcome serialization failed: {e:?}"))
+                })?;
+
+            Ok::<_, Report<GroupError>>((commit_output, welcome))
+        });
+
+        match result {
+            Ok((commit_output, welcome)) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                self.start_proposal_with_data(message, welcome, reply).await;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
         }
     }
 
-    /// Propose with automatic retry on contention.
-    ///
-    /// Blocks until this node has learned the consensus result.
-    async fn propose_with_retry<F, T>(&mut self, build_commit: F) -> Result<T, Report<GroupError>>
-    where
-        F: Fn(
-            &mut GroupLearner<C, CS>,
-        ) -> Result<(mls_rs::group::CommitOutput, T), Report<GroupError>>,
-    {
-        const MAX_RETRIES: u32 = 5;
+    /// Handle remove member request
+    async fn handle_remove_member(
+        &mut self,
+        member_index: u32,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    ) {
+        let result = blocking(|| {
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .remove_member(member_index)
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("remove_member failed: {e:?}"))
+                })?
+                .build()
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
+                })
+        });
 
-        for attempt in 0..MAX_RETRIES {
-            tracing::debug!(attempt, "propose_with_retry attempt");
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                self.start_proposal(message, reply).await;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
 
-            // Apply any pending learned proposals first
-            self.apply_pending_learned()?;
+    /// Handle update keys request
+    async fn handle_update_keys(&mut self, reply: oneshot::Sender<Result<(), Report<GroupError>>>) {
+        let result = blocking(|| {
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .build()
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
+                })
+        });
 
-            let current_epoch = self.learner.mls_epoch();
-            let my_id = self.learner.node_id();
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                self.start_proposal(message, reply).await;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
 
-            // Build the commit (blocking I/O via storage)
-            let (commit_output, result) = blocking(|| build_commit(&mut self.learner))?;
-            let message = GroupMessage::new(commit_output.commit_message.clone());
+    /// Handle send message request
+    fn handle_send_message(
+        &mut self,
+        data: &[u8],
+        reply: oneshot::Sender<Result<EncryptedAppMessage, Report<GroupError>>>,
+    ) {
+        // Get current epoch and check if we need to reset the message counter
+        let current_epoch = self.learner.mls_epoch();
+        if current_epoch != self.message_epoch {
+            self.message_index = 0;
+            self.message_epoch = current_epoch;
+        }
 
-            // Try to get consensus (works with or without acceptors)
-            match self.proposer.propose(&self.learner, message).await {
-                Some((won_proposal, won_msg)) => {
-                    // Check if we won (by comparing epoch and member ID)
-                    let we_won =
-                        won_proposal.member_id == my_id && won_proposal.epoch == current_epoch;
+        let sender = MemberId(self.learner.group().current_member_index());
+        let index = self.message_index;
+        self.message_index = self.message_index.wrapping_add(1);
 
-                    // Apply the winning proposal (handles both our own and others')
-                    self.apply_proposal(&won_proposal, won_msg)?;
+        // Only include the index in authenticated data
+        let authenticated_data = index.to_be_bytes().to_vec();
 
-                    if we_won {
-                        return Ok(result);
-                    }
-                    // Someone else won - retry
+        // Encrypt the message
+        let result = blocking(|| {
+            self.learner
+                .encrypt_application_message(data, authenticated_data)
+        });
+
+        let mls_message = match result {
+            Ok(msg) => msg,
+            Err(e) => {
+                let _ =
+                    reply
+                        .send(Err(Report::new(GroupError)
+                            .attach_printable(format!("encrypt failed: {e}"))));
+                return;
+            }
+        };
+
+        let ciphertext = match mls_message.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = reply
+                    .send(Err(Report::new(GroupError)
+                        .attach_printable(format!("serialize failed: {e:?}"))));
+                return;
+            }
+        };
+
+        let encrypted_msg = EncryptedAppMessage {
+            ciphertext: ciphertext.clone(),
+        };
+
+        // Select acceptors using rendezvous hashing
+        let message_id = MessageId {
+            group_id: self.group_id,
+            epoch: current_epoch,
+            sender,
+            index,
+        };
+        let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
+        let delivery_count = crate::rendezvous::delivery_count(acceptor_ids.len());
+        let selected_acceptors =
+            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
+
+        // Send to selected acceptors
+        for acceptor_id in selected_acceptors {
+            if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
+                let _ = tx.try_send(AcceptorOutbound::AppMessage {
+                    msg: encrypted_msg.clone(),
+                });
+            }
+        }
+
+        let _ = reply.send(Ok(encrypted_msg));
+    }
+
+    /// Handle add acceptor request
+    async fn handle_add_acceptor(
+        &mut self,
+        addr: EndpointAddr,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    ) {
+        use mls_rs::ExtensionList;
+        use universal_sync_core::AcceptorAdd;
+
+        // Build commit with AcceptorAdd extension
+        let result = blocking(|| {
+            let add_ext = AcceptorAdd::new(addr.clone());
+            let mut extensions = ExtensionList::default();
+            extensions.set_from(add_ext).map_err(|e| {
+                Report::new(GroupError).attach_printable(format!("extension failed: {e:?}"))
+            })?;
+
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .set_group_context_ext(extensions)
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("set extension failed: {e:?}"))
+                })?
+                .build()
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
+                })
+        });
+
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                // Store the addr so we can register after consensus
+                // For now, just start the proposal
+                self.start_proposal(message, reply).await;
+
+                // TODO: After consensus, register with the new acceptor
+                // This would require tracking the addr and doing the registration
+                // after apply_proposal is called
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+
+    /// Handle remove acceptor request
+    async fn handle_remove_acceptor(
+        &mut self,
+        acceptor_id: AcceptorId,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    ) {
+        use mls_rs::ExtensionList;
+        use universal_sync_core::AcceptorRemove;
+
+        let result = blocking(|| {
+            let remove_ext = AcceptorRemove::new(acceptor_id);
+            let mut extensions = ExtensionList::default();
+            extensions.set_from(remove_ext).map_err(|e| {
+                Report::new(GroupError).attach_printable(format!("extension failed: {e:?}"))
+            })?;
+
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .set_group_context_ext(extensions)
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("set extension failed: {e:?}"))
+                })?
+                .build()
+                .map_err(|e| {
+                    Report::new(GroupError).attach_printable(format!("commit build failed: {e:?}"))
+                })
+        });
+
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                self.start_proposal(message, reply).await;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+
+    /// Start a proposal and wait for consensus
+    async fn start_proposal(
+        &mut self,
+        message: GroupMessage,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    ) {
+        let result = self
+            .proposer
+            .propose(&self.learner, self.attempt, message.clone());
+
+        match result {
+            ProposeResult::Learned { proposal, message } => {
+                // Immediately learned (no acceptors)
+                self.apply_proposal(&proposal, message).await;
+                let _ = reply.send(Ok(()));
+            }
+            ProposeResult::Continue(messages) => {
+                // Send prepare messages to acceptors
+                let proposal = self.learner.propose(self.attempt);
+                self.active_proposal = Some(ActiveProposal {
+                    proposal: proposal.clone(),
+                    message,
+                    reply_kind: ProposalReplyKind::Simple(reply),
+                    started_at: std::time::Instant::now(),
+                    retries: 0,
+                });
+
+                for (acceptor_id, request) in messages {
+                    self.send_proposal_request(acceptor_id, request);
                 }
-                None => {
-                    // Proposal failed - clear and retry
+            }
+            ProposeResult::Rejected { superseded_by } => {
+                // Retry with higher attempt number
+                self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                self.learner.clear_pending_commit();
+                tracing::debug!(?self.attempt, "proposal rejected immediately, will retry");
+                // Re-queue the proposal request
+                let () = self.retry_proposal_simple(message, reply, 0).await;
+            }
+        }
+    }
+
+    /// Start a proposal that returns data (e.g., Welcome message)
+    async fn start_proposal_with_data(
+        &mut self,
+        message: GroupMessage,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, Report<GroupError>>>,
+    ) {
+        let result = self
+            .proposer
+            .propose(&self.learner, self.attempt, message.clone());
+
+        match result {
+            ProposeResult::Learned { proposal, message } => {
+                // Immediately learned (no acceptors)
+                self.apply_proposal(&proposal, message).await;
+                let _ = reply.send(Ok(data));
+            }
+            ProposeResult::Continue(messages) => {
+                let proposal = self.learner.propose(self.attempt);
+                self.active_proposal = Some(ActiveProposal {
+                    proposal: proposal.clone(),
+                    message,
+                    reply_kind: ProposalReplyKind::WithData { data, reply },
+                    started_at: std::time::Instant::now(),
+                    retries: 0,
+                });
+
+                for (acceptor_id, request) in messages {
+                    self.send_proposal_request(acceptor_id, request);
+                }
+            }
+            ProposeResult::Rejected { superseded_by } => {
+                // Retry with higher attempt number
+                self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                self.learner.clear_pending_commit();
+                tracing::debug!(?self.attempt, "proposal rejected immediately, will retry");
+                let () = self.retry_proposal_with_data(message, data, reply, 0).await;
+            }
+        }
+    }
+
+    /// Retry a simple proposal
+    async fn retry_proposal_simple(
+        &mut self,
+        message: GroupMessage,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        retries: u32,
+    ) {
+        if retries >= MAX_PROPOSAL_RETRIES {
+            let _ = reply.send(Err(
+                Report::new(GroupError).attach_printable("max proposal retries exceeded")
+            ));
+            return;
+        }
+
+        let result = self
+            .proposer
+            .propose(&self.learner, self.attempt, message.clone());
+
+        match result {
+            ProposeResult::Learned { proposal, message } => {
+                self.apply_proposal(&proposal, message).await;
+                let _ = reply.send(Ok(()));
+            }
+            ProposeResult::Continue(messages) => {
+                let proposal = self.learner.propose(self.attempt);
+                self.active_proposal = Some(ActiveProposal {
+                    proposal: proposal.clone(),
+                    message,
+                    reply_kind: ProposalReplyKind::Simple(reply),
+                    started_at: std::time::Instant::now(),
+                    retries,
+                });
+
+                for (acceptor_id, request) in messages {
+                    self.send_proposal_request(acceptor_id, request);
+                }
+            }
+            ProposeResult::Rejected { superseded_by } => {
+                self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                self.learner.clear_pending_commit();
+                // Recursive retry with backoff
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    10 * (u64::from(retries) + 1),
+                ))
+                .await;
+                Box::pin(self.retry_proposal_simple(message, reply, retries + 1)).await;
+            }
+        }
+    }
+
+    /// Retry a proposal with data
+    async fn retry_proposal_with_data(
+        &mut self,
+        message: GroupMessage,
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, Report<GroupError>>>,
+        retries: u32,
+    ) {
+        if retries >= MAX_PROPOSAL_RETRIES {
+            let _ = reply.send(Err(
+                Report::new(GroupError).attach_printable("max proposal retries exceeded")
+            ));
+            return;
+        }
+
+        let result = self
+            .proposer
+            .propose(&self.learner, self.attempt, message.clone());
+
+        match result {
+            ProposeResult::Learned { proposal, message } => {
+                self.apply_proposal(&proposal, message).await;
+                let _ = reply.send(Ok(data));
+            }
+            ProposeResult::Continue(messages) => {
+                let proposal = self.learner.propose(self.attempt);
+                self.active_proposal = Some(ActiveProposal {
+                    proposal: proposal.clone(),
+                    message,
+                    reply_kind: ProposalReplyKind::WithData { data, reply },
+                    started_at: std::time::Instant::now(),
+                    retries,
+                });
+
+                for (acceptor_id, request) in messages {
+                    self.send_proposal_request(acceptor_id, request);
+                }
+            }
+            ProposeResult::Rejected { superseded_by } => {
+                self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                self.learner.clear_pending_commit();
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    10 * (u64::from(retries) + 1),
+                ))
+                .await;
+                Box::pin(self.retry_proposal_with_data(message, data, reply, retries + 1)).await;
+            }
+        }
+    }
+
+    /// Complete a proposal with success
+    fn complete_proposal_success(active: ActiveProposal) {
+        match active.reply_kind {
+            ProposalReplyKind::Simple(reply) => {
+                let _ = reply.send(Ok(()));
+            }
+            ProposalReplyKind::WithData { data, reply } => {
+                let _ = reply.send(Ok(data));
+            }
+        }
+    }
+
+    /// Complete a proposal with error
+    fn complete_proposal_error(active: ActiveProposal, message: &'static str) {
+        match active.reply_kind {
+            ProposalReplyKind::Simple(reply) => {
+                let _ = reply.send(Err(Report::new(GroupError).attach_printable(message)));
+            }
+            ProposalReplyKind::WithData { reply, .. } => {
+                let _ = reply.send(Err(Report::new(GroupError).attach_printable(message)));
+            }
+        }
+    }
+
+    /// Send a proposal request to an acceptor
+    fn send_proposal_request(
+        &self,
+        acceptor_id: AcceptorId,
+        request: universal_sync_paxos::AcceptorRequest<GroupLearner<C, CS>>,
+    ) {
+        let wire_request = match request {
+            universal_sync_paxos::AcceptorRequest::Prepare(p) => ProposalRequest::Prepare(p),
+            universal_sync_paxos::AcceptorRequest::Accept(p, m) => ProposalRequest::Accept(p, m),
+        };
+
+        if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
+            if let Err(e) = tx.try_send(AcceptorOutbound::ProposalRequest {
+                request: wire_request,
+            }) {
+                tracing::warn!(?acceptor_id, ?e, "failed to queue proposal request");
+            }
+        } else {
+            tracing::warn!(?acceptor_id, "no acceptor actor found for proposal request");
+        }
+    }
+
+    /// Handle an inbound message from an acceptor actor
+    async fn handle_acceptor_inbound(&mut self, inbound: AcceptorInbound) {
+        match inbound {
+            AcceptorInbound::ProposalResponse {
+                acceptor_id,
+                response,
+            } => {
+                self.handle_proposal_response(acceptor_id, response).await;
+            }
+            AcceptorInbound::EncryptedMessage { msg } => {
+                self.handle_encrypted_message(msg);
+            }
+            AcceptorInbound::Disconnected { acceptor_id } => {
+                tracing::warn!(?acceptor_id, "acceptor disconnected");
+                self.acceptor_txs.remove(&acceptor_id);
+                if let Some(handle) = self.acceptor_handles.remove(&acceptor_id) {
+                    handle.abort();
+                }
+            }
+        }
+    }
+
+    /// Handle a proposal response from an acceptor
+    async fn handle_proposal_response(
+        &mut self,
+        acceptor_id: AcceptorId,
+        response: ProposalResponse,
+    ) {
+        // Convert wire format to AcceptorMessage
+        let acceptor_msg: AcceptorMessage<GroupLearner<C, CS>> = AcceptorMessage {
+            promised: response.promised,
+            accepted: response.accepted,
+        };
+
+        // Track for learning (even if not our proposal)
+        if let Some((proposal, message)) = acceptor_msg.accepted.clone() {
+            self.quorum_tracker.track(proposal, message);
+
+            // Check if we learned something for current epoch
+            let current_epoch = self.learner.mls_epoch();
+            if let Some((learned_p, learned_m)) = self.quorum_tracker.check_quorum(current_epoch) {
+                let learned_p = learned_p.clone();
+                let learned_m = learned_m.clone();
+
+                // Check if this is our proposal
+                let my_id = self.learner.node_id();
+                let is_ours = learned_p.member_id == my_id;
+
+                self.apply_proposal(&learned_p, learned_m).await;
+
+                // Complete the active proposal if it was ours
+                if is_ours {
+                    if let Some(active) = self.active_proposal.take() {
+                        Self::complete_proposal_success(active);
+                    }
+                } else {
+                    // Someone else won - fail our active proposal
+                    if let Some(active) = self.active_proposal.take() {
+                        self.learner.clear_pending_commit();
+                        Self::complete_proposal_error(active, "another proposal won");
+                    }
+                }
+
+                return;
+            }
+        }
+
+        // If we have an active proposal, process through proposer
+        if self.active_proposal.is_some() {
+            let result = self
+                .proposer
+                .receive(&self.learner, acceptor_id, acceptor_msg);
+
+            match result {
+                ProposeResult::Continue(messages) => {
+                    for (acc_id, request) in messages {
+                        self.send_proposal_request(acc_id, request);
+                    }
+                }
+                ProposeResult::Learned { proposal, message } => {
+                    self.apply_proposal(&proposal, message).await;
+
+                    if let Some(active) = self.active_proposal.take() {
+                        Self::complete_proposal_success(active);
+                    }
+                }
+                ProposeResult::Rejected { superseded_by } => {
+                    self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                    self.learner.clear_pending_commit();
+
+                    // Retry the proposal if we haven't exceeded max retries
+                    if let Some(active) = self.active_proposal.take() {
+                        let retries = active.retries + 1;
+                        if retries > MAX_PROPOSAL_RETRIES {
+                            tracing::warn!(retries, "max proposal retries exceeded");
+                            Self::complete_proposal_error(active, "max proposal retries exceeded");
+                        } else {
+                            tracing::debug!(retries, "proposal rejected, retrying");
+                            // Small backoff before retry
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                10 * u64::from(retries),
+                            ))
+                            .await;
+                            self.retry_active_proposal(active, retries).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retry an active proposal after rejection
+    async fn retry_active_proposal(&mut self, active: ActiveProposal, retries: u32) {
+        let result = self
+            .proposer
+            .propose(&self.learner, self.attempt, active.message.clone());
+
+        match result {
+            ProposeResult::Learned { proposal, message } => {
+                self.apply_proposal(&proposal, message).await;
+                Self::complete_proposal_success(active);
+            }
+            ProposeResult::Continue(messages) => {
+                let proposal = self.learner.propose(self.attempt);
+                self.active_proposal = Some(ActiveProposal {
+                    proposal: proposal.clone(),
+                    message: active.message,
+                    reply_kind: active.reply_kind,
+                    started_at: active.started_at, // Keep original start time
+                    retries,
+                });
+
+                for (acceptor_id, request) in messages {
+                    self.send_proposal_request(acceptor_id, request);
+                }
+            }
+            ProposeResult::Rejected { superseded_by } => {
+                self.attempt = GroupProposal::next_attempt(superseded_by.attempt());
+                self.learner.clear_pending_commit();
+
+                if retries + 1 > MAX_PROPOSAL_RETRIES {
+                    Self::complete_proposal_error(active, "max proposal retries exceeded");
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        10 * u64::from(retries + 1),
+                    ))
+                    .await;
+                    Box::pin(self.retry_active_proposal(active, retries + 1)).await;
+                }
+            }
+        }
+    }
+
+    /// Handle an encrypted message from an acceptor
+    fn handle_encrypted_message(&mut self, msg: EncryptedAppMessage) {
+        use mls_rs::MlsMessage;
+
+        // Deserialize the MLS message
+        let mls_message = match MlsMessage::from_bytes(&msg.ciphertext) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!(?e, "failed to deserialize MLS message");
+                return;
+            }
+        };
+
+        // Try to process through MLS
+        let received = blocking(|| {
+            self.learner
+                .group_mut()
+                .process_incoming_message(mls_message)
+        });
+
+        let received = match received {
+            Ok(msg) => msg,
+            Err(e) => {
+                // Could be from a future epoch - buffer it
+                // For now, just log and skip
+                tracing::debug!(?e, "failed to process message, possibly future epoch");
+                self.pending_messages.push(msg);
+                return;
+            }
+        };
+
+        // Extract application data
+        let ReceivedMessage::ApplicationMessage(app_msg) = received else {
+            tracing::debug!("received non-application message on message stream");
+            return;
+        };
+
+        // Extract message identity from authenticated data
+        let index = if app_msg.authenticated_data.len() >= 4 {
+            u32::from_be_bytes(app_msg.authenticated_data[..4].try_into().unwrap_or([0; 4]))
+        } else {
+            0
+        };
+
+        let sender = MemberId(app_msg.sender_index);
+        let epoch = self.learner.mls_epoch();
+
+        // Deduplicate
+        let key = (sender, epoch, index);
+        if self.seen_messages.contains(&key) {
+            return;
+        }
+        self.seen_messages.insert(key);
+
+        let received_msg = ReceivedAppMessage {
+            sender,
+            epoch,
+            index,
+            data: app_msg.data().to_vec(),
+        };
+
+        let _ = self.app_message_tx.try_send(received_msg);
+    }
+
+    /// Apply a proposal to the MLS group state
+    async fn apply_proposal(&mut self, proposal: &GroupProposal, message: GroupMessage) {
+        let my_id = self.learner.node_id();
+        let my_proposal = proposal.member_id == my_id;
+
+        let effect = blocking(|| {
+            if my_proposal && self.learner.has_pending_commit() {
+                tracing::debug!("applying our own pending commit");
+                let effect = self.learner.group_mut().apply_pending_commit().ok()?;
+                Some(effect.effect)
+            } else {
+                if self.learner.has_pending_commit() {
+                    tracing::debug!("clearing pending commit - another proposal won");
                     self.learner.clear_pending_commit();
                 }
+
+                let result = self
+                    .learner
+                    .group_mut()
+                    .process_incoming_message(message.mls_message)
+                    .ok()?;
+
+                match result {
+                    ReceivedMessage::Commit(commit_desc) => Some(commit_desc.effect),
+                    _ => None,
+                }
+            }
+        });
+
+        if let Some(effect) = effect {
+            let (events, new_acceptors) = self.process_commit_effect(&effect);
+            for event in events {
+                let _ = self.event_tx.send(event);
             }
 
-            // Wait a bit before retrying
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            // Register and spawn actors for newly added acceptors
+            for (acceptor_id, addr) in new_acceptors {
+                self.spawn_acceptor_actor_with_registration(acceptor_id, addr)
+                    .await;
+            }
+
+            // Reinitialize quorum tracker with new acceptor count
+            let num_acceptors = self.learner.acceptor_ids().count();
+            self.quorum_tracker = QuorumTracker::new(num_acceptors);
         }
 
-        Err(Report::new(GroupError).attach_printable("max retries exceeded due to contention"))
+        // Reset attempt on successful apply
+        self.attempt = universal_sync_core::Attempt::default();
+
+        // Try to process any pending messages
+        self.try_process_pending_messages();
+    }
+
+    /// Process a commit effect and return events + new acceptors to spawn
+    fn process_commit_effect(
+        &mut self,
+        effect: &CommitEffect,
+    ) -> (Vec<GroupEvent>, Vec<(AcceptorId, EndpointAddr)>) {
+        let applied_proposals = match effect {
+            CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
+                &new_epoch.applied_proposals
+            }
+            CommitEffect::ReInit(_) => {
+                return (vec![GroupEvent::ReInitiated], vec![]);
+            }
+        };
+
+        let mut events = Vec::new();
+        let mut new_acceptors = Vec::new();
+
+        for proposal_info in applied_proposals {
+            let event = match &proposal_info.proposal {
+                MlsProposal::Add(add_proposal) => {
+                    let _ = add_proposal;
+                    GroupEvent::MemberAdded { index: 0 }
+                }
+                MlsProposal::Remove(remove_proposal) => GroupEvent::MemberRemoved {
+                    index: remove_proposal.to_remove(),
+                },
+                MlsProposal::ReInit(_) => GroupEvent::ReInitiated,
+                MlsProposal::ExternalInit(_) => GroupEvent::ExternalInit,
+                MlsProposal::GroupContextExtensions(extensions) => {
+                    if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
+                        let id = add.acceptor_id();
+                        let addr = add.0.clone();
+                        self.learner.add_acceptor_addr(addr.clone());
+                        // Queue for spawning after this function returns
+                        new_acceptors.push((id, addr));
+                        GroupEvent::AcceptorAdded { id }
+                    } else if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
+                        let id = remove.acceptor_id();
+                        self.learner.remove_acceptor_id(&id);
+                        // Remove acceptor actor
+                        if let Some(handle) = self.acceptor_handles.remove(&id) {
+                            handle.abort();
+                        }
+                        self.acceptor_txs.remove(&id);
+                        GroupEvent::AcceptorRemoved { id }
+                    } else {
+                        GroupEvent::ExtensionsUpdated
+                    }
+                }
+                _ => GroupEvent::Unknown,
+            };
+
+            events.push(event);
+        }
+
+        (events, new_acceptors)
+    }
+
+    /// Try to process any pending messages that may now be decryptable
+    fn try_process_pending_messages(&mut self) {
+        let pending = std::mem::take(&mut self.pending_messages);
+        for msg in pending {
+            // Re-queue via the inbound channel so it goes through normal processing
+            let _ = self
+                .acceptor_inbound_tx
+                .try_send(AcceptorInbound::EncryptedMessage { msg });
+        }
     }
 }
 
-/// Helper to send a message to a single acceptor
-async fn send_message_to_acceptor(
-    connection_manager: &ConnectionManager,
-    acceptor_id: &AcceptorId,
-    group_id: GroupId,
-    msg: EncryptedAppMessage,
-) -> Result<(), crate::connector::ConnectorError> {
-    use futures::{SinkExt, StreamExt};
-    use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-    use universal_sync_core::MessageRequest;
+// =============================================================================
+// AcceptorActor
+// =============================================================================
 
-    use crate::connector::ConnectorError;
-
-    // Open a message stream to the acceptor
-    let (send, recv) = connection_manager
-        .open_message_stream(acceptor_id, group_id)
-        .await?;
-
-    let mut writer = FramedWrite::new(send, LengthDelimitedCodec::new());
-    let mut reader = FramedRead::new(recv, LengthDelimitedCodec::new());
-
-    // Send the message
-    let request = MessageRequest::Send(msg);
-    let request_bytes = postcard::to_allocvec(&request)
-        .map_err(|e| ConnectorError::Codec(format!("serialize: {e}")))?;
-    writer
-        .send(request_bytes.into())
-        .await
-        .map_err(|e| ConnectorError::Io(std::io::Error::other(e)))?;
-
-    // Wait for acknowledgment (optional, but good to confirm delivery)
-    match reader.next().await {
-        Some(Ok(response_bytes)) => {
-            let response: universal_sync_core::MessageResponse =
-                postcard::from_bytes(&response_bytes)
-                    .map_err(|e| ConnectorError::Codec(format!("deserialize: {e}")))?;
-
-            match response {
-                universal_sync_core::MessageResponse::Stored { arrival_seq } => {
-                    tracing::debug!(?acceptor_id, arrival_seq, "message stored");
-                    Ok(())
-                }
-                universal_sync_core::MessageResponse::Error(e) => {
-                    Err(ConnectorError::Handshake(format!("acceptor error: {e}")))
-                }
-                _ => Ok(()), // Ignore other responses
-            }
-        }
-        Some(Err(e)) => Err(ConnectorError::Io(std::io::Error::other(e))),
-        None => Err(ConnectorError::Connect("stream closed".to_string())),
-    }
-}
-
-/// Create a stream of messages from a single acceptor
-fn subscribe_to_acceptor_messages(
-    connection_manager: ConnectionManager,
+/// Actor managing connection to a single acceptor
+struct AcceptorActor {
     acceptor_id: AcceptorId,
     group_id: GroupId,
+    connection_manager: ConnectionManager,
+    outbound_rx: mpsc::Receiver<AcceptorOutbound>,
+    inbound_tx: mpsc::Sender<AcceptorInbound>,
     cancel_token: CancellationToken,
-) -> impl futures::Stream<Item = EncryptedAppMessage> + Send {
-    async_stream::stream! {
+}
+
+/// Maximum reconnection attempts before giving up
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// Initial reconnection delay
+const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// Maximum reconnection delay
+const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl AcceptorActor {
+    async fn run(mut self) {
+        let mut reconnect_attempts = 0u32;
+        let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
+
+        loop {
+            if self.cancel_token.is_cancelled() {
+                break;
+            }
+
+            // Try to connect and run
+            match self.run_connection().await {
+                ConnectionResult::Cancelled => break,
+                ConnectionResult::Disconnected => {
+                    reconnect_attempts += 1;
+                    if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                        tracing::warn!(
+                            acceptor_id = ?self.acceptor_id,
+                            "max reconnect attempts reached, giving up"
+                        );
+                        break;
+                    }
+
+                    tracing::debug!(
+                        acceptor_id = ?self.acceptor_id,
+                        attempt = reconnect_attempts,
+                        delay_ms = reconnect_delay.as_millis(),
+                        "reconnecting to acceptor"
+                    );
+
+                    // Wait before reconnecting
+                    tokio::select! {
+                        () = tokio::time::sleep(reconnect_delay) => {}
+                        () = self.cancel_token.cancelled() => break,
+                    }
+
+                    // Exponential backoff with cap
+                    reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                }
+            }
+        }
+
+        // Notify group actor we disconnected
+        let _ = self
+            .inbound_tx
+            .send(AcceptorInbound::Disconnected {
+                acceptor_id: self.acceptor_id,
+            })
+            .await;
+    }
+
+    /// Run a single connection session. Returns when disconnected or cancelled.
+    #[allow(clippy::too_many_lines)]
+    async fn run_connection(&mut self) -> ConnectionResult {
         use futures::{SinkExt, StreamExt};
         use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
         use universal_sync_core::{MessageRequest, MessageResponse};
 
-        // Try to connect and subscribe
-        let result = connection_manager
-            .open_message_stream(&acceptor_id, group_id)
+        // Open proposal stream (required for Paxos)
+        let proposal_streams = self
+            .connection_manager
+            .open_proposal_stream(&self.acceptor_id, self.group_id)
             .await;
 
-        let (send, recv) = match result {
+        let (proposal_send, proposal_recv) = match proposal_streams {
             Ok(streams) => streams,
             Err(e) => {
-                tracing::warn!(?acceptor_id, ?e, "failed to open message stream");
-                return;
+                tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to open proposal stream");
+                return ConnectionResult::Disconnected;
             }
         };
 
-        let mut writer = FramedWrite::new(send, LengthDelimitedCodec::new());
-        let mut reader = FramedRead::new(recv, LengthDelimitedCodec::new());
+        let (mut proposal_writer, mut proposal_reader) =
+            crate::connector::make_proposal_streams(proposal_send, proposal_recv);
 
-        // Send subscribe request (start from 0 to get only new messages)
-        let request = MessageRequest::Subscribe { since_seq: 0 };
-        let request_bytes = match postcard::to_allocvec(&request) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(?acceptor_id, ?e, "failed to serialize subscribe request");
-                return;
+        // Try to open message stream (optional - for application messages)
+        let message_streams = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.connection_manager
+                .open_message_stream(&self.acceptor_id, self.group_id),
+        )
+        .await;
+
+        let message_io: Option<(
+            FramedWrite<iroh::endpoint::SendStream, LengthDelimitedCodec>,
+            FramedRead<iroh::endpoint::RecvStream, LengthDelimitedCodec>,
+        )> = match message_streams {
+            Ok(Ok((message_send, message_recv))) => {
+                let mut message_writer =
+                    FramedWrite::new(message_send, LengthDelimitedCodec::new());
+                let message_reader = FramedRead::new(message_recv, LengthDelimitedCodec::new());
+
+                let subscribe_request = MessageRequest::Subscribe { since_seq: 0 };
+                if let Ok(request_bytes) = postcard::to_allocvec(&subscribe_request) {
+                    if message_writer.send(request_bytes.into()).await.is_ok() {
+                        Some((message_writer, message_reader))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
+            Ok(Err(_)) | Err(_) => None,
         };
 
-        if let Err(e) = writer.send(request_bytes.into()).await {
-            tracing::warn!(?acceptor_id, ?e, "failed to send subscribe request");
-            return;
-        }
+        let (mut message_writer_opt, mut message_reader_opt) = match message_io {
+            Some((w, r)) => (Some(w), Some(r)),
+            None => (None, None),
+        };
 
-        // Read messages until cancelled or stream closes
+        // Connection established - run the main loop
         loop {
             tokio::select! {
                 biased;
 
-                () = cancel_token.cancelled() => {
-                    break;
+                () = self.cancel_token.cancelled() => {
+                    return ConnectionResult::Cancelled;
                 }
 
-                frame = reader.next() => {
-                    match frame {
-                        Some(Ok(bytes)) => {
-                            match postcard::from_bytes::<MessageResponse>(&bytes) {
-                                Ok(MessageResponse::Message { message, .. }) => {
-                                    yield message;
-                                }
-                                Ok(MessageResponse::Error(e)) => {
-                                    tracing::warn!(?acceptor_id, ?e, "acceptor returned error");
-                                }
-                                Ok(_) => {
-                                    // Ignore other responses (e.g., Stored)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(?acceptor_id, ?e, "failed to deserialize response");
+                Some(outbound) = self.outbound_rx.recv() => {
+                    match outbound {
+                        AcceptorOutbound::ProposalRequest { request } => {
+                            if let Err(e) = proposal_writer.send(request).await {
+                                tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to send proposal");
+                                return ConnectionResult::Disconnected;
+                            }
+                        }
+                        AcceptorOutbound::AppMessage { msg } => {
+                            if let Some(ref mut writer) = message_writer_opt {
+                                let request = MessageRequest::Send(msg);
+                                if let Ok(request_bytes) = postcard::to_allocvec(&request) {
+                                    let _ = writer.send(request_bytes.into()).await;
                                 }
                             }
                         }
-                        Some(Err(e)) => {
-                            tracing::warn!(?acceptor_id, ?e, "stream read error");
-                            break;
+                    }
+                }
+
+                Some(result) = proposal_reader.next() => {
+                    match result {
+                        Ok(response) => {
+                            let _ = self.inbound_tx.send(AcceptorInbound::ProposalResponse {
+                                acceptor_id: self.acceptor_id,
+                                response,
+                            }).await;
                         }
-                        None => {
-                            tracing::debug!(?acceptor_id, "message stream closed");
-                            break;
+                        Err(e) => {
+                            tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "proposal stream error");
+                            return ConnectionResult::Disconnected;
                         }
+                    }
+                }
+
+                Some(result) = async {
+                    if let Some(ref mut reader) = message_reader_opt {
+                        reader.next().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Ok(bytes) = result {
+                        if let Ok(MessageResponse::Message { message, .. }) = postcard::from_bytes(&bytes) {
+                            let _ = self.inbound_tx.send(AcceptorInbound::EncryptedMessage {
+                                msg: message,
+                            }).await;
+                        }
+                    } else {
+                        // Don't disconnect for message stream errors
+                        message_reader_opt = None;
+                        message_writer_opt = None;
                     }
                 }
             }
         }
     }
+}
+
+/// Result of a connection attempt
+enum ConnectionResult {
+    /// Connection was cancelled
+    Cancelled,
+    /// Connection disconnected (should reconnect)
+    Disconnected,
 }
 
 #[cfg(test)]

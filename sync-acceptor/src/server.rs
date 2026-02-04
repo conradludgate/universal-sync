@@ -194,9 +194,9 @@ where
     let remote_id = conn.remote_id();
     debug!(?remote_id, "accepted connection");
 
-    // Accept and handle one stream (the first one)
-    // TODO: Support multiple concurrent streams per connection once
-    // AcceptorStateStore methods have Send bounds on their futures
+    // Accept and handle one stream per connection
+    // Each stream type (proposals, messages) should use a separate connection
+    // because AcceptorStateStore methods don't return Send futures
     let (send, recv) = conn
         .accept_bi()
         .await

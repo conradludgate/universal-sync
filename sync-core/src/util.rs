@@ -20,7 +20,7 @@ impl std::error::Error for KeyLoadError {}
 ///
 /// Supports two formats:
 /// - Raw bytes: exactly 32 bytes
-/// - Hex string: 64 hex characters (with optional `0x` prefix)
+/// - Base58 string: encoded 32-byte key
 ///
 /// # Errors
 ///
@@ -32,7 +32,7 @@ impl std::error::Error for KeyLoadError {}
 /// # Example
 ///
 /// ```ignore
-/// let key_bytes = load_secret_key("./my-key.hex")?;
+/// let key_bytes = load_secret_key("./my-key.b58")?;
 /// let iroh_key = iroh::SecretKey::from_bytes(&key_bytes);
 /// ```
 pub fn load_secret_key(path: impl AsRef<Path>) -> Result<[u8; 32], Report<KeyLoadError>> {
@@ -46,25 +46,19 @@ pub fn load_secret_key(path: impl AsRef<Path>) -> Result<[u8; 32], Report<KeyLoa
         return Ok(bytes);
     }
 
-    // Try parsing as hex
-    let hex_str = String::from_utf8(contents)
+    // Try parsing as base58
+    let b58_str = String::from_utf8(contents)
         .change_context(KeyLoadError)
         .attach_printable("key file is not valid UTF-8")?;
 
-    let hex_str = hex_str.trim();
-    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let b58_str = b58_str.trim();
 
-    if hex_str.len() != 64 {
-        return Err(Report::new(KeyLoadError).attach_printable(format!(
-            "expected 32 raw bytes or 64 hex characters, got {} chars",
-            hex_str.len()
-        )));
-    }
-
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(hex_str, &mut bytes)
+    let bytes = bs58::decode(b58_str)
+        .into_vec()
         .change_context(KeyLoadError)
-        .attach_printable("invalid hex encoding")?;
+        .attach_printable("invalid base58 encoding")?;
 
-    Ok(bytes)
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        Report::new(KeyLoadError).attach_printable(format!("expected 32 bytes, got {}", v.len()))
+    })
 }

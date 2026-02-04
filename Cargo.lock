@@ -331,6 +331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4605,12 +4614,12 @@ dependencies = [
 name = "universal-sync-acceptor"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "bytes",
  "clap",
  "error-stack",
  "fjall",
  "futures",
- "hex",
  "iroh",
  "mls-rs",
  "mls-rs-crypto-rustcrypto",
@@ -4632,10 +4641,10 @@ dependencies = [
 name = "universal-sync-core"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "bytes",
  "error-stack",
  "futures",
- "hex",
  "iroh",
  "mls-rs",
  "pin-project-lite",
@@ -4674,12 +4683,12 @@ name = "universal-sync-proposer"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "bs58",
  "bytes",
  "clap",
  "error-stack",
  "fjall",
  "futures",
- "hex",
  "iroh",
  "mls-rs",
  "mls-rs-core",

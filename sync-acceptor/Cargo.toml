@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-hex = "0.4"
+bs58.workspace = true
 rand.workspace = true
 tracing-subscriber.workspace = true
 universal-sync-core = { path = "../sync-core" }

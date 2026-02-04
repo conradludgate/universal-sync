@@ -143,6 +143,8 @@ impl ConnectionManager {
     /// Open a message stream for application messages.
     ///
     /// This opens a bidirectional stream and sends a `JoinMessages` handshake.
+    /// Note: This creates a new connection because the server handles only
+    /// one stream per connection (due to `AcceptorStateStore` not being Send).
     ///
     /// # Errors
     /// Returns an error if connection or handshake fails.
@@ -151,11 +153,33 @@ impl ConnectionManager {
         acceptor_id: &AcceptorId,
         group_id: GroupId,
     ) -> Result<(SendStream, RecvStream), ConnectorError> {
-        let conn = self.get_connection(acceptor_id).await?;
+        // Create a new connection for message stream
+        // (server handles one stream per connection)
+        let conn = self.new_connection(acceptor_id).await?;
         let (send, recv) = self
             .open_stream_with_handshake(&conn, Handshake::JoinMessages(group_id))
             .await?;
         Ok((send, recv))
+    }
+
+    /// Create a new connection to an acceptor (not cached).
+    async fn new_connection(&self, acceptor_id: &AcceptorId) -> Result<Connection, ConnectorError> {
+        let addr = self
+            .address_hints
+            .read()
+            .await
+            .get(acceptor_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
+                    .expect("AcceptorId should be a valid public key");
+                public_key.into()
+            });
+
+        self.endpoint
+            .connect(addr, PAXOS_ALPN)
+            .await
+            .map_err(|e| ConnectorError::Connect(e.to_string()))
     }
 
     /// Register a new group with an acceptor.

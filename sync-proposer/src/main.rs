@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("key generation should succeed");
 
     info!(
-        mls_public_key = %hex::encode(public_key.as_ref()),
+        mls_public_key = %bs58::encode(public_key.as_ref()).into_string(),
         "MLS signing key generated"
     );
 
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run REPL
     println!("Universal Sync Proposer REPL");
-    println!("Iroh key: {}", hex::encode(key_bytes));
+    println!("Iroh key: {}", bs58::encode(key_bytes).into_string());
     println!("Type 'help' for available commands.\n");
 
     let mut rl = DefaultEditor::new()?;

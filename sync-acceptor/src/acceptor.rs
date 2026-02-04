@@ -203,7 +203,7 @@ where
         Epoch(self.external_group.group_context().epoch)
     }
 
-    fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId> {
+    fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId, IntoIter: ExactSizeIterator> {
         self.acceptors.iter().copied()
     }
 

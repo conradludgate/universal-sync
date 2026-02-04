@@ -304,7 +304,7 @@ where
         Epoch(self.group.context().epoch)
     }
 
-    fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId> {
+    fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId, IntoIter: ExactSizeIterator> {
         self.acceptors.keys().copied()
     }
 

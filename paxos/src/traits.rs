@@ -195,7 +195,7 @@ pub trait Learner: Send + Sync + 'static {
     fn current_round(&self) -> <Self::Proposal as Proposal>::RoundId;
 
     /// Current acceptor set based on learned state
-    fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorId>;
+    fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorId, IntoIter: ExactSizeIterator>;
 
     /// Create a proposal for the current round and attempt.
     ///

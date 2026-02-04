@@ -110,10 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = endpoint.addr();
     info!(?addr, "Acceptor server listening");
 
-    // Print the address as JSON for easy copy/paste to proposer REPL
+    // Print the address for easy copy/paste to proposer REPL
     let addr_bytes = postcard::to_allocvec(&addr).expect("serialization should not fail");
-    let addr_str = hex::encode(addr_bytes);
-    println!("Endpoint address (hex): {addr_str}");
+    let addr_str = bs58::encode(addr_bytes).into_string();
+    println!("Endpoint address (base58): {addr_str}");
 
     // Accept connections
     info!("Ready to accept connections");

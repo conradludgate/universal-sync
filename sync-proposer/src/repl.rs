@@ -93,7 +93,7 @@ where
                 if parts.len() < 2 {
                     return Err("Usage: group_context <group_id_hex>".to_string());
                 }
-                self.cmd_group_context(parts[1])
+                self.cmd_group_context(parts[1]).await
             }
             "list_groups" => Ok(self.cmd_list_groups()),
             "send" => {
@@ -147,7 +147,7 @@ where
             .to_bytes()
             .map_err(|e| format!("Failed to serialize key package: {e:?}"))?;
 
-        Ok(hex::encode(bytes))
+        Ok(bs58::encode(bytes).into_string())
     }
 
     async fn cmd_create_group(&mut self) -> Result<String, String> {
@@ -162,7 +162,7 @@ where
         .map_err(|e| format!("Failed to create group: {e:?}"))?;
 
         let group_id = group.group_id();
-        let group_id_hex = hex::encode(group_id.as_bytes());
+        let group_id_hex = bs58::encode(group_id.as_bytes()).into_string();
 
         self.groups.insert(group_id, group);
 
@@ -170,9 +170,11 @@ where
     }
 
     async fn cmd_join_group(&mut self, welcome_hex: &str) -> Result<String, String> {
-        let welcome_bytes = hex::decode(welcome_hex).map_err(|e| format!("Invalid hex: {e}"))?;
+        let welcome_bytes = bs58::decode(welcome_hex)
+            .into_vec()
+            .map_err(|e| format!("Invalid base58: {e}"))?;
 
-        let group = Group::join(
+        let mut group = Group::join(
             &self.client,
             self.signer.clone(),
             self.cipher_suite.clone(),
@@ -183,7 +185,8 @@ where
         .map_err(|e| format!("Failed to join group: {e:?}"))?;
 
         let group_id = group.group_id();
-        let output = Self::print_group_context(&group.context_snapshot());
+        let output =
+            Self::print_group_context(&group.context().await.map_err(|e| format!("{e:?}"))?);
 
         self.groups.insert(group_id, group);
 
@@ -214,7 +217,7 @@ where
 
         Ok(format!(
             "Added acceptor: {}",
-            hex::encode(acceptor_id.as_bytes())
+            bs58::encode(acceptor_id.as_bytes()).into_string()
         ))
     }
 
@@ -224,7 +227,9 @@ where
         key_package_hex: &str,
     ) -> Result<String, String> {
         let group_id = parse_group_id(group_id_hex)?;
-        let kp_bytes = hex::decode(key_package_hex).map_err(|e| format!("Invalid hex: {e}"))?;
+        let kp_bytes = bs58::decode(key_package_hex)
+            .into_vec()
+            .map_err(|e| format!("Invalid base58: {e}"))?;
         let key_package =
             MlsMessage::from_bytes(&kp_bytes).map_err(|e| format!("Invalid key package: {e:?}"))?;
 
@@ -238,7 +243,7 @@ where
             .await
             .map_err(|e| format!("Failed to add member: {e:?}"))?;
 
-        Ok(format!("Welcome: {}", hex::encode(welcome)))
+        Ok(format!("Welcome: {}", bs58::encode(welcome).into_string()))
     }
 
     async fn cmd_update_keys(&mut self, group_id_hex: &str) -> Result<String, String> {
@@ -254,7 +259,7 @@ where
             .await
             .map_err(|e| format!("Failed to update keys: {e:?}"))?;
 
-        let context = group.context();
+        let context = group.context().await.map_err(|e| format!("{e:?}"))?;
         Ok(format!("Keys updated. New epoch: {}", context.epoch.0))
     }
 
@@ -302,7 +307,7 @@ where
         Ok(format!("Removed member: {member_index}"))
     }
 
-    fn cmd_group_context(&mut self, group_id_hex: &str) -> Result<String, String> {
+    async fn cmd_group_context(&mut self, group_id_hex: &str) -> Result<String, String> {
         let group_id = parse_group_id(group_id_hex)?;
 
         let group = self
@@ -310,7 +315,8 @@ where
             .get_mut(&group_id)
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
-        Ok(Self::print_group_context(&group.context()))
+        let context = group.context().await.map_err(|e| format!("{e:?}"))?;
+        Ok(Self::print_group_context(&context))
     }
 
     fn print_group_context(context: &crate::GroupContext) -> String {
@@ -318,13 +324,13 @@ where
         let _ = writeln!(
             output,
             "Group ID: {}",
-            hex::encode(context.group_id.as_bytes())
+            bs58::encode(context.group_id.as_bytes()).into_string()
         );
         let _ = writeln!(output, "Epoch: {}", context.epoch.0);
         let _ = writeln!(
             output,
             "Transcript: {}",
-            hex::encode(&context.confirmed_transcript_hash)
+            bs58::encode(&context.confirmed_transcript_hash).into_string()
         );
         let _ = writeln!(output, "Members: {}", context.member_count);
 
@@ -333,7 +339,11 @@ where
         } else {
             output.push_str("Acceptors:\n");
             for acceptor_id in &context.acceptors {
-                let _ = writeln!(output, "  {}", hex::encode(acceptor_id.as_bytes()));
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    bs58::encode(acceptor_id.as_bytes()).into_string()
+                );
             }
         }
 
@@ -348,7 +358,11 @@ where
         let mut output = String::from("Groups:\n");
 
         for group_id in self.groups.keys() {
-            let _ = writeln!(output, "  {}", hex::encode(group_id.as_bytes()));
+            let _ = writeln!(
+                output,
+                "  {}",
+                bs58::encode(group_id.as_bytes()).into_string()
+            );
         }
 
         output
@@ -390,7 +404,7 @@ where
         let result = timeout(Duration::from_secs(5), group.recv_message()).await;
 
         match result {
-            Ok(Ok(Some(msg))) => {
+            Ok(Some(msg)) => {
                 let mut output = String::new();
                 let _ = writeln!(output, "From: member {}", msg.sender.0);
                 let _ = writeln!(output, "Epoch: {}", msg.epoch.0);
@@ -401,13 +415,16 @@ where
                         let _ = writeln!(output, "Data: {text}");
                     }
                     Err(_) => {
-                        let _ = writeln!(output, "Data (hex): {}", hex::encode(&msg.data));
+                        let _ = writeln!(
+                            output,
+                            "Data (base58): {}",
+                            bs58::encode(&msg.data).into_string()
+                        );
                     }
                 }
                 Ok(output)
             }
-            Ok(Ok(None)) => Ok("No messages (channel closed)".to_string()),
-            Ok(Err(e)) => Err(format!("Failed to receive message: {e:?}")),
+            Ok(None) => Ok("No messages (channel closed)".to_string()),
             Err(_) => Ok("No messages (timeout)".to_string()),
         }
     }
@@ -415,16 +432,20 @@ where
 
 // Helper functions
 
-fn parse_group_id(hex_str: &str) -> Result<GroupId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("Invalid hex: {e}"))?;
+fn parse_group_id(b58_str: &str) -> Result<GroupId, String> {
+    let bytes = bs58::decode(b58_str)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58: {e}"))?;
     if bytes.len() > 32 {
         return Err("Group ID too long (max 32 bytes)".to_string());
     }
     Ok(GroupId::from_slice(&bytes))
 }
 
-fn parse_acceptor_id(hex_str: &str) -> Result<AcceptorId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("Invalid hex: {e}"))?;
+fn parse_acceptor_id(b58_str: &str) -> Result<AcceptorId, String> {
+    let bytes = bs58::decode(b58_str)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58: {e}"))?;
     if bytes.len() != 32 {
         return Err("Acceptor ID must be exactly 32 bytes".to_string());
     }
@@ -432,8 +453,10 @@ fn parse_acceptor_id(hex_str: &str) -> Result<AcceptorId, String> {
     Ok(AcceptorId::from_bytes(arr))
 }
 
-fn parse_endpoint_addr(addr_hex: &str) -> Result<EndpointAddr, String> {
-    let bytes = hex::decode(addr_hex).map_err(|e| format!("Invalid hex: {e}"))?;
+fn parse_endpoint_addr(addr_b58: &str) -> Result<EndpointAddr, String> {
+    let bytes = bs58::decode(addr_b58)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58: {e}"))?;
     let addr: EndpointAddr =
         postcard::from_bytes(&bytes).map_err(|e| format!("Invalid address format: {e}"))?;
     Ok(addr)

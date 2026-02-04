@@ -593,7 +593,7 @@ impl Learner for FjallLearner {
         Epoch(0)
     }
 
-    fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorId> {
+    fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorId, IntoIter: ExactSizeIterator> {
         std::iter::empty()
     }
 

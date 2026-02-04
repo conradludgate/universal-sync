@@ -25,7 +25,7 @@ bytes.workspace = true
 pin-project-lite.workspace = true
 clap = { version = "4", features = ["derive"] }
 rustyline = "15"
-hex = "0.4"
+bs58.workspace = true
 fjall.workspace = true
 rand.workspace = true
 error-stack.workspace = true
