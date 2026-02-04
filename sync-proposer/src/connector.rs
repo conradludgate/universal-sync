@@ -8,12 +8,12 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use pin_project_lite::pin_project;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use universal_sync_core::codec::PostcardCodec;
+use universal_sync_core::sink_stream::{Mapped, SinkStream};
 use universal_sync_core::{
     AcceptorId, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
 };
@@ -148,9 +148,9 @@ impl<L> IrohConnector<L> {
 impl<L> Connector<L> for IrohConnector<L>
 where
     L: Learner<Proposal = GroupProposal, Message = GroupMessage, AcceptorId = AcceptorId>,
-    L::Error: From<ConnectorError>,
+    L::Error: From<ConnectorError> + From<std::io::Error>,
 {
-    type Connection = IrohConnection<L>;
+    type Connection = IrohConnection<L, L::Error>;
     type Error = ConnectorError;
     type ConnectFuture =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send>>;
@@ -231,7 +231,7 @@ where
             let recv = reader.into_inner();
             let send = writer.into_inner();
 
-            Ok(IrohConnection::new(send, recv))
+            Ok(new_iroh_connection::<L, L::Error>(send, recv))
         })
     }
 }
@@ -342,90 +342,29 @@ pub async fn register_group_with_addr(
     }
 }
 
-pin_project! {
-    /// A bidirectional Paxos connection over iroh
-    ///
-    /// Implements both `Sink<AcceptorRequest>` and `Stream<Item = AcceptorMessage>`.
-    pub struct IrohConnection<L> {
-        #[pin]
-        writer: FramedWrite<iroh::endpoint::SendStream, LengthDelimitedCodec>,
-        #[pin]
-        reader: FramedRead<iroh::endpoint::RecvStream, LengthDelimitedCodec>,
-        _marker: PhantomData<fn() -> L>,
-    }
-}
+/// A bidirectional Paxos connection over iroh
+///
+/// Implements both `Sink<AcceptorRequest>` and `Stream<Item = AcceptorMessage>`.
+/// Uses `MappedSinkStream` to convert `io::Error` to the learner's error type.
+pub type IrohConnection<L, E> = Mapped<
+    SinkStream<
+        FramedWrite<iroh::endpoint::SendStream, PostcardCodec<AcceptorRequest<L>>>,
+        FramedRead<iroh::endpoint::RecvStream, PostcardCodec<AcceptorMessage<L>>>,
+    >,
+    E,
+>;
 
-impl<L> IrohConnection<L> {
-    fn new(send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream) -> Self {
-        let codec = LengthDelimitedCodec::builder()
-            .max_frame_length(16 * 1024 * 1024) // 16 MB max message size
-            .new_codec();
-
-        Self {
-            writer: FramedWrite::new(send, codec.clone()),
-            reader: FramedRead::new(recv, codec),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<L> Stream for IrohConnection<L>
+/// Create a new `IrohConnection` from iroh streams
+#[must_use]
+pub fn new_iroh_connection<L, E>(
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+) -> IrohConnection<L, E>
 where
     L: Learner<Proposal = GroupProposal, Message = GroupMessage>,
-    L::Error: From<ConnectorError>,
 {
-    type Item = Result<AcceptorMessage<L>, L::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        match this.reader.poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match postcard::from_bytes(&bytes) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => Poll::Ready(Some(Err(ConnectorError::Codec(e.to_string()).into()))),
-            },
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ConnectorError::Io(e).into()))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<L> Sink<AcceptorRequest<L>> for IrohConnection<L>
-where
-    L: Learner<Proposal = GroupProposal, Message = GroupMessage>,
-    L::Error: From<ConnectorError>,
-{
-    type Error = L::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_ready(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: AcceptorRequest<L>) -> Result<(), Self::Error> {
-        let bytes =
-            postcard::to_allocvec(&item).map_err(|e| ConnectorError::Codec(e.to_string()))?;
-
-        self.project()
-            .writer
-            .start_send(bytes.into())
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_flush(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_close(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
+    Mapped::new(SinkStream::new(
+        FramedWrite::new(send, PostcardCodec::new()),
+        FramedRead::new(recv, PostcardCodec::new()),
+    ))
 }

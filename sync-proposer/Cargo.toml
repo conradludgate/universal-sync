@@ -30,6 +30,7 @@ fjall.workspace = true
 rand.workspace = true
 error-stack.workspace = true
 async-stream.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

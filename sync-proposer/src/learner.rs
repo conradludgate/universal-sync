@@ -20,6 +20,8 @@ pub enum LearnerError {
     Mls(mls_rs::error::MlsError),
     /// Crypto error during signing/verification
     Crypto(String),
+    /// IO error
+    Io(std::io::Error),
     /// Unexpected message type
     UnexpectedMessageType,
 }
@@ -29,6 +31,7 @@ impl std::fmt::Display for LearnerError {
         match self {
             LearnerError::Mls(e) => write!(f, "MLS error: {e:?}"),
             LearnerError::Crypto(e) => write!(f, "crypto error: {e}"),
+            LearnerError::Io(e) => write!(f, "IO error: {e}"),
             LearnerError::UnexpectedMessageType => write!(f, "unexpected message type"),
         }
     }
@@ -45,6 +48,12 @@ impl From<mls_rs::error::MlsError> for LearnerError {
 impl From<crate::connector::ConnectorError> for LearnerError {
     fn from(e: crate::connector::ConnectorError) -> Self {
         LearnerError::Crypto(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for LearnerError {
+    fn from(e: std::io::Error) -> Self {
+        LearnerError::Io(e)
     }
 }
 

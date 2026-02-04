@@ -4632,12 +4632,17 @@ dependencies = [
 name = "universal-sync-core"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "error-stack",
+ "futures",
  "hex",
  "iroh",
  "mls-rs",
+ "pin-project-lite",
  "postcard",
  "serde",
+ "tokio",
+ "tokio-util",
  "universal-sync-paxos",
 ]
 
@@ -4691,6 +4696,7 @@ dependencies = [
  "tracing-subscriber",
  "universal-sync-core",
  "universal-sync-paxos",
+ "xxhash-rust",
 ]
 
 [[package]]

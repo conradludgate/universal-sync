@@ -168,7 +168,7 @@ where
     /// Per-epoch message index counter (resets on epoch change)
     message_index: u32,
 
-    /// The epoch for which message_index is valid
+    /// The epoch for which `message_index` is valid
     message_epoch: Epoch,
 }
 
@@ -709,6 +709,7 @@ where
     ///
     /// # Errors
     /// Returns an error if encryption or sending fails.
+    #[allow(clippy::unused_async)] // Async for future improvements; spawned tasks don't count
     pub async fn send_message(
         &mut self,
         data: &[u8],
@@ -802,9 +803,8 @@ where
             self.apply_pending_learned()?;
 
             // Try to receive an encrypted message
-            let encrypted = match self.encrypted_message_rx.recv().await {
-                Some(msg) => msg,
-                None => return Ok(None), // Channel closed
+            let Some(encrypted) = self.encrypted_message_rx.recv().await else {
+                return Ok(None); // Channel closed
             };
 
             // Deserialize the MLS message
@@ -1073,6 +1073,8 @@ async fn send_message_to_acceptor(
     use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
     use universal_sync_core::MessageRequest;
 
+    use crate::connector::ConnectorError;
+
     // Open a message stream to the acceptor
     let (send, recv) = connection_manager
         .open_message_stream(acceptor_id, group_id)
@@ -1081,8 +1083,6 @@ async fn send_message_to_acceptor(
     let mut writer = FramedWrite::new(send, LengthDelimitedCodec::new());
     let mut reader = FramedRead::new(recv, LengthDelimitedCodec::new());
 
-    use crate::connector::ConnectorError;
-
     // Send the message
     let request = MessageRequest::Send(msg);
     let request_bytes = postcard::to_allocvec(&request)
@@ -1090,7 +1090,7 @@ async fn send_message_to_acceptor(
     writer
         .send(request_bytes.into())
         .await
-        .map_err(|e| ConnectorError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .map_err(|e| ConnectorError::Io(std::io::Error::other(e)))?;
 
     // Wait for acknowledgment (optional, but good to confirm delivery)
     match reader.next().await {
@@ -1110,10 +1110,7 @@ async fn send_message_to_acceptor(
                 _ => Ok(()), // Ignore other responses
             }
         }
-        Some(Err(e)) => Err(ConnectorError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e,
-        ))),
+        Some(Err(e)) => Err(ConnectorError::Io(std::io::Error::other(e))),
         None => Err(ConnectorError::Connect("stream closed".to_string())),
     }
 }

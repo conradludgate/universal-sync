@@ -34,15 +34,12 @@
 //! }
 //! ```
 
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{SinkExt, StreamExt};
 use iroh::endpoint::{Incoming, RecvStream, SendStream};
-use pin_project_lite::pin_project;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, warn};
+use universal_sync_core::codec::PostcardCodec;
+use universal_sync_core::sink_stream::{Mapped, SinkStream};
 use universal_sync_core::{
     EncryptedAppMessage, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
     MemberId, MessageRequest, MessageResponse,
@@ -52,178 +49,53 @@ use universal_sync_paxos::{AcceptorMessage, AcceptorRequest, AcceptorStateStore,
 
 use crate::connector::{ConnectorError, PAXOS_ALPN};
 
-pin_project! {
-    /// Server-side acceptor connection over iroh
-    ///
-    /// This is the inverse of `IrohConnection`:
-    /// - Stream yields `AcceptorRequest` (from clients)
-    /// - Sink accepts `AcceptorMessage` (to clients)
-    pub struct IrohAcceptorConnection<A> {
-        #[pin]
-        writer: FramedWrite<SendStream, LengthDelimitedCodec>,
-        #[pin]
-        reader: FramedRead<RecvStream, LengthDelimitedCodec>,
-        _marker: PhantomData<fn() -> A>,
-    }
-}
+/// Server-side acceptor connection over iroh
+///
+/// This is the inverse of `IrohConnection`:
+/// - Stream yields `AcceptorRequest` (from clients)
+/// - Sink accepts `AcceptorMessage` (to clients)
+///
+/// Uses `MappedSinkStream` to convert `io::Error` to the acceptor's error type.
+pub type IrohAcceptorConnection<A, E> = Mapped<
+    SinkStream<
+        FramedWrite<SendStream, PostcardCodec<AcceptorMessage<A>>>,
+        FramedRead<RecvStream, PostcardCodec<AcceptorRequest<A>>>,
+    >,
+    E,
+>;
 
-impl<A> IrohAcceptorConnection<A> {
-    /// Create a new acceptor connection from iroh streams
-    #[must_use]
-    pub fn new(send: SendStream, recv: RecvStream) -> Self {
-        let codec = LengthDelimitedCodec::builder()
-            .max_frame_length(16 * 1024 * 1024) // 16 MB max message size
-            .new_codec();
-
-        Self {
-            writer: FramedWrite::new(send, codec.clone()),
-            reader: FramedRead::new(recv, codec),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<A> Stream for IrohAcceptorConnection<A>
+/// Create a new acceptor connection from iroh streams
+#[must_use]
+pub fn new_acceptor_connection<A, E>(
+    send: SendStream,
+    recv: RecvStream,
+) -> IrohAcceptorConnection<A, E>
 where
     A: Learner<Proposal = GroupProposal, Message = GroupMessage>,
-    A::Error: From<ConnectorError>,
 {
-    type Item = Result<AcceptorRequest<A>, A::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        match this.reader.poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match postcard::from_bytes(&bytes) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => Poll::Ready(Some(Err(ConnectorError::Codec(e.to_string()).into()))),
-            },
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ConnectorError::Io(e).into()))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+    Mapped::new(SinkStream::new(
+        FramedWrite::new(send, PostcardCodec::new()),
+        FramedRead::new(recv, PostcardCodec::new()),
+    ))
 }
 
-impl<A> Sink<AcceptorMessage<A>> for IrohAcceptorConnection<A>
-where
-    A: Learner<Proposal = GroupProposal, Message = GroupMessage>,
-    A::Error: From<ConnectorError>,
-{
-    type Error = A::Error;
+/// Server-side message connection over iroh
+///
+/// Used for application message streams (not Paxos):
+/// - Stream yields `MessageRequest` (from clients)
+/// - Sink accepts `MessageResponse` (to clients)
+pub type IrohMessageConnection = SinkStream<
+    FramedWrite<SendStream, PostcardCodec<MessageResponse>>,
+    FramedRead<RecvStream, PostcardCodec<MessageRequest>>,
+>;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_ready(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: AcceptorMessage<A>) -> Result<(), Self::Error> {
-        let bytes =
-            postcard::to_allocvec(&item).map_err(|e| ConnectorError::Codec(e.to_string()))?;
-
-        self.project()
-            .writer
-            .start_send(bytes.into())
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_flush(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_close(cx)
-            .map_err(|e| ConnectorError::Io(e).into())
-    }
-}
-
-pin_project! {
-    /// Server-side message connection over iroh
-    ///
-    /// Used for application message streams (not Paxos):
-    /// - Stream yields `MessageRequest` (from clients)
-    /// - Sink accepts `MessageResponse` (to clients)
-    pub struct IrohMessageConnection {
-        #[pin]
-        writer: FramedWrite<SendStream, LengthDelimitedCodec>,
-        #[pin]
-        reader: FramedRead<RecvStream, LengthDelimitedCodec>,
-    }
-}
-
-impl IrohMessageConnection {
-    /// Create a new message connection from iroh streams
-    #[must_use]
-    pub fn new(send: SendStream, recv: RecvStream) -> Self {
-        let codec = LengthDelimitedCodec::builder()
-            .max_frame_length(16 * 1024 * 1024) // 16 MB max message size
-            .new_codec();
-
-        Self {
-            writer: FramedWrite::new(send, codec.clone()),
-            reader: FramedRead::new(recv, codec),
-        }
-    }
-}
-
-impl Stream for IrohMessageConnection {
-    type Item = Result<MessageRequest, ConnectorError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        match this.reader.poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => match postcard::from_bytes(&bytes) {
-                Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => Poll::Ready(Some(Err(ConnectorError::Codec(e.to_string())))),
-            },
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(ConnectorError::Io(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Sink<MessageResponse> for IrohMessageConnection {
-    type Error = ConnectorError;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_ready(cx)
-            .map_err(ConnectorError::Io)
-    }
-
-    fn start_send(self: Pin<&mut Self>, item: MessageResponse) -> Result<(), Self::Error> {
-        let bytes =
-            postcard::to_allocvec(&item).map_err(|e| ConnectorError::Codec(e.to_string()))?;
-
-        self.project()
-            .writer
-            .start_send(bytes.into())
-            .map_err(ConnectorError::Io)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_flush(cx)
-            .map_err(ConnectorError::Io)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.project()
-            .writer
-            .poll_close(cx)
-            .map_err(ConnectorError::Io)
-    }
+/// Create a new message connection from iroh streams
+#[must_use]
+pub fn new_message_connection(send: SendStream, recv: RecvStream) -> IrohMessageConnection {
+    SinkStream::new(
+        FramedWrite::new(send, PostcardCodec::new()),
+        FramedRead::new(recv, PostcardCodec::new()),
+    )
 }
 
 /// Registry for looking up and creating groups
@@ -303,7 +175,7 @@ pub trait GroupRegistry: Clone + Send + Sync + 'static {
 pub async fn accept_connection<R>(incoming: Incoming, registry: R) -> Result<(), ConnectorError>
 where
     R: GroupRegistry,
-    <R::Acceptor as Learner>::Error: From<ConnectorError>,
+    <R::Acceptor as Learner>::Error: From<ConnectorError> + From<std::io::Error>,
 {
     // Accept the connection
     let conn = incoming
@@ -341,7 +213,7 @@ async fn handle_stream<R>(
 ) -> Result<(), ConnectorError>
 where
     R: GroupRegistry,
-    <R::Acceptor as Learner>::Error: From<ConnectorError>,
+    <R::Acceptor as Learner>::Error: From<ConnectorError> + From<std::io::Error>,
 {
     // Create framed reader/writer for handshake
     let codec = LengthDelimitedCodec::builder()
@@ -390,7 +262,7 @@ async fn handle_proposal_stream<R>(
 ) -> Result<(), ConnectorError>
 where
     R: GroupRegistry,
-    <R::Acceptor as Learner>::Error: From<ConnectorError>,
+    <R::Acceptor as Learner>::Error: From<ConnectorError> + From<std::io::Error>,
 {
     // Get or create the group
     let (acceptor, state) = if let Some(group_info) = create_group_info {
@@ -441,7 +313,8 @@ where
     let send = writer.into_inner();
 
     // Create the connection wrapper for Paxos protocol
-    let connection = IrohAcceptorConnection::<R::Acceptor>::new(send, recv);
+    let connection =
+        new_acceptor_connection::<R::Acceptor, <R::Acceptor as Learner>::Error>(send, recv);
 
     // Create the handler with shared state
     let handler = AcceptorHandler::new(acceptor, state);
@@ -495,7 +368,7 @@ where
     let send = writer.into_inner();
 
     // Create the message connection
-    let mut connection = IrohMessageConnection::new(send, recv);
+    let mut connection = new_message_connection(send, recv);
 
     // Subscribe to live messages
     let mut subscription = registry.subscribe_messages(&group_id);

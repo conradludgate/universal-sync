@@ -5,10 +5,12 @@
 
 #![warn(clippy::pedantic)]
 
+pub mod codec;
 pub mod extension;
 pub mod handshake;
 pub mod message;
 pub mod proposal;
+pub mod sink_stream;
 
 pub use extension::{
     AcceptorAdd, AcceptorRemove, AcceptorsExt, ACCEPTORS_EXTENSION_TYPE,

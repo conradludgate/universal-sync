@@ -110,7 +110,7 @@ pub enum MessageResponse {
 
     /// End of backfill batch.
     BackfillComplete {
-        /// Highest arrival_seq in this batch (for pagination)
+        /// Highest `arrival_seq` in this batch (for pagination)
         last_seq: u64,
         /// Whether there are more messages available
         has_more: bool,

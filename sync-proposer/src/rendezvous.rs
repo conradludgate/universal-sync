@@ -5,7 +5,7 @@
 //!
 //! # Algorithm
 //!
-//! For each acceptor, compute a score as `hash(acceptor_id || message_id)`.
+//! For each acceptor, compute a score as `xxh3(acceptor_id || message_id)`.
 //! Sort acceptors by score (highest first) and select the top `k` acceptors.
 //!
 //! This ensures:
@@ -13,19 +13,20 @@
 //! - Minimal disruption: adding/removing acceptors only affects messages mapped to them
 
 use std::collections::BinaryHeap;
-use std::hash::{Hash, Hasher};
 
 use universal_sync_core::{AcceptorId, MessageId};
+use xxhash_rust::xxh3::xxh3_64;
 
-/// Compute a hash score for an acceptor and message combination.
+/// Compute a hash score for an acceptor and message combination using xxh3.
 fn compute_score(acceptor_id: &AcceptorId, message_id: &MessageId) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    acceptor_id.as_bytes().hash(&mut hasher);
-    message_id.group_id.as_bytes().hash(&mut hasher);
-    message_id.epoch.0.hash(&mut hasher);
-    message_id.sender.0.hash(&mut hasher);
-    message_id.index.hash(&mut hasher);
-    hasher.finish()
+    // Build the input bytes: acceptor_id (32) + group_id (32) + epoch (8) + sender (4) + index (4)
+    let mut buf = [0u8; 80];
+    buf[..32].copy_from_slice(acceptor_id.as_bytes());
+    buf[32..64].copy_from_slice(message_id.group_id.as_bytes());
+    buf[64..72].copy_from_slice(&message_id.epoch.0.to_le_bytes());
+    buf[72..76].copy_from_slice(&message_id.sender.0.to_le_bytes());
+    buf[76..80].copy_from_slice(&message_id.index.to_le_bytes());
+    xxh3_64(&buf)
 }
 
 /// Select acceptors for a message using rendezvous hashing.
@@ -54,11 +55,12 @@ pub fn select_acceptors<'a>(
 
         if heap.len() < count {
             heap.push(std::cmp::Reverse((score, *acceptor_id)));
-        } else if let Some(&std::cmp::Reverse((min_score, _))) = heap.peek() {
-            if score > min_score {
-                heap.pop();
-                heap.push(std::cmp::Reverse((score, *acceptor_id)));
-            }
+        } else if heap
+            .peek()
+            .is_some_and(|&std::cmp::Reverse((min_score, _))| score > min_score)
+        {
+            heap.pop();
+            heap.push(std::cmp::Reverse((score, *acceptor_id)));
         }
     }
 
@@ -73,10 +75,16 @@ pub fn select_acceptors<'a>(
 /// Returns `ceil(sqrt(n))` where `n` is the number of acceptors.
 /// Minimum is 1 (if there are any acceptors).
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub fn delivery_count(num_acceptors: usize) -> usize {
     if num_acceptors == 0 {
         return 0;
     }
+    // Safe: sqrt of usize is always positive and fits in usize
     let sqrt = (num_acceptors as f64).sqrt().ceil() as usize;
     sqrt.max(1)
 }
@@ -128,8 +136,9 @@ mod tests {
     fn test_select_acceptors_different_messages() {
         let acceptors: Vec<_> = (0..10).map(make_acceptor).collect();
 
-        let selected1 = select_acceptors(&acceptors, &make_message_id(1), 3);
-        let selected2 = select_acceptors(&acceptors, &make_message_id(2), 3);
+        // Use more varied message indices to ensure different selections
+        let selected1 = select_acceptors(&acceptors, &make_message_id(100), 3);
+        let selected2 = select_acceptors(&acceptors, &make_message_id(999), 3);
 
         // Different messages should (usually) select different acceptors
         // This is probabilistic, but with 10 acceptors and 3 selected, collision is unlikely

@@ -90,6 +90,12 @@ impl From<ConnectorError> for AcceptorError {
     }
 }
 
+impl From<std::io::Error> for AcceptorError {
+    fn from(e: std::io::Error) -> Self {
+        AcceptorError::Crypto(format!("IO error: {e}"))
+    }
+}
+
 /// A federated server that validates and orders group operations
 ///
 /// Wraps an MLS `ExternalGroup` to verify signatures without being
