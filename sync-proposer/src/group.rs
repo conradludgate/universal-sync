@@ -475,7 +475,7 @@ where
                 .unwrap_or_default();
 
             // Read CRDT type from group context extensions
-            let crdt_type_id = group
+            let crdt_ext = group
                 .context()
                 .extensions
                 .get_as::<CrdtRegistrationExt>()
@@ -483,8 +483,10 @@ where
                     Report::new(GroupError)
                         .attach(OperationContext::JOINING_GROUP)
                         .attach(format!("failed to read CRDT extension: {e:?}"))
-                })?
-                .map_or_else(|| "none".to_owned(), |ext| ext.type_id);
+                })?;
+            tracing::debug!(?crdt_ext, "Read CRDT extension from group context");
+            let crdt_type_id = crdt_ext.map_or_else(|| "none".to_owned(), |ext| ext.type_id);
+            tracing::debug!(%crdt_type_id, "Resolved CRDT type ID");
 
             // Create the learner
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
