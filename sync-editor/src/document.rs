@@ -247,10 +247,21 @@ where
                         break;
                     }
 
-                    msg = async {
-                        let mut g = group.lock().await;
-                        g.recv_message().await
-                    } => {
+                    // Note: We lock, try to receive, and release quickly
+                    // This allows other operations (like add_acceptor) to acquire the lock
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                        let msg = {
+                            let mut g = group.lock().await;
+                            // Use a short timeout to avoid holding lock forever
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_millis(10),
+                                g.recv_message()
+                            ).await {
+                                Ok(msg) => msg,
+                                Err(_) => continue, // Timeout, try again
+                            }
+                        };
+                        
                         let Some(msg) = msg else {
                             tracing::debug!("sync loop: group channel closed");
                             break;

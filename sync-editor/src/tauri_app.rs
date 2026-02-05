@@ -313,7 +313,6 @@ pub async fn add_acceptor(
         postcard::from_bytes(&addr_bytes).map_err(|e| format!("invalid address: {e}"))?;
 
     let mut app = state.write().await;
-    
     let doc = app
         .get_document_mut(&gid)
         .ok_or_else(|| format!("document not found: {group_id}"))?;
@@ -324,6 +323,7 @@ pub async fn add_acceptor(
         .await
         .map_err(|e| format!("failed to add acceptor: {e:?}"))?;
 
+    tracing::info!("Added acceptor to document {}", group_id);
     Ok(())
 }
 
