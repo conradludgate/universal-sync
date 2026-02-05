@@ -2214,9 +2214,17 @@ where
         let data = app_msg.data().to_vec();
 
         // Update the internal CRDT to keep it in sync for snapshots
-        if let Ok(mut crdt) = self.crdt.lock() {
-            if let Err(e) = crdt.merge(&data) {
-                tracing::warn!(?e, "failed to merge remote update into CRDT snapshot");
+        tracing::debug!(data_len = data.len(), "merging remote update into CRDT");
+        match self.crdt.lock() {
+            Ok(mut crdt) => {
+                if let Err(e) = crdt.merge(&data) {
+                    tracing::warn!(?e, "failed to merge remote update into CRDT snapshot");
+                } else {
+                    tracing::debug!("CRDT merge successful");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to acquire CRDT lock for merge");
             }
         }
 
