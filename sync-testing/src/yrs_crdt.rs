@@ -24,7 +24,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use universal_sync_core::{Crdt, CrdtError, CrdtFactory};
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update};
 
 /// Derive a stable yrs client ID from an MLS signing public key.
 ///
@@ -112,10 +112,19 @@ impl Crdt for YrsCrdt {
         let update = Update::decode_v1(operation)
             .map_err(|e| CrdtError::new(format!("decode error: {e}")))?;
 
+        let my_client_id = self.doc.client_id();
+        tracing::debug!(my_client_id, operation_len = operation.len(), "YrsCrdt::apply");
+
         self.doc
             .transact_mut()
             .apply_update(update)
             .map_err(|e| CrdtError::new(format!("apply error: {e}")))?;
+
+        // Log the resulting text for debugging
+        let text = self.doc.get_or_insert_text("content");
+        let txn = self.doc.transact();
+        let content = text.get_string(&txn);
+        tracing::debug!(my_client_id, text_after_apply = %content, "YrsCrdt::apply result");
 
         Ok(())
     }

@@ -148,21 +148,23 @@ where
             
             if let Some(yrs_crdt) = crdt_guard.as_any_mut().downcast_mut::<YrsCrdt>() {
                 let doc = yrs_crdt.doc_mut();
+                let client_id = doc.client_id();
                 let text = doc.get_or_insert_text(TEXT_NAME);
                 let mut txn = doc.transact_mut();
                 text.insert(&mut txn, position, content);
-                txn.encode_update_v1()
+                let update = txn.encode_update_v1();
+                tracing::debug!(
+                    update_len = update.len(),
+                    position = position,
+                    inserted_text = %content,
+                    client_id = client_id,
+                    "sending insert update to group"
+                );
+                update
             } else {
                 return Ok(()); // No yrs CRDT, nothing to do
             }
         };
-
-        tracing::debug!(
-            update_len = update.len(),
-            position = position,
-            inserted_text = %content,
-            "sending insert update to group"
-        );
         group.send_message(&update).await?;
 
         Ok(())
