@@ -443,7 +443,7 @@ where
         })?;
 
         // Join the group (blocking I/O via storage)
-        let (learner, group_id, crdt_type_id) = blocking(|| {
+        let (learner, group_id) = blocking(|| {
             // Parse the MLS Welcome message from the bundle
             let welcome = MlsMessage::from_bytes(&welcome_bundle.mls_welcome).map_err(|e| {
                 Report::new(GroupError)
@@ -474,25 +474,15 @@ where
                 .map(|ext| ext.0)
                 .unwrap_or_default();
 
-            // Read CRDT type from group context extensions
-            let crdt_ext = group
-                .context()
-                .extensions
-                .get_as::<CrdtRegistrationExt>()
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::JOINING_GROUP)
-                        .attach(format!("failed to read CRDT extension: {e:?}"))
-                })?;
-            tracing::debug!(?crdt_ext, "Read CRDT extension from group context");
-            let crdt_type_id = crdt_ext.map_or_else(|| "none".to_owned(), |ext| ext.type_id);
-            tracing::debug!(%crdt_type_id, "Resolved CRDT type ID");
-
             // Create the learner
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
 
-            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id))
+            Ok::<_, Report<GroupError>>((learner, group_id))
         })?;
+
+        // Get CRDT type from welcome bundle (more reliable than group context extension)
+        let crdt_type_id = welcome_bundle.crdt_type_id().to_owned();
+        tracing::debug!(%crdt_type_id, "Got CRDT type ID from welcome bundle");
 
         // Look up the CRDT factory
         let crdt_factory = crdt_factories.get(&crdt_type_id).ok_or_else(|| {
@@ -1239,9 +1229,16 @@ where
 
         match result {
             Ok((commit_output, mls_welcome)) => {
-                // Create welcome bundle with CRDT snapshot if present
+                // Get CRDT type ID
+                let crdt_type_id = self
+                    .crdt
+                    .lock()
+                    .map(|c| c.type_id().to_owned())
+                    .unwrap_or_else(|_| "none".to_owned());
+
+                // Create welcome bundle with CRDT info
                 let welcome_bundle = match crdt_snapshot {
-                    Some(snapshot) => WelcomeBundle::with_crdt(mls_welcome, snapshot),
+                    Some(snapshot) => WelcomeBundle::with_crdt(mls_welcome, crdt_type_id, snapshot),
                     None => WelcomeBundle::new(mls_welcome),
                 };
 

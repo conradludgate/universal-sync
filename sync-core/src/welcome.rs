@@ -2,6 +2,7 @@
 //!
 //! When a new member joins a group, they receive a `WelcomeBundle` containing:
 //! - The MLS Welcome message (provides encryption keys)
+//! - The CRDT type ID (identifies which CRDT implementation to use)
 //! - The CRDT snapshot (provides current application state)
 //!
 //! The bundle is serialized and sent as a single message to ensure atomicity.
@@ -12,11 +13,18 @@ use serde::{Deserialize, Serialize};
 ///
 /// Contains everything a new member needs to participate:
 /// - MLS Welcome message (for encryption keys and group state)
+/// - CRDT type ID (which CRDT implementation to use)
 /// - CRDT snapshot (for application state, if the group uses a CRDT)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WelcomeBundle {
     /// Serialized MLS Welcome message
     pub mls_welcome: Vec<u8>,
+
+    /// CRDT type identifier (e.g., "yrs", "none")
+    ///
+    /// This tells the joining member which CRDT factory to use.
+    #[serde(default)]
+    pub crdt_type_id: String,
 
     /// Serialized CRDT snapshot (empty if no CRDT)
     ///
@@ -31,16 +39,30 @@ impl WelcomeBundle {
     pub fn new(mls_welcome: Vec<u8>) -> Self {
         Self {
             mls_welcome,
+            crdt_type_id: String::new(),
             crdt_snapshot: Vec::new(),
         }
     }
 
-    /// Create a new welcome bundle with both MLS welcome and CRDT snapshot.
+    /// Create a new welcome bundle with MLS welcome and CRDT info.
     #[must_use]
-    pub fn with_crdt(mls_welcome: Vec<u8>, crdt_snapshot: Vec<u8>) -> Self {
+    pub fn with_crdt(mls_welcome: Vec<u8>, crdt_type_id: String, crdt_snapshot: Vec<u8>) -> Self {
         Self {
             mls_welcome,
+            crdt_type_id,
             crdt_snapshot,
+        }
+    }
+
+    /// Get the CRDT type ID.
+    ///
+    /// Returns "none" if no CRDT type was specified.
+    #[must_use]
+    pub fn crdt_type_id(&self) -> &str {
+        if self.crdt_type_id.is_empty() {
+            "none"
+        } else {
+            &self.crdt_type_id
         }
     }
 
@@ -104,17 +126,21 @@ mod tests {
     fn test_welcome_bundle_with_crdt() {
         let welcome = b"mls welcome message".to_vec();
         let crdt = b"crdt snapshot".to_vec();
-        let bundle = WelcomeBundle::with_crdt(welcome.clone(), crdt.clone());
+        let bundle = WelcomeBundle::with_crdt(welcome.clone(), "yrs".to_owned(), crdt.clone());
 
         assert!(bundle.has_crdt());
         assert_eq!(bundle.mls_welcome, welcome);
+        assert_eq!(bundle.crdt_type_id(), "yrs");
         assert_eq!(bundle.crdt_snapshot, crdt);
     }
 
     #[test]
     fn test_welcome_bundle_roundtrip() {
-        let bundle =
-            WelcomeBundle::with_crdt(b"mls welcome message".to_vec(), b"crdt snapshot".to_vec());
+        let bundle = WelcomeBundle::with_crdt(
+            b"mls welcome message".to_vec(),
+            "yrs".to_owned(),
+            b"crdt snapshot".to_vec(),
+        );
 
         let bytes = bundle.to_bytes().unwrap();
         let decoded = WelcomeBundle::from_bytes(&bytes).unwrap();
