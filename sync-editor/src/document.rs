@@ -122,7 +122,7 @@ where
         let crdt = group.crdt();
         let crdt_guard = crdt.lock().unwrap();
         
-        if let Some(yrs_crdt) = crdt_guard.as_any().downcast_ref::<YrsCrdt>() {
+        if let Some(yrs_crdt) = (**crdt_guard).as_any().downcast_ref::<YrsCrdt>() {
             let doc = yrs_crdt.doc();
             let text = doc.get_or_insert_text(TEXT_NAME);
             let txn = doc.transact();
@@ -146,7 +146,7 @@ where
             let crdt = group.crdt();
             let mut crdt_guard = crdt.lock().unwrap();
             
-            if let Some(yrs_crdt) = crdt_guard.as_any_mut().downcast_mut::<YrsCrdt>() {
+            if let Some(yrs_crdt) = (**crdt_guard).as_any_mut().downcast_mut::<YrsCrdt>() {
                 let doc = yrs_crdt.doc_mut();
                 let text = doc.get_or_insert_text(TEXT_NAME);
                 let mut txn = doc.transact_mut();
@@ -180,7 +180,7 @@ where
             let crdt = group.crdt();
             let mut crdt_guard = crdt.lock().unwrap();
             
-            if let Some(yrs_crdt) = crdt_guard.as_any_mut().downcast_mut::<YrsCrdt>() {
+            if let Some(yrs_crdt) = (**crdt_guard).as_any_mut().downcast_mut::<YrsCrdt>() {
                 let doc = yrs_crdt.doc_mut();
                 let text = doc.get_or_insert_text(TEXT_NAME);
                 let mut txn = doc.transact_mut();
@@ -271,12 +271,17 @@ where
                             let crdt = g.crdt();
                             let crdt_guard = crdt.lock().unwrap();
                             
-                            if let Some(yrs_crdt) = crdt_guard.as_any().downcast_ref::<YrsCrdt>() {
+                            // Try to downcast to YrsCrdt
+                            let crdt_type = crdt_guard.type_id();
+                            tracing::debug!(crdt_type, "sync loop: checking CRDT type");
+                            
+                            if let Some(yrs_crdt) = (**crdt_guard).as_any().downcast_ref::<YrsCrdt>() {
                                 let doc = yrs_crdt.doc();
                                 let t = doc.get_or_insert_text(TEXT_NAME);
                                 let txn = doc.transact();
                                 t.get_string(&txn)
                             } else {
+                                tracing::warn!("sync loop: failed to downcast CRDT to YrsCrdt");
                                 continue;
                             }
                         };
