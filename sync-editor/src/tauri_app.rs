@@ -22,6 +22,9 @@ use universal_sync_core::{
 };
 use universal_sync_proposer::GroupClient;
 
+use serde_json::json;
+use tauri::Emitter;
+
 use crate::{AppState, EditorClient};
 
 /// The cipher suite provider type
@@ -113,12 +116,39 @@ pub async fn init_app_state() -> SharedAppState {
 
 use crate::commands::{DeltaCommand, DocumentInfo, parse_group_id};
 
+/// Start the sync loop for a document and emit events to the frontend.
+fn spawn_sync_emitter(
+    app_handle: tauri::AppHandle,
+    group_id_b58: String,
+    mut rx: tokio::sync::mpsc::Receiver<crate::DocumentUpdateEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            tracing::debug!(group_id = %group_id_b58, text_len = event.text.len(), "emitting document-updated");
+            
+            // Emit to frontend
+            if let Err(e) = app_handle.emit("document-updated", json!({
+                "group_id": group_id_b58,
+                "text": event.text,
+                "sender": event.sender,
+                "epoch": event.epoch,
+            })) {
+                tracing::warn!(?e, "failed to emit document-updated event");
+            }
+        }
+        tracing::debug!(group_id = %group_id_b58, "sync emitter stopped");
+    });
+}
+
 #[tauri::command]
-pub async fn create_document(state: tauri::State<'_, SharedAppState>) -> Result<DocumentInfo, String> {
+pub async fn create_document(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, SharedAppState>,
+) -> Result<DocumentInfo, String> {
     let mut app = state.write().await;
     let acceptors = app.acceptor_addrs();
 
-    let doc = app
+    let mut doc = app
         .client
         .create_document(&acceptors)
         .await
@@ -127,6 +157,10 @@ pub async fn create_document(state: tauri::State<'_, SharedAppState>) -> Result<
     let group_id = doc.group_id().await;
     let group_id_b58 = bs58::encode(group_id.as_bytes()).into_string();
     let text = doc.text().await;
+
+    // Start sync loop and emit events
+    let rx = doc.start_sync_loop();
+    spawn_sync_emitter(app_handle, group_id_b58.clone(), rx);
 
     app.insert_document(group_id, doc);
 
@@ -152,12 +186,13 @@ pub async fn recv_welcome(state: tauri::State<'_, SharedAppState>) -> Result<Vec
 
 #[tauri::command]
 pub async fn join_document_bytes(
+    app_handle: tauri::AppHandle,
     state: tauri::State<'_, SharedAppState>,
     welcome: Vec<u8>,
 ) -> Result<DocumentInfo, String> {
     let mut app = state.write().await;
 
-    let doc = app
+    let mut doc = app
         .client
         .join_document(&welcome)
         .await
@@ -166,6 +201,10 @@ pub async fn join_document_bytes(
     let group_id = doc.group_id().await;
     let group_id_b58 = bs58::encode(group_id.as_bytes()).into_string();
     let text = doc.text().await;
+
+    // Start sync loop and emit events
+    let rx = doc.start_sync_loop();
+    spawn_sync_emitter(app_handle, group_id_b58.clone(), rx);
 
     app.insert_document(group_id, doc);
 
@@ -257,14 +296,16 @@ pub async fn add_member(
     Ok(())
 }
 
+/// Add an acceptor to a document's group.
 #[tauri::command]
 pub async fn add_acceptor(
     state: tauri::State<'_, SharedAppState>,
-    name: String,
+    group_id: String,
     addr_b58: String,
 ) -> Result<(), String> {
     use iroh::EndpointAddr;
 
+    let gid = parse_group_id(&group_id)?;
     let addr_bytes = bs58::decode(&addr_b58)
         .into_vec()
         .map_err(|e| format!("invalid base58: {e}"))?;
@@ -272,7 +313,16 @@ pub async fn add_acceptor(
         postcard::from_bytes(&addr_bytes).map_err(|e| format!("invalid address: {e}"))?;
 
     let mut app = state.write().await;
-    app.add_acceptor(name, addr);
+    
+    let doc = app
+        .get_document_mut(&gid)
+        .ok_or_else(|| format!("document not found: {group_id}"))?;
+
+    doc.group_mut()
+        .await
+        .add_acceptor(addr)
+        .await
+        .map_err(|e| format!("failed to add acceptor: {e:?}"))?;
 
     Ok(())
 }

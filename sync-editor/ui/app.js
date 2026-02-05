@@ -62,8 +62,8 @@ const elements = {
     btnInviteCancel: document.getElementById('btn-invite-cancel'),
     inviteModalClose: document.getElementById('invite-modal-close'),
     
-    // Acceptor modal
-    btnAddAcceptor: document.getElementById('btn-add-acceptor'),
+    // Acceptor modal (per-document)
+    btnDocAcceptors: document.getElementById('btn-doc-acceptors'),
     acceptorModal: document.getElementById('acceptor-modal'),
     acceptorList: document.getElementById('acceptor-list'),
     acceptorEmpty: document.getElementById('acceptor-empty'),
@@ -182,8 +182,16 @@ function escapeHtml(text) {
 }
 
 async function addAcceptor(name, addr) {
+    if (!state.currentDocument) {
+        showToast('No document open', 'error');
+        return;
+    }
+    
     try {
-        await invoke('add_acceptor', { name, addrB58: addr });
+        await invoke('add_acceptor', { 
+            groupId: state.currentDocument.group_id,
+            addrB58: addr 
+        });
         state.acceptors.push({ name, addr });
         renderAcceptorList();
         showToast(`Added acceptor: ${name}`, 'success');
@@ -284,9 +292,11 @@ async function joinDocumentWithWelcome(welcomeBytes) {
         const doc = await invoke('join_document_bytes', { welcome: welcomeBytes });
         
         state.currentDocument = doc;
+        state.acceptors = []; // Reset acceptors for joined document
         elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
         elements.docId.title = doc.group_id;
         elements.editor.value = doc.text;
+        lastText = doc.text;
         
         showEditor();
         updateSyncStatus('synced');
@@ -309,9 +319,11 @@ async function createDocument() {
         const doc = await invoke('create_document');
         
         state.currentDocument = doc;
+        state.acceptors = []; // Reset acceptors for new document
         elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
         elements.docId.title = doc.group_id;
         elements.editor.value = doc.text;
+        lastText = doc.text;
         
         showEditor();
         updateSyncStatus('synced');
@@ -509,8 +521,12 @@ function setupEventListeners() {
     // Editor input
     elements.editor.addEventListener('input', handleEditorInput);
     
-    // Acceptor modal
-    elements.btnAddAcceptor.addEventListener('click', () => {
+    // Acceptor modal (per-document)
+    elements.btnDocAcceptors.addEventListener('click', () => {
+        if (!state.currentDocument) {
+            showToast('No document open', 'error');
+            return;
+        }
         renderAcceptorList();
         showModal(elements.acceptorModal);
     });

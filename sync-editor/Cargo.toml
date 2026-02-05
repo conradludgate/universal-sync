@@ -25,6 +25,7 @@ mls-rs = { workspace = true, features = ["prior_epoch", "private_message"] }
 mls-rs-core.workspace = true
 mls-rs-crypto-rustcrypto.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 postcard.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
