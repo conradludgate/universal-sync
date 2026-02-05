@@ -16,11 +16,10 @@ use rustyline::error::ReadlineError;
 use tracing::info;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
-    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory,
+    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory, PAXOS_ALPN,
     SUPPORTED_CRDTS_EXTENSION_TYPE, load_secret_key,
 };
 use universal_sync_proposer::GroupClient;
-use universal_sync_proposer::connector::PAXOS_ALPN;
 use universal_sync_proposer::repl::ReplContext;
 
 /// Universal Sync Proposer REPL

@@ -246,12 +246,12 @@ impl<L: Learner> Proposer<L> {
 
     /// Check if there's an active proposal in progress.
     #[must_use]
-    pub fn is_proposing(&self) -> bool {
+    pub(crate) fn is_proposing(&self) -> bool {
         self.active.is_some()
     }
 
     /// Cancel the current proposal (if any).
-    pub fn cancel(&mut self) {
+    pub(crate) fn cancel(&mut self) {
         self.active = None;
     }
 }

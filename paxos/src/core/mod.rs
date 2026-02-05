@@ -14,12 +14,17 @@
 //! - [`proposer`]: Proposer state machine (`ProposerCore`)
 //! - [`quorum`]: Quorum tracking (`QuorumCore`)
 
-pub mod acceptor;
-pub mod proposer;
-pub mod quorum;
-pub mod types;
+pub(crate) mod acceptor;
+pub(crate) mod proposer;
+pub(crate) mod quorum;
+pub(crate) mod types;
 
-pub use acceptor::{AcceptResult, AcceptorCore, PrepareResult};
-pub use proposer::{AcceptPhaseResult, PreparePhaseResult, ProposerCore, ProposerPhase};
-pub use quorum::QuorumCore;
+pub use acceptor::AcceptorCore;
+pub(crate) use acceptor::{AcceptResult, PrepareResult};
+pub(crate) use proposer::ProposerPhase;
+pub use proposer::{AcceptPhaseResult, PreparePhaseResult, ProposerCore};
+pub(crate) use quorum::QuorumCore;
 pub use types::{AcceptorRequest, AcceptorResponse, ProposalKey};
+
+#[cfg(test)]
+mod stateright_tests;

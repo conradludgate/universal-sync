@@ -17,20 +17,23 @@ use universal_sync_core::{Epoch, MemberId};
 ///
 /// Contains the public signing key for each member, indexed by their MLS leaf index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EpochRoster {
+pub(crate) struct EpochRoster {
     /// The epoch this roster is for
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
 
     /// Member public keys indexed by member ID (leaf index)
     ///
     /// The key is serialized as bytes for storage efficiency.
     /// Format: `Vec<(member_id, public_key_bytes)>`
-    pub members: Vec<(MemberId, Vec<u8>)>,
+    pub(crate) members: Vec<(MemberId, Vec<u8>)>,
 }
 
 impl EpochRoster {
     /// Create a new epoch roster snapshot
-    pub fn new(epoch: Epoch, members: impl IntoIterator<Item = (MemberId, Vec<u8>)>) -> Self {
+    pub(crate) fn new(
+        epoch: Epoch,
+        members: impl IntoIterator<Item = (MemberId, Vec<u8>)>,
+    ) -> Self {
         Self {
             epoch,
             members: members.into_iter().collect(),
@@ -39,7 +42,7 @@ impl EpochRoster {
 
     /// Get a member's public key by ID
     #[must_use]
-    pub fn get_member_key(&self, member_id: MemberId) -> Option<&[u8]> {
+    pub(crate) fn get_member_key(&self, member_id: MemberId) -> Option<&[u8]> {
         self.members
             .iter()
             .find(|(id, _)| *id == member_id)
@@ -51,13 +54,13 @@ impl EpochRoster {
     /// # Panics
     /// Panics if serialization fails (should not happen with valid data).
     #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("serialization should not fail")
     }
 
     /// Deserialize from bytes
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         postcard::from_bytes(bytes).ok()
     }
 }

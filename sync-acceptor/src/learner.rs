@@ -41,16 +41,16 @@ use std::collections::BTreeMap;
 use futures::SinkExt;
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::mpsc;
-use universal_sync_core::{AcceptorId, Epoch, GroupId, GroupMessage, GroupProposal};
-use universal_sync_paxos::proposer::QuorumTracker;
+use universal_sync_core::{AcceptorId, Epoch, GroupId, GroupMessage, GroupProposal, PAXOS_ALPN};
 use universal_sync_paxos::Learner;
+use universal_sync_paxos::proposer::QuorumTracker;
 
 use crate::acceptor::{AcceptorChangeEvent, AcceptorError, GroupAcceptor};
 use crate::connector::ConnectorError;
 
 /// Events sent from peer acceptor actors to the learning coordinator
 #[derive(Debug)]
-pub enum PeerEvent {
+pub(crate) enum PeerEvent {
     /// Peer accepted a value
     Accepted {
         /// The acceptor ID that sent this
@@ -71,7 +71,7 @@ pub enum PeerEvent {
 
 /// Commands to the learning actor
 #[derive(Debug)]
-pub enum LearningCommand {
+pub(crate) enum LearningCommand {
     /// Local acceptor accepted a value
     LocalAccepted {
         /// The accepted proposal
@@ -87,7 +87,7 @@ pub enum LearningCommand {
 
 /// Events emitted by the learning actor
 #[derive(Debug)]
-pub enum LearningEvent {
+pub(crate) enum LearningEvent {
     /// A value reached quorum and was applied
     Learned {
         /// The new epoch after applying
@@ -104,7 +104,7 @@ pub enum LearningEvent {
 /// - Tracks accepted values from all sources (local + peers)
 /// - Applies values when quorum is reached
 /// - Updates peer connections when the acceptor set changes
-pub struct GroupLearningActor<C, CS>
+pub(crate) struct GroupLearningActor<C, CS>
 where
     C: mls_rs::external_client::builder::MlsConfig + Clone + 'static,
     CS: mls_rs::CipherSuiteProvider + 'static,
@@ -146,7 +146,7 @@ where
     /// * `command_rx` - Channel to receive commands
     /// * `event_tx` - Channel to send events
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         own_id: AcceptorId,
         group_id: GroupId,
         endpoint: Endpoint,
@@ -187,21 +187,22 @@ where
     /// # Errors
     ///
     /// Returns an error if applying a learned value to the acceptor fails.
-    pub async fn run<A>(
-        mut self,
-        acceptor: &mut A,
-    ) -> Result<(), AcceptorError>
+    pub(crate) async fn run<A>(mut self, acceptor: &mut A) -> Result<(), AcceptorError>
     where
         A: Learner<
-            Proposal = GroupProposal,
-            Message = GroupMessage,
-            AcceptorId = AcceptorId,
-            Error = AcceptorError,
-        >,
+                Proposal = GroupProposal,
+                Message = GroupMessage,
+                AcceptorId = AcceptorId,
+                Error = AcceptorError,
+            >,
     {
         // Spawn peer actors for initial acceptors
         let current_round = acceptor.current_round();
-        let peers: Vec<_> = self.peer_acceptors.iter().map(|(id, addr)| (*id, addr.clone())).collect();
+        let peers: Vec<_> = self
+            .peer_acceptors
+            .iter()
+            .map(|(id, addr)| (*id, addr.clone()))
+            .collect();
         for (id, addr) in peers {
             self.spawn_peer_actor(id, addr, current_round);
         }
@@ -270,11 +271,11 @@ where
     ) -> Result<(), AcceptorError>
     where
         A: Learner<
-            Proposal = GroupProposal,
-            Message = GroupMessage,
-            AcceptorId = AcceptorId,
-            Error = AcceptorError,
-        >,
+                Proposal = GroupProposal,
+                Message = GroupMessage,
+                AcceptorId = AcceptorId,
+                Error = AcceptorError,
+            >,
     {
         let current_round = acceptor.current_round();
 
@@ -290,9 +291,10 @@ where
             acceptor.apply(p.clone(), m.clone()).await?;
 
             // Notify
-            let _ = self.event_tx.send(LearningEvent::Learned {
-                epoch: p.epoch,
-            }).await;
+            let _ = self
+                .event_tx
+                .send(LearningEvent::Learned { epoch: p.epoch })
+                .await;
         }
 
         Ok(())
@@ -320,7 +322,9 @@ where
         self.quorum_tracker = QuorumTracker::new(total);
 
         // Notify
-        let _ = self.event_tx.try_send(LearningEvent::AcceptorChange(change));
+        let _ = self
+            .event_tx
+            .try_send(LearningEvent::AcceptorChange(change));
     }
 
     /// Spawn a peer actor for connecting to a peer acceptor
@@ -356,8 +360,6 @@ async fn run_peer_actor(
     use universal_sync_core::codec::PostcardCodec;
     use universal_sync_core::{Handshake, HandshakeResponse};
 
-    use crate::connector::PAXOS_ALPN;
-
     tracing::debug!(?acceptor_id, "connecting to peer acceptor");
 
     // Connect to the peer acceptor
@@ -381,8 +383,8 @@ async fn run_peer_actor(
 
     // Send Join handshake
     let handshake = Handshake::JoinProposals(group_id);
-    let handshake_bytes = postcard::to_allocvec(&handshake)
-        .map_err(|e| ConnectorError::Codec(e.to_string()))?;
+    let handshake_bytes =
+        postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
     writer
         .send(handshake_bytes.into())
         .await
@@ -409,10 +411,14 @@ async fn run_peer_actor(
     let recv = reader.into_inner();
     let send = writer.into_inner();
 
-    let mut reader: FramedRead<iroh::endpoint::RecvStream, PostcardCodec<crate::connector::ProposalResponse>> =
-        FramedRead::new(recv, PostcardCodec::new());
-    let mut writer: FramedWrite<iroh::endpoint::SendStream, PostcardCodec<crate::connector::ProposalRequest>> =
-        FramedWrite::new(send, PostcardCodec::new());
+    let mut reader: FramedRead<
+        iroh::endpoint::RecvStream,
+        PostcardCodec<crate::connector::ProposalResponse>,
+    > = FramedRead::new(recv, PostcardCodec::new());
+    let mut writer: FramedWrite<
+        iroh::endpoint::SendStream,
+        PostcardCodec<crate::connector::ProposalRequest>,
+    > = FramedWrite::new(send, PostcardCodec::new());
 
     // Send a sync Prepare to initiate the learning stream
     // Use attempt=0 to indicate this is a learning request
@@ -459,7 +465,7 @@ async fn run_peer_actor(
 
 /// Create channels for a learning actor
 #[must_use]
-pub fn learning_channels() -> (
+pub(crate) fn learning_channels() -> (
     mpsc::Sender<LearningCommand>,
     mpsc::Receiver<LearningCommand>,
     mpsc::Sender<LearningEvent>,

@@ -42,12 +42,12 @@ use universal_sync_core::codec::PostcardCodec;
 use universal_sync_core::sink_stream::{Mapped, SinkStream};
 use universal_sync_core::{
     EncryptedAppMessage, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
-    MemberId, MessageRequest, MessageResponse,
+    MemberId, MessageRequest, MessageResponse, PAXOS_ALPN,
 };
 use universal_sync_paxos::acceptor::{AcceptorHandler, run_acceptor};
 use universal_sync_paxos::{AcceptorMessage, AcceptorRequest, AcceptorStateStore, Learner};
 
-use crate::connector::{ConnectorError, PAXOS_ALPN};
+use crate::connector::ConnectorError;
 
 /// Server-side acceptor connection over iroh
 ///
@@ -66,7 +66,7 @@ pub type IrohAcceptorConnection<A, E> = Mapped<
 
 /// Create a new acceptor connection from iroh streams
 #[must_use]
-pub fn new_acceptor_connection<A, E>(
+pub(crate) fn new_acceptor_connection<A, E>(
     send: SendStream,
     recv: RecvStream,
 ) -> IrohAcceptorConnection<A, E>
@@ -84,14 +84,14 @@ where
 /// Used for application message streams (not Paxos):
 /// - Stream yields `MessageRequest` (from clients)
 /// - Sink accepts `MessageResponse` (to clients)
-pub type IrohMessageConnection = SinkStream<
+pub(crate) type IrohMessageConnection = SinkStream<
     FramedWrite<SendStream, PostcardCodec<MessageResponse>>,
     FramedRead<RecvStream, PostcardCodec<MessageRequest>>,
 >;
 
 /// Create a new message connection from iroh streams
 #[must_use]
-pub fn new_message_connection(send: SendStream, recv: RecvStream) -> IrohMessageConnection {
+pub(crate) fn new_message_connection(send: SendStream, recv: RecvStream) -> IrohMessageConnection {
     SinkStream::new(
         FramedWrite::new(send, PostcardCodec::new()),
         FramedRead::new(recv, PostcardCodec::new()),

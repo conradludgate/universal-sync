@@ -147,13 +147,13 @@ impl<P: Proposal> Ord for ProposalKey<P> {
 impl<P: Proposal> ProposalKey<P> {
     /// Create a new proposal key.
     #[must_use]
-    pub fn new(round: P::RoundId, attempt: P::AttemptId, node_id: P::NodeId) -> Self {
+    pub(crate) fn new(round: P::RoundId, attempt: P::AttemptId, node_id: P::NodeId) -> Self {
         Self(round, attempt, node_id)
     }
 
     /// Get the round ID from this key.
     #[must_use]
-    pub fn round(&self) -> P::RoundId {
+    pub(crate) fn round(&self) -> P::RoundId {
         self.0
     }
 
@@ -165,7 +165,7 @@ impl<P: Proposal> ProposalKey<P> {
 
     /// Get the node ID from this key.
     #[must_use]
-    pub fn node_id(&self) -> P::NodeId {
+    pub(crate) fn node_id(&self) -> P::NodeId {
         self.2
     }
 }

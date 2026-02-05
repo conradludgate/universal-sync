@@ -48,7 +48,7 @@ impl ConnectionManager {
     /// # Arguments
     /// * `endpoint` - The iroh endpoint to use for connections
     #[must_use]
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub(crate) fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -58,7 +58,7 @@ impl ConnectionManager {
 
     /// Get the underlying iroh endpoint.
     #[must_use]
-    pub fn endpoint(&self) -> &Endpoint {
+    pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
@@ -66,12 +66,12 @@ impl ConnectionManager {
     ///
     /// Use this when iroh discovery is not available and you have
     /// the full endpoint address for an acceptor.
-    pub async fn add_address_hint(&self, acceptor_id: AcceptorId, addr: EndpointAddr) {
+    pub(crate) async fn add_address_hint(&self, acceptor_id: AcceptorId, addr: EndpointAddr) {
         self.address_hints.write().await.insert(acceptor_id, addr);
     }
 
     /// Remove an address hint for an acceptor.
-    pub async fn remove_address_hint(&self, acceptor_id: &AcceptorId) {
+    pub(crate) async fn remove_address_hint(&self, acceptor_id: &AcceptorId) {
         self.address_hints.write().await.remove(acceptor_id);
     }
 
@@ -128,7 +128,7 @@ impl ConnectionManager {
     ///
     /// # Errors
     /// Returns an error if connection or handshake fails.
-    pub async fn open_proposal_stream(
+    pub(crate) async fn open_proposal_stream(
         &self,
         acceptor_id: &AcceptorId,
         group_id: GroupId,
@@ -148,7 +148,7 @@ impl ConnectionManager {
     ///
     /// # Errors
     /// Returns an error if connection or handshake fails.
-    pub async fn open_message_stream(
+    pub(crate) async fn open_message_stream(
         &self,
         acceptor_id: &AcceptorId,
         group_id: GroupId,
@@ -188,7 +188,7 @@ impl ConnectionManager {
     ///
     /// # Errors
     /// Returns an error if connection or handshake fails.
-    pub async fn register_group(
+    pub(crate) async fn register_group(
         &self,
         acceptor_id: &AcceptorId,
         group_info: &[u8],
@@ -207,7 +207,7 @@ impl ConnectionManager {
     ///
     /// # Errors
     /// Returns an error if connection or handshake fails.
-    pub async fn register_group_with_addr(
+    pub(crate) async fn register_group_with_addr(
         &self,
         addr: impl Into<EndpointAddr>,
         group_info: &[u8],
@@ -298,14 +298,14 @@ impl ConnectionManager {
     }
 
     /// Close and remove a cached connection to an acceptor.
-    pub async fn close_connection(&self, acceptor_id: &AcceptorId) {
+    pub(crate) async fn close_connection(&self, acceptor_id: &AcceptorId) {
         if let Some(conn) = self.connections.write().await.remove(acceptor_id) {
             conn.close(0u8.into(), b"closed");
         }
     }
 
     /// Close all cached connections.
-    pub async fn close_all(&self) {
+    pub(crate) async fn close_all(&self) {
         let connections: Vec<_> = self.connections.write().await.drain().collect();
         for (_, conn) in connections {
             conn.close(0u8.into(), b"closed");

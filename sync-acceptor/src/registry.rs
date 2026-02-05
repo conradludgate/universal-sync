@@ -74,17 +74,17 @@ where
     }
 
     /// Get this acceptor's own ID (derived from secret key)
-    pub fn own_id(&self) -> AcceptorId {
+    pub(crate) fn own_id(&self) -> AcceptorId {
         AcceptorId::from_bytes(*self.secret_key.public().as_bytes())
     }
 
     /// Get the state store
-    pub fn state_store(&self) -> &SharedFjallStateStore {
+    pub(crate) fn state_store(&self) -> &SharedFjallStateStore {
         &self.state_store
     }
 
     /// List all registered groups
-    pub fn list_groups(&self) -> Vec<GroupId> {
+    pub(crate) fn list_groups(&self) -> Vec<GroupId> {
         self.state_store.list_groups()
     }
 

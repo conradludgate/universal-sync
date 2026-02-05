@@ -37,7 +37,7 @@ type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal
 /// - `messages`: (`group_id`, `arrival_seq`) -> `EncryptedAppMessage`
 /// - `message_seq`: `group_id` -> next sequence number
 /// - `epoch_rosters`: (`group_id`, epoch) -> `EpochRoster` (for signature validation)
-pub struct FjallStateStore {
+pub(crate) struct FjallStateStore {
     /// The fjall database
     db: Database,
     /// Keyspace for promised proposals
@@ -66,7 +66,7 @@ impl FjallStateStore {
     ///
     /// # Panics
     /// Panics if the spawned blocking task panics.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
+    pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
         let path = path.as_ref().to_owned();
 
         // Use spawn_blocking for the synchronous fjall operations
@@ -189,7 +189,7 @@ impl FjallStateStore {
     ///
     /// # Errors
     /// Returns an error if storage operations fail.
-    pub fn store_app_message(
+    pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
         msg: &EncryptedAppMessage,
@@ -216,7 +216,7 @@ impl FjallStateStore {
     }
 
     /// Get messages for a group starting from a sequence number
-    pub fn get_messages_since(
+    pub(crate) fn get_messages_since(
         &self,
         group_id: &GroupId,
         since_seq: u64,
@@ -252,7 +252,7 @@ impl FjallStateStore {
     ///
     /// # Panics
     /// Panics if the internal lock is poisoned.
-    pub fn subscribe_messages(
+    pub(crate) fn subscribe_messages(
         &self,
         group_id: &GroupId,
     ) -> broadcast::Receiver<EncryptedAppMessage> {
@@ -529,7 +529,7 @@ impl SharedFjallStateStore {
 
     /// Get a per-group state store view
     #[must_use]
-    pub fn for_group(&self, group_id: GroupId) -> GroupStateStore {
+    pub(crate) fn for_group(&self, group_id: GroupId) -> GroupStateStore {
         GroupStateStore {
             inner: self.inner.clone(),
             group_id,
@@ -566,7 +566,7 @@ impl SharedFjallStateStore {
     ///
     /// # Errors
     /// Returns an error if removing from the database fails.
-    pub fn remove_group(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
+    pub(crate) fn remove_group(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
         self.inner.remove_group_sync(group_id)
     }
 
@@ -576,7 +576,7 @@ impl SharedFjallStateStore {
     ///
     /// # Errors
     /// Returns an error if persisting to the database fails.
-    pub fn store_app_message(
+    pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
         msg: &EncryptedAppMessage,
@@ -586,7 +586,7 @@ impl SharedFjallStateStore {
 
     /// Get messages since a sequence number.
     #[must_use]
-    pub fn get_messages_since(
+    pub(crate) fn get_messages_since(
         &self,
         group_id: &GroupId,
         since_seq: u64,
@@ -596,7 +596,7 @@ impl SharedFjallStateStore {
 
     /// Subscribe to new messages for a group.
     #[must_use]
-    pub fn subscribe_messages(
+    pub(crate) fn subscribe_messages(
         &self,
         group_id: &GroupId,
     ) -> broadcast::Receiver<EncryptedAppMessage> {
@@ -609,7 +609,7 @@ impl SharedFjallStateStore {
     ///
     /// # Errors
     /// Returns an error if persisting to the database fails.
-    pub fn store_epoch_roster(
+    pub(crate) fn store_epoch_roster(
         &self,
         group_id: &GroupId,
         roster: &EpochRoster,
@@ -619,13 +619,13 @@ impl SharedFjallStateStore {
 
     /// Get an epoch roster snapshot for a specific epoch
     #[must_use]
-    pub fn get_epoch_roster(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
+    pub(crate) fn get_epoch_roster(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
         self.inner.get_epoch_roster_sync(group_id, epoch)
     }
 
     /// Get the closest epoch roster at or before the given epoch
     #[must_use]
-    pub fn get_epoch_roster_at_or_before(
+    pub(crate) fn get_epoch_roster_at_or_before(
         &self,
         group_id: &GroupId,
         epoch: Epoch,
@@ -648,7 +648,7 @@ pub struct GroupStateStore {
 impl GroupStateStore {
     /// Get the group ID
     #[must_use]
-    pub fn group_id(&self) -> &GroupId {
+    pub(crate) fn group_id(&self) -> &GroupId {
         &self.group_id
     }
 
@@ -656,7 +656,10 @@ impl GroupStateStore {
     ///
     /// This is useful for replaying messages to catch up a newly created acceptor.
     #[must_use]
-    pub fn get_accepted_from(&self, from_epoch: Epoch) -> Vec<(GroupProposal, GroupMessage)> {
+    pub(crate) fn get_accepted_from(
+        &self,
+        from_epoch: Epoch,
+    ) -> Vec<(GroupProposal, GroupMessage)> {
         self.inner
             .get_accepted_from_sync(&self.group_id, from_epoch)
     }
@@ -665,19 +668,19 @@ impl GroupStateStore {
     ///
     /// # Errors
     /// Returns an error if persisting to the database fails.
-    pub fn store_epoch_roster(&self, roster: &EpochRoster) -> Result<(), fjall::Error> {
+    pub(crate) fn store_epoch_roster(&self, roster: &EpochRoster) -> Result<(), fjall::Error> {
         self.inner.store_epoch_roster_sync(&self.group_id, roster)
     }
 
     /// Get an epoch roster snapshot for a specific epoch
     #[must_use]
-    pub fn get_epoch_roster(&self, epoch: Epoch) -> Option<EpochRoster> {
+    pub(crate) fn get_epoch_roster(&self, epoch: Epoch) -> Option<EpochRoster> {
         self.inner.get_epoch_roster_sync(&self.group_id, epoch)
     }
 
     /// Get the closest epoch roster at or before the given epoch
     #[must_use]
-    pub fn get_epoch_roster_at_or_before(&self, epoch: Epoch) -> Option<EpochRoster> {
+    pub(crate) fn get_epoch_roster_at_or_before(&self, epoch: Epoch) -> Option<EpochRoster> {
         self.inner
             .get_epoch_roster_at_or_before_sync(&self.group_id, epoch)
     }

@@ -18,14 +18,14 @@ where
     P: Ord,
 {
     /// Per-round: highest promised proposal
-    pub promised: BTreeMap<R, P>,
+    pub(crate) promised: BTreeMap<R, P>,
     /// Per-round: accepted (proposal, message)
-    pub accepted: BTreeMap<R, (P, M)>,
+    pub(crate) accepted: BTreeMap<R, (P, M)>,
 }
 
 /// Result of handling a Prepare request
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PrepareResult<P, M> {
+pub(crate) enum PrepareResult<P, M> {
     /// Promised successfully - returns the currently accepted value (if any)
     Promised {
         /// The proposal we just promised
@@ -44,7 +44,7 @@ pub enum PrepareResult<P, M> {
 
 /// Result of handling an Accept request
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AcceptResult<P, M> {
+pub(crate) enum AcceptResult<P, M> {
     /// Accepted successfully
     Accepted {
         /// The proposal we accepted
@@ -64,7 +64,7 @@ where
 {
     /// Create a new empty acceptor state
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             promised: BTreeMap::new(),
             accepted: BTreeMap::new(),
@@ -72,7 +72,7 @@ where
     }
 
     /// Get the current state for a round
-    pub fn get(&self, round: R) -> (Option<P>, Option<(P, M)>) {
+    pub(crate) fn get(&self, round: R) -> (Option<P>, Option<(P, M)>) {
         (
             self.promised.get(&round).cloned(),
             self.accepted.get(&round).cloned(),
@@ -87,7 +87,7 @@ where
     ///
     /// On success, updates the promised value and returns the current accepted value.
     /// On failure, returns the current state without modification.
-    pub fn prepare(&mut self, round: R, proposal: P) -> PrepareResult<P, M> {
+    pub(crate) fn prepare(&mut self, round: R, proposal: P) -> PrepareResult<P, M> {
         let current_promised = self.promised.get(&round);
         let current_accepted = self.accepted.get(&round);
 
@@ -122,7 +122,7 @@ where
     ///
     /// On success, updates the accepted value.
     /// On failure, returns Rejected without modification.
-    pub fn accept(&mut self, round: R, proposal: P, message: M) -> AcceptResult<P, M> {
+    pub(crate) fn accept(&mut self, round: R, proposal: P, message: M) -> AcceptResult<P, M> {
         let current_promised = self.promised.get(&round);
         let current_accepted = self.accepted.get(&round);
 
@@ -145,7 +145,7 @@ where
 
     /// Get all accepted values from a given round onwards
     #[must_use]
-    pub fn accepted_from(&self, from_round: R) -> Vec<(P, M)> {
+    pub(crate) fn accepted_from(&self, from_round: R) -> Vec<(P, M)> {
         self.accepted
             .range(from_round..)
             .map(|(_, (p, m))| (p.clone(), m.clone()))
@@ -154,7 +154,7 @@ where
 
     /// Get the highest round that has been accepted
     #[must_use]
-    pub fn highest_accepted_round(&self) -> Option<R> {
+    pub(crate) fn highest_accepted_round(&self) -> Option<R> {
         self.accepted.keys().next_back().copied()
     }
 

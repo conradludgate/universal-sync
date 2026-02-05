@@ -14,6 +14,7 @@ use universal_sync_core::{
     CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory,
     SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
+use universal_sync_proposer::GroupClient;
 pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
 
 /// Default cipher suite for testing
@@ -124,17 +125,3 @@ pub fn test_group_client(
     client.register_crdt_factory(NoCrdtFactory);
     client
 }
-
-// Re-export for convenience
-pub use universal_sync_acceptor::{
-    AcceptorError, AcceptorRegistry, GroupAcceptor, GroupRegistry, GroupStateStore,
-    IrohAcceptorConnection, SharedFjallStateStore, accept_connection,
-};
-pub use universal_sync_core::{
-    AcceptorId, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, MemberId,
-};
-pub use universal_sync_proposer::{
-    ConnectionManager, ConnectorError, Group, GroupClient, GroupContext, GroupError, GroupEvent,
-    GroupLearner, IrohConnection, IrohConnector, LearnerError, MemberAddrExt, PAXOS_ALPN,
-    acceptors_extension, register_group, register_group_with_addr, wait_for_welcome,
-};

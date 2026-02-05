@@ -22,18 +22,6 @@ pub struct ProposalKey<R, A, N> {
     pub node: N,
 }
 
-impl<R, A, N> ProposalKey<R, A, N> {
-    /// Create a new proposal key.
-    #[must_use]
-    pub fn new(round: R, attempt: A, node: N) -> Self {
-        Self {
-            round,
-            attempt,
-            node,
-        }
-    }
-}
-
 // =============================================================================
 // CORE MESSAGE TYPES
 // =============================================================================

@@ -10,25 +10,29 @@
 
 #![warn(clippy::pedantic)]
 
-pub mod acceptor;
-pub mod connector;
-pub mod epoch_roster;
-pub mod learner;
-pub mod registry;
-pub mod server;
-pub mod state_store;
+pub(crate) mod acceptor;
+pub(crate) mod connector;
+pub(crate) mod epoch_roster;
+pub(crate) mod learner;
+pub(crate) mod registry;
+pub(crate) mod server;
+pub(crate) mod state_store;
 
-pub use acceptor::{AcceptorChangeEvent, AcceptorError, GroupAcceptor};
-pub use connector::{ConnectorError, ProposalRequest, ProposalResponse, PAXOS_ALPN};
-pub use learner::{
+pub(crate) use acceptor::AcceptorChangeEvent;
+pub use acceptor::{AcceptorError, GroupAcceptor};
+pub use connector::ConnectorError;
+pub(crate) use connector::{ProposalRequest, ProposalResponse};
+pub(crate) use epoch_roster::EpochRoster;
+pub(crate) use learner::{
     GroupLearningActor, LearningCommand, LearningEvent, PeerEvent, learning_channels,
 };
-pub use epoch_roster::EpochRoster;
 pub use registry::AcceptorRegistry;
 pub use server::{GroupRegistry, IrohAcceptorConnection, accept_connection};
-pub use state_store::{FjallStateStore, GroupStateStore, SharedFjallStateStore};
+pub(crate) use state_store::FjallStateStore;
+pub use state_store::GroupStateStore;
 // Re-export core types for convenience
-pub use universal_sync_core::{
+pub use state_store::SharedFjallStateStore;
+pub(crate) use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
     AcceptorAdd, AcceptorId, AcceptorRemove, AcceptorsExt, Attempt, Epoch, GroupId, GroupMessage,
     GroupProposal, Handshake, HandshakeResponse, MemberId, UnsignedProposal,

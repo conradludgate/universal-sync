@@ -9,7 +9,7 @@ use crate::traits::{Acceptor, AcceptorStateStore, Proposal};
 
 /// Error returned when a proposal fails validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidProposal;
+pub(crate) struct InvalidProposal;
 
 impl fmt::Display for InvalidProposal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -20,7 +20,7 @@ impl fmt::Display for InvalidProposal {
 impl std::error::Error for InvalidProposal {}
 
 /// Outcome of handling a Prepare request.
-pub enum PromiseOutcome<A: Acceptor> {
+pub(crate) enum PromiseOutcome<A: Acceptor> {
     /// Successfully promised to this proposal.
     Promised(AcceptorMessage<A>),
     /// Rejected because a higher proposal was already promised/accepted.
@@ -28,7 +28,7 @@ pub enum PromiseOutcome<A: Acceptor> {
 }
 
 /// Outcome of handling an Accept request.
-pub enum AcceptOutcome<A: Acceptor> {
+pub(crate) enum AcceptOutcome<A: Acceptor> {
     /// Successfully accepted this proposal.
     Accepted(AcceptorMessage<A>),
     /// Rejected because a higher proposal was already promised/accepted.
@@ -55,12 +55,12 @@ where
     }
 
     /// Get the node ID of this acceptor.
-    pub fn node_id(&self) -> <A::Proposal as Proposal>::NodeId {
+    pub(crate) fn node_id(&self) -> <A::Proposal as Proposal>::NodeId {
         self.acceptor.node_id()
     }
 
     /// Get a reference to the underlying state.
-    pub fn state(&self) -> &S {
+    pub(crate) fn state(&self) -> &S {
         &self.state
     }
 
@@ -72,7 +72,7 @@ where
     /// # Errors
     ///
     /// Returns `Err(InvalidProposal)` if the proposal fails validation.
-    pub async fn handle_prepare(
+    pub(crate) async fn handle_prepare(
         &mut self,
         proposal: &A::Proposal,
     ) -> Result<PromiseOutcome<A>, InvalidProposal> {
@@ -109,7 +109,7 @@ where
     /// # Errors
     ///
     /// - `Err(InvalidProposal)` if validation fails.
-    pub async fn handle_accept(
+    pub(crate) async fn handle_accept(
         &mut self,
         proposal: &A::Proposal,
         message: &A::Message,

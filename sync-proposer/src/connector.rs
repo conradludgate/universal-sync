@@ -20,7 +20,7 @@ use universal_sync_core::{
 use universal_sync_paxos::{AcceptorMessage, AcceptorRequest, Connector, Learner};
 
 /// ALPN protocol identifier for Paxos connections
-pub const PAXOS_ALPN: &[u8] = b"universal-sync/paxos/1";
+pub(crate) const PAXOS_ALPN: &[u8] = b"universal-sync/paxos/1";
 
 /// Error type for iroh connector operations
 #[derive(Debug)]
@@ -110,7 +110,7 @@ impl<L> IrohConnector<L> {
     /// * `endpoint` - The iroh endpoint to use for connections
     /// * `group_id` - The group to join
     #[must_use]
-    pub fn new(endpoint: Endpoint, group_id: GroupId) -> Self {
+    pub(crate) fn new(endpoint: Endpoint, group_id: GroupId) -> Self {
         Self {
             endpoint,
             group_id,
@@ -128,7 +128,7 @@ impl<L> IrohConnector<L> {
     // /// * `endpoint` - The iroh endpoint to use for connections
     // /// * `group_id` - The group to join
     // /// * `address_hints` - Map of acceptor IDs to their endpoint addresses
-    // pub fn with_address_hints(
+    // pub(crate) fn with_address_hints(
     //     endpoint: Endpoint,
     //     group_id: GroupId,
     //     address_hints: impl IntoIterator<Item = (AcceptorId, EndpointAddr)>,
@@ -143,13 +143,13 @@ impl<L> IrohConnector<L> {
 
     /// Get the underlying iroh endpoint
     #[must_use]
-    pub fn endpoint(&self) -> &Endpoint {
+    pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
     /// Get the group ID
     #[must_use]
-    pub fn group_id(&self) -> &GroupId {
+    pub(crate) fn group_id(&self) -> &GroupId {
         &self.group_id
     }
 }
@@ -264,7 +264,7 @@ where
 ///
 /// # Panics
 /// Panics if the `AcceptorId` is not a valid public key.
-pub async fn register_group(
+pub(crate) async fn register_group(
     endpoint: &Endpoint,
     acceptor_id: &AcceptorId,
     group_info: &[u8],
@@ -290,7 +290,7 @@ pub async fn register_group(
 ///
 /// # Errors
 /// Returns an error if the connection fails or the handshake is rejected.
-pub async fn register_group_with_addr(
+pub(crate) async fn register_group_with_addr(
     endpoint: &Endpoint,
     addr: impl Into<iroh::EndpointAddr>,
     group_info: &[u8],
@@ -365,7 +365,7 @@ pub type IrohConnection<L, E> = Mapped<
 
 /// Create a new `IrohConnection` from iroh streams
 #[must_use]
-pub fn new_iroh_connection<L, E>(
+pub(crate) fn new_iroh_connection<L, E>(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
 ) -> IrohConnection<L, E>
@@ -385,7 +385,7 @@ where
 /// Wire format for proposal requests (independent of Learner type)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum ProposalRequest {
+pub(crate) enum ProposalRequest {
     /// Phase 1: Prepare
     Prepare(GroupProposal),
     /// Phase 2: Accept
@@ -394,22 +394,24 @@ pub enum ProposalRequest {
 
 /// Wire format for proposal responses (independent of Learner type)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProposalResponse {
+pub(crate) struct ProposalResponse {
     /// Highest promised proposal
-    pub promised: GroupProposal,
+    pub(crate) promised: GroupProposal,
     /// Highest accepted (proposal, message) pair
-    pub accepted: Option<(GroupProposal, GroupMessage)>,
+    pub(crate) accepted: Option<(GroupProposal, GroupMessage)>,
 }
 
 /// Writer for proposal requests
-pub type ProposalWriter = FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>>;
+pub(crate) type ProposalWriter =
+    FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>>;
 
 /// Reader for proposal responses
-pub type ProposalReader = FramedRead<iroh::endpoint::RecvStream, PostcardCodec<ProposalResponse>>;
+pub(crate) type ProposalReader =
+    FramedRead<iroh::endpoint::RecvStream, PostcardCodec<ProposalResponse>>;
 
 /// Create proposal stream readers/writers from raw iroh streams
 #[must_use]
-pub fn make_proposal_streams(
+pub(crate) fn make_proposal_streams(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
 ) -> (ProposalWriter, ProposalReader) {

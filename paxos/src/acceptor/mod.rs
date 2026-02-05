@@ -46,6 +46,8 @@ mod handler;
 mod runner;
 mod state;
 
-pub use handler::{AcceptOutcome, AcceptorHandler, InvalidProposal, PromiseOutcome};
+pub use handler::AcceptorHandler;
+pub(crate) use handler::{AcceptOutcome, InvalidProposal, PromiseOutcome};
 pub use runner::{run_acceptor, run_acceptor_with_epoch_waiter};
-pub use state::{AcceptorReceiver, AcceptorSubscription, RoundState, SharedAcceptorState};
+pub use state::RoundState;
+pub(crate) use state::{AcceptorReceiver, AcceptorSubscription, SharedAcceptorState};

@@ -86,7 +86,7 @@ impl<L: Learner> AcceptorMessage<L> {
     /// # Panics
     /// Panics if `promised` is None, which should never happen for valid responses.
     #[must_use]
-    pub fn from_round_state(state: RoundState<L>) -> Self {
+    pub(crate) fn from_round_state(state: RoundState<L>) -> Self {
         Self {
             promised: state
                 .promised

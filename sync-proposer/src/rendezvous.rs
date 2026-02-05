@@ -38,7 +38,7 @@ fn compute_score(acceptor_id: &AcceptorId, message_id: &MessageId) -> u64 {
 /// * `acceptors` - Iterator of acceptor IDs to select from
 /// * `message_id` - The message ID to hash against
 /// * `count` - Maximum number of acceptors to select
-pub fn select_acceptors<'a>(
+pub(crate) fn select_acceptors<'a>(
     acceptors: impl IntoIterator<Item = &'a AcceptorId>,
     message_id: &MessageId,
     count: usize,
@@ -80,7 +80,7 @@ pub fn select_acceptors<'a>(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-pub fn delivery_count(num_acceptors: usize) -> usize {
+pub(crate) fn delivery_count(num_acceptors: usize) -> usize {
     if num_acceptors == 0 {
         return 0;
     }

@@ -37,7 +37,8 @@ pub mod proposer;
 mod traits;
 
 pub use messages::{AcceptorMessage, AcceptorRequest};
-pub use proposer::{ProposeResult, Proposer, QuorumTracker};
+pub(crate) use proposer::QuorumTracker;
+pub use proposer::{ProposeResult, Proposer};
 pub use traits::{
     Acceptor, AcceptorConn, AcceptorStateStore, Connector, Learner, Proposal, ProposalKey,
     Validated, ValidationError,

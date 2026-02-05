@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 /// Error type for group state storage operations.
 #[derive(Debug)]
-pub struct GroupStateError;
+pub(crate) struct GroupStateError;
 
 impl std::fmt::Display for GroupStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,7 +34,7 @@ impl mls_rs_core::error::IntoAnyError for GroupStateError {
 /// - Group state: `state:{group_id_hex}`
 /// - Epoch records: `epoch:{group_id_hex}:{epoch_id}`
 #[derive(Clone)]
-pub struct FjallGroupStateStorage {
+pub(crate) struct FjallGroupStateStorage {
     inner: Arc<FjallGroupStateStorageInner>,
 }
 
@@ -52,7 +52,7 @@ impl FjallGroupStateStorage {
     ///
     /// # Panics
     /// Panics if `spawn_blocking` fails.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, Report<GroupStateError>> {
+    pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, Report<GroupStateError>> {
         let path = path.as_ref().to_owned();
         tokio::task::spawn_blocking(move || Self::open_sync(&path))
             .await

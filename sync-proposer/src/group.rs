@@ -157,15 +157,15 @@ enum AcceptorOutbound {
 
 /// A decrypted application message received from the group.
 #[derive(Debug, Clone)]
-pub struct ReceivedAppMessage {
+pub(crate) struct ReceivedAppMessage {
     /// The sender's member index
-    pub sender: MemberId,
+    pub(crate) sender: MemberId,
     /// The epoch in which the message was sent
-    pub epoch: Epoch,
+    pub(crate) epoch: Epoch,
     /// The message index (per-sender, per-epoch)
-    pub index: u32,
+    pub(crate) index: u32,
     /// The decrypted application data
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Events emitted by a Group.
@@ -2358,7 +2358,7 @@ enum ConnectionResult {
 ///
 /// # Errors
 /// Returns an error if no welcome is received or the connection fails.
-pub async fn wait_for_welcome(endpoint: &Endpoint) -> Result<Vec<u8>, Report<GroupError>> {
+pub(crate) async fn wait_for_welcome(endpoint: &Endpoint) -> Result<Vec<u8>, Report<GroupError>> {
     use futures::StreamExt;
     use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 

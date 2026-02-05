@@ -11,7 +11,7 @@ pin_project! {
     /// This is useful for streams that may not be fused by default.
     #[derive(Debug)]
     #[must_use = "streams do nothing unless polled"]
-    pub struct Fuse<S> {
+    pub(crate) struct Fuse<S> {
         #[pin]
         stream: Option<S>,
     }
@@ -19,14 +19,14 @@ pin_project! {
 
 impl<S> Fuse<S> {
     /// Creates a new fused stream.
-    pub fn new(stream: S) -> Self {
+    pub(crate) fn new(stream: S) -> Self {
         Self {
             stream: Some(stream),
         }
     }
 
     /// Returns whether the underlying stream has finished.
-    pub fn terminated() -> Self {
+    pub(crate) fn terminated() -> Self {
         Self { stream: None }
     }
 }

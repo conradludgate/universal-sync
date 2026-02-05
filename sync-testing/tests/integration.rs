@@ -9,8 +9,9 @@ use iroh::Endpoint;
 use mls_rs::external_client::ExternalClient;
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
+use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
+use universal_sync_core::{AcceptorId, GroupId, PAXOS_ALPN};
 use universal_sync_testing::{
-    AcceptorId, AcceptorRegistry, GroupId, PAXOS_ALPN, SharedFjallStateStore, accept_connection,
     test_cipher_suite, test_crypto_provider, test_group_client, test_identity_provider,
 };
 

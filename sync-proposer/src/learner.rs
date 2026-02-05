@@ -94,7 +94,7 @@ where
     /// * `signer` - The signing secret key for this member
     /// * `cipher_suite` - Cipher suite provider for crypto operations
     /// * `acceptors` - Initial set of acceptor endpoint addresses
-    pub fn new(
+    pub(crate) fn new(
         group: Group<C>,
         signer: SignatureSecretKey,
         cipher_suite: CS,
@@ -112,33 +112,33 @@ where
     }
 
     /// Get access to the underlying MLS group
-    pub fn group(&self) -> &Group<C> {
+    pub(crate) fn group(&self) -> &Group<C> {
         &self.group
     }
 
     /// Get mutable access to the underlying MLS group
-    pub fn group_mut(&mut self) -> &mut Group<C> {
+    pub(crate) fn group_mut(&mut self) -> &mut Group<C> {
         &mut self.group
     }
 
     /// Get the current set of acceptor IDs
-    pub fn acceptor_ids(&self) -> impl Iterator<Item = AcceptorId> + '_ {
+    pub(crate) fn acceptor_ids(&self) -> impl Iterator<Item = AcceptorId> + '_ {
         self.acceptors.keys().copied()
     }
 
     /// Get the current set of acceptors with their addresses
-    pub fn acceptors(&self) -> &BTreeMap<AcceptorId, EndpointAddr> {
+    pub(crate) fn acceptors(&self) -> &BTreeMap<AcceptorId, EndpointAddr> {
         &self.acceptors
     }
 
     /// Add an acceptor to the set by endpoint address
-    pub fn add_acceptor_addr(&mut self, addr: EndpointAddr) {
+    pub(crate) fn add_acceptor_addr(&mut self, addr: EndpointAddr) {
         let id = AcceptorId::from_bytes(*addr.id.as_bytes());
         self.acceptors.insert(id, addr);
     }
 
     /// Remove an acceptor from the set by ID
-    pub fn remove_acceptor_id(&mut self, acceptor_id: &AcceptorId) {
+    pub(crate) fn remove_acceptor_id(&mut self, acceptor_id: &AcceptorId) {
         self.acceptors.remove(acceptor_id);
     }
 
@@ -149,7 +149,7 @@ where
     ///
     /// # Errors
     /// Returns an error if applying the pending commit fails.
-    pub fn apply_pending_commit(&mut self) -> Result<(), LearnerError> {
+    pub(crate) fn apply_pending_commit(&mut self) -> Result<(), LearnerError> {
         let commit_output = self.group.apply_pending_commit()?;
         self.process_commit_effect(&commit_output.effect);
         Ok(())
@@ -159,13 +159,13 @@ where
     ///
     /// Call this when another proposer's value won consensus and we need
     /// to discard our pending commit before processing the winning value.
-    pub fn clear_pending_commit(&mut self) {
+    pub(crate) fn clear_pending_commit(&mut self) {
         self.group.clear_pending_commit();
     }
 
     /// Check if we have a pending commit
     #[must_use]
-    pub fn has_pending_commit(&self) -> bool {
+    pub(crate) fn has_pending_commit(&self) -> bool {
         self.group.has_pending_commit()
     }
 
@@ -200,7 +200,7 @@ where
     }
 
     /// Get the current epoch from MLS state
-    pub fn mls_epoch(&self) -> Epoch {
+    pub(crate) fn mls_epoch(&self) -> Epoch {
         Epoch(self.group.context().epoch)
     }
 
@@ -211,7 +211,7 @@ where
     ///
     /// # Errors
     /// Returns an error if encryption fails.
-    pub fn encrypt_application_message(
+    pub(crate) fn encrypt_application_message(
         &mut self,
         message: &[u8],
         authenticated_data: Vec<u8>,

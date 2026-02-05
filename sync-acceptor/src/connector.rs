@@ -3,9 +3,6 @@
 //! This module provides the error type used for connection operations
 //! and the ALPN protocol identifier.
 
-/// ALPN protocol identifier for Paxos connections
-pub const PAXOS_ALPN: &[u8] = b"universal-sync/paxos/1";
-
 /// Error type for connector operations
 #[derive(Debug)]
 pub enum ConnectorError {
@@ -54,7 +51,7 @@ use universal_sync_core::{GroupMessage, GroupProposal};
 /// Wire format for proposal requests
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
-pub enum ProposalRequest {
+pub(crate) enum ProposalRequest {
     /// Phase 1: Prepare
     Prepare(GroupProposal),
     /// Phase 2: Accept
@@ -63,9 +60,9 @@ pub enum ProposalRequest {
 
 /// Wire format for proposal responses
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProposalResponse {
+pub(crate) struct ProposalResponse {
     /// Highest promised proposal
-    pub promised: GroupProposal,
+    pub(crate) promised: GroupProposal,
     /// Highest accepted (proposal, message) pair
-    pub accepted: Option<(GroupProposal, GroupMessage)>,
+    pub(crate) accepted: Option<(GroupProposal, GroupMessage)>,
 }

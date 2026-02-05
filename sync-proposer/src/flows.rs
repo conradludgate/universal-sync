@@ -25,7 +25,9 @@ use universal_sync_core::AcceptorsExt;
 ///     .unwrap();
 /// ```
 #[must_use]
-pub fn acceptors_extension(acceptors: impl IntoIterator<Item = EndpointAddr>) -> ExtensionList {
+pub(crate) fn acceptors_extension(
+    acceptors: impl IntoIterator<Item = EndpointAddr>,
+) -> ExtensionList {
     let acceptors_ext = AcceptorsExt::new(acceptors);
     let mut extensions = ExtensionList::default();
     extensions

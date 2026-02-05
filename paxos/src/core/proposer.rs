@@ -42,7 +42,7 @@ where
 
 /// Proposer phase
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ProposerPhase<K, P, M, I>
+pub(crate) enum ProposerPhase<K, P, M, I>
 where
     K: Ord,
 {
@@ -153,43 +153,43 @@ where
 
     /// Get the current proposal key
     #[must_use]
-    pub fn proposal(&self) -> &K {
+    pub(crate) fn proposal(&self) -> &K {
         &self.proposal
     }
 
     /// Get the current value
     #[must_use]
-    pub fn value(&self) -> &M {
+    pub(crate) fn value(&self) -> &M {
         &self.value
     }
 
     /// Check if we're still in the Preparing phase
     #[must_use]
-    pub fn is_preparing(&self) -> bool {
+    pub(crate) fn is_preparing(&self) -> bool {
         matches!(self.phase, ProposerPhase::Preparing { .. })
     }
 
     /// Check if we're in the Accepting phase
     #[must_use]
-    pub fn is_accepting(&self) -> bool {
+    pub(crate) fn is_accepting(&self) -> bool {
         matches!(self.phase, ProposerPhase::Accepting { .. })
     }
 
     /// Check if we've learned a value
     #[must_use]
-    pub fn is_learned(&self) -> bool {
+    pub(crate) fn is_learned(&self) -> bool {
         matches!(self.phase, ProposerPhase::Learned)
     }
 
     /// Check if we failed
     #[must_use]
-    pub fn is_failed(&self) -> bool {
+    pub(crate) fn is_failed(&self) -> bool {
         matches!(self.phase, ProposerPhase::Failed { .. })
     }
 
     /// Get quorum size
     #[must_use]
-    pub fn quorum(&self) -> usize {
+    pub(crate) fn quorum(&self) -> usize {
         self.quorum
     }
 
@@ -201,7 +201,7 @@ where
     /// - `get_key`: Function to extract key from a proposal
     ///
     /// Returns the result of processing this response.
-    pub fn handle_promise<F>(
+    pub(crate) fn handle_promise<F>(
         &mut self,
         acceptor_id: I,
         promised_key: K,
@@ -261,7 +261,7 @@ where
     /// - `proposal`: The actual proposal object (for returning in Learned result)
     ///
     /// Returns the result of processing this response.
-    pub fn handle_accepted(
+    pub(crate) fn handle_accepted(
         &mut self,
         acceptor_id: I,
         accepted_key: Option<K>,

@@ -27,3 +27,6 @@ pub use message::{EncryptedAppMessage, GroupMessage, MessageId, MessageRequest, 
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub use util::{load_secret_key, KeyLoadError};
 pub use welcome::{WelcomeBundle, WelcomeError};
+
+/// ALPN protocol identifier for Paxos connections
+pub const PAXOS_ALPN: &[u8] = b"universal-sync/paxos/1";

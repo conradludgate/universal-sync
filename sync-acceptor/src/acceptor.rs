@@ -97,7 +97,7 @@ impl From<std::io::Error> for AcceptorError {
 
 /// Event emitted when the acceptor set changes during apply
 #[derive(Debug, Clone)]
-pub enum AcceptorChangeEvent {
+pub(crate) enum AcceptorChangeEvent {
     /// An acceptor was added
     Added {
         /// The acceptor ID
@@ -164,7 +164,7 @@ where
     /// * `cipher_suite` - Cipher suite for MLS signature verification
     /// * `secret_key` - This acceptor's iroh secret key (for signing sync proposals)
     /// * `acceptors` - Initial set of known acceptors with addresses (from `GroupInfo` extensions)
-    pub fn new(
+    pub(crate) fn new(
         external_group: ExternalGroup<C>,
         cipher_suite: CS,
         secret_key: SecretKey,
@@ -187,18 +187,21 @@ where
 
     /// Set the state store for epoch roster lookups
     #[must_use]
-    pub fn with_state_store(mut self, state_store: crate::state_store::GroupStateStore) -> Self {
+    pub(crate) fn with_state_store(
+        mut self,
+        state_store: crate::state_store::GroupStateStore,
+    ) -> Self {
         self.state_store = Some(state_store);
         self
     }
 
     /// Get this acceptor's own ID (derived from secret key)
-    pub fn own_id(&self) -> AcceptorId {
+    pub(crate) fn own_id(&self) -> AcceptorId {
         AcceptorId::from_bytes(*self.secret_key.public().as_bytes())
     }
 
     /// Update the set of known acceptors from addresses
-    pub fn set_acceptors(&mut self, acceptors: impl IntoIterator<Item = EndpointAddr>) {
+    pub(crate) fn set_acceptors(&mut self, acceptors: impl IntoIterator<Item = EndpointAddr>) {
         self.acceptors = acceptors
             .into_iter()
             .map(|addr| {
@@ -209,19 +212,19 @@ where
     }
 
     /// Get a reference to the external group
-    pub fn external_group(&self) -> &ExternalGroup<C> {
+    pub(crate) fn external_group(&self) -> &ExternalGroup<C> {
         &self.external_group
     }
 
     /// Get the acceptor addresses
-    pub fn acceptor_addrs(&self) -> impl Iterator<Item = (&AcceptorId, &EndpointAddr)> {
+    pub(crate) fn acceptor_addrs(&self) -> impl Iterator<Item = (&AcceptorId, &EndpointAddr)> {
         self.acceptors.iter()
     }
 
     /// Add an acceptor by address
     ///
     /// Returns the `AcceptorId` that was added.
-    pub fn add_acceptor(&mut self, addr: EndpointAddr) -> AcceptorId {
+    pub(crate) fn add_acceptor(&mut self, addr: EndpointAddr) -> AcceptorId {
         let id = AcceptorId::from_bytes(*addr.id.as_bytes());
         self.acceptors.insert(id, addr);
         id
@@ -230,7 +233,7 @@ where
     /// Remove an acceptor by ID
     ///
     /// Returns the address if the acceptor was present.
-    pub fn remove_acceptor(&mut self, id: &AcceptorId) -> Option<EndpointAddr> {
+    pub(crate) fn remove_acceptor(&mut self, id: &AcceptorId) -> Option<EndpointAddr> {
         self.acceptors.remove(id)
     }
 
@@ -506,8 +509,8 @@ where
         &mut self,
         commit_desc: &mls_rs::group::CommitMessageDescription,
     ) -> Vec<AcceptorChangeEvent> {
-        use mls_rs::group::proposal::Proposal as MlsProposal;
         use mls_rs::group::CommitEffect;
+        use mls_rs::group::proposal::Proposal as MlsProposal;
 
         let mut changes = Vec::new();
 

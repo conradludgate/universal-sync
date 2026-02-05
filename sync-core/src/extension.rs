@@ -5,7 +5,8 @@
 use iroh::EndpointAddr;
 use mls_rs::extension::{ExtensionType, MlsCodecExtension};
 use mls_rs::mls_rs_codec::{self as mls_rs_codec, MlsDecode, MlsEncode, MlsSize};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use crate::proposal::AcceptorId;
 
@@ -41,9 +42,12 @@ fn postcard_encoded_len<T: Serialize>(value: &T) -> usize {
 
 /// Encode a value using postcard with a 4-byte length prefix
 #[expect(clippy::cast_possible_truncation)]
-fn postcard_encode<T: Serialize>(value: &T, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
-    let bytes = postcard::to_allocvec(value)
-        .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
+fn postcard_encode<T: Serialize>(
+    value: &T,
+    writer: &mut Vec<u8>,
+) -> Result<(), mls_rs_codec::Error> {
+    let bytes =
+        postcard::to_allocvec(value).map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
     let len = bytes.len() as u32;
     writer.extend_from_slice(&len.to_be_bytes());
     writer.extend_from_slice(&bytes);
@@ -328,8 +332,8 @@ impl MlsEncode for CrdtRegistrationExt {
 impl MlsDecode for CrdtRegistrationExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
         let data = read_length_prefixed(reader)?;
-        let type_id =
-            String::from_utf8(data.to_vec()).map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
+        let type_id = String::from_utf8(data.to_vec())
+            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
         Ok(Self { type_id })
     }
 }

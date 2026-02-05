@@ -58,7 +58,7 @@ impl<L: Learner> Default for RoundState<L> {
 /// - Thread-safe synchronization via `Arc<Mutex>`
 /// - Broadcast channel for learner notifications
 #[derive(Clone)]
-pub struct SharedAcceptorState<L: Learner> {
+pub(crate) struct SharedAcceptorState<L: Learner> {
     /// Pure state machine core - contains promised/accepted maps
     core: Arc<Mutex<CoreState<L>>>,
     /// Broadcast channel for notifying learners of accepted values
@@ -76,13 +76,13 @@ impl<L: Learner> Default for SharedAcceptorState<L> {
 impl<L: Learner> SharedAcceptorState<L> {
     /// Create a new shared acceptor state with default broadcast capacity.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_capacity(16)
     }
 
     /// Create a new shared acceptor state with specified broadcast capacity.
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         let (broadcast, _) = broadcast::channel(capacity);
         Self {
             core: Arc::new(Mutex::new(AcceptorCore::new())),
@@ -93,7 +93,7 @@ impl<L: Learner> SharedAcceptorState<L> {
 
     /// Create with initial accepted state (e.g., loaded from persistence)
     #[must_use]
-    pub fn with_accepted(proposal: &L::Proposal, message: &L::Message) -> Self {
+    pub(crate) fn with_accepted(proposal: &L::Proposal, message: &L::Message) -> Self {
         let mut core = AcceptorCore::new();
         let round = proposal.round();
         let key = proposal.key();
@@ -125,7 +125,7 @@ impl<L: Learner> SharedAcceptorState<L> {
 }
 
 /// A receiver for accepted proposals, wrapping a broadcast receiver.
-pub struct AcceptorReceiver<L: Learner> {
+pub(crate) struct AcceptorReceiver<L: Learner> {
     inner: tokio_stream::wrappers::BroadcastStream<(L::Proposal, L::Message)>,
 }
 
@@ -144,11 +144,11 @@ where
 }
 
 /// Stream of historical accepted values for in-memory state.
-pub type HistoricalStream<L> =
+pub(crate) type HistoricalStream<L> =
     stream::Iter<std::vec::IntoIter<(<L as Learner>::Proposal, <L as Learner>::Message)>>;
 
 /// Combined subscription stream (historical + live).
-pub type AcceptorSubscription<L> = stream::Chain<HistoricalStream<L>, AcceptorReceiver<L>>;
+pub(crate) type AcceptorSubscription<L> = stream::Chain<HistoricalStream<L>, AcceptorReceiver<L>>;
 
 impl<L: Learner> AcceptorStateStore<L> for SharedAcceptorState<L>
 where

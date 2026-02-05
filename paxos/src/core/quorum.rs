@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 /// Pure quorum tracker - counts (proposal, value) pairs and detects quorum
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct QuorumCore<K, P, M>
+pub(crate) struct QuorumCore<K, P, M>
 where
     K: Ord,
 {
@@ -24,7 +24,7 @@ where
 {
     /// Create a new quorum tracker
     #[must_use]
-    pub fn new(num_acceptors: usize) -> Self {
+    pub(crate) fn new(num_acceptors: usize) -> Self {
         Self {
             counts: BTreeMap::new(),
             quorum: num_acceptors / 2 + 1,
@@ -33,7 +33,7 @@ where
 
     /// Get the quorum threshold
     #[must_use]
-    pub fn quorum(&self) -> usize {
+    pub(crate) fn quorum(&self) -> usize {
         self.quorum
     }
 
@@ -41,7 +41,7 @@ where
     ///
     /// Returns `Some((&proposal, &message))` if quorum was JUST reached (exactly),
     /// `None` otherwise.
-    pub fn track(&mut self, key: K, proposal: P, message: M) -> Option<(&P, &M)> {
+    pub(crate) fn track(&mut self, key: K, proposal: P, message: M) -> Option<(&P, &M)> {
         let entry = self
             .counts
             .entry(key)
@@ -57,7 +57,7 @@ where
     /// Check if any entry with the given key prefix has reached quorum.
     ///
     /// The `matches_prefix` function should return true if a key matches the desired prefix.
-    pub fn check_quorum<F>(&self, matches_prefix: F) -> Option<(&P, &M)>
+    pub(crate) fn check_quorum<F>(&self, matches_prefix: F) -> Option<(&P, &M)>
     where
         F: Fn(&K) -> bool,
     {

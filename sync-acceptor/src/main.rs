@@ -11,10 +11,8 @@ use mls_rs::identity::basic::BasicIdentityProvider;
 use mls_rs::{CipherSuite, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tracing::{error, info};
-use universal_sync_acceptor::{
-    AcceptorRegistry, PAXOS_ALPN, SharedFjallStateStore, accept_connection,
-};
-use universal_sync_core::load_secret_key;
+use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
+use universal_sync_core::{PAXOS_ALPN, load_secret_key};
 
 /// Universal Sync Acceptor Server
 #[derive(Parser, Debug)]

@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Model};
-use universal_sync_paxos::core::{
+
+use super::{
     AcceptorCore, AcceptorRequest, AcceptorResponse, PreparePhaseResult,
     ProposalKey as ProposalKeyGeneric, ProposerCore,
 };
@@ -261,14 +262,14 @@ impl PaxosActor {
             let result = new_core.handle_accepted(src, accepted_key, proposal);
 
             match result {
-                universal_sync_paxos::core::AcceptPhaseResult::Learned { value, .. } => {
+                super::AcceptPhaseResult::Learned { value, .. } => {
                     *state.to_mut() = PaxosActorState::Proposer(ProposerState {
                         core: new_core,
                         current_round: prop_state.current_round,
                         learned: Some((proposal.round, value)),
                     });
                 }
-                universal_sync_paxos::core::AcceptPhaseResult::Rejected { superseded_by } => {
+                super::AcceptPhaseResult::Rejected { superseded_by } => {
                     // Retry with higher attempt
                     let new_attempt = superseded_by.attempt + 1;
                     let new_proposal = ProposalKey {
@@ -293,7 +294,7 @@ impl PaxosActor {
                         learned: None,
                     });
                 }
-                universal_sync_paxos::core::AcceptPhaseResult::Pending => {
+                super::AcceptPhaseResult::Pending => {
                     *state.to_mut() = PaxosActorState::Proposer(ProposerState {
                         core: new_core,
                         current_round: prop_state.current_round,

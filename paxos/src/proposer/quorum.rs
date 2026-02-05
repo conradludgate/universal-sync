@@ -30,7 +30,7 @@ impl<L: Learner> QuorumTracker<L> {
 
     /// Get the number of acceptors this tracker was configured for.
     #[must_use]
-    pub fn num_acceptors(&self) -> usize {
+    pub(crate) fn num_acceptors(&self) -> usize {
         self.num_acceptors
     }
 
@@ -69,7 +69,7 @@ impl<L: Learner> QuorumTracker<L> {
 
     /// Get the quorum threshold.
     #[must_use]
-    pub fn quorum(&self) -> usize {
+    pub(crate) fn quorum(&self) -> usize {
         self.quorum
     }
 }
