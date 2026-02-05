@@ -16,9 +16,10 @@ use rustyline::error::ReadlineError;
 use tracing::info;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
-    load_secret_key,
+    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory,
+    SUPPORTED_CRDTS_EXTENSION_TYPE, load_secret_key,
 };
-use universal_sync_proposer::ConnectionManager;
+use universal_sync_proposer::GroupClient;
 use universal_sync_proposer::connector::PAXOS_ALPN;
 use universal_sync_proposer::repl::ReplContext;
 
@@ -100,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extension_type(ACCEPTORS_EXTENSION_TYPE)
         .extension_type(ACCEPTOR_ADD_EXTENSION_TYPE)
         .extension_type(ACCEPTOR_REMOVE_EXTENSION_TYPE)
+        .extension_type(MEMBER_ADDR_EXTENSION_TYPE)
+        .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
+        .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
         .build();
 
     info!("MLS client created");
@@ -113,12 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(addr = ?endpoint.addr(), "Iroh endpoint ready");
 
+    // Create GroupClient with NoCrdtFactory registered
+    let mut group_client = GroupClient::new(client, secret_key, cipher_suite, endpoint);
+    group_client.register_crdt_factory(NoCrdtFactory);
+
     // Create REPL context
     let mut context = ReplContext {
-        client,
-        signer: secret_key,
-        cipher_suite,
-        connection_manager: ConnectionManager::new(endpoint),
+        client: group_client,
         groups: HashMap::new(),
     };
 

@@ -88,7 +88,7 @@ async fn test_mls_group_creation_with_group_api() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     // Create a group using the GroupClient API (no acceptors)
-    let mut group = alice.create_group(&[]).await.expect("create group");
+    let mut group = alice.create_group(&[], "none").await.expect("create group");
 
     let context = group.context().await.expect("get context");
     tracing::info!(group_id = ?context.group_id, epoch = ?context.epoch, "Group created");
@@ -149,7 +149,10 @@ async fn test_alice_adds_bob_with_group_api() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     // Create group without acceptors first
-    let mut alice_group = alice.create_group(&[]).await.expect("alice create group");
+    let mut alice_group = alice
+        .create_group(&[], "none")
+        .await
+        .expect("alice create group");
 
     let group_id = alice_group.group_id();
     tracing::info!(?group_id, "Alice created group");
@@ -320,7 +323,7 @@ async fn test_acceptor_add_remove() {
     // --- Alice creates a group and manages acceptors ---
     let alice = test_group_client("alice", test_endpoint().await);
 
-    let mut group = alice.create_group(&[]).await.expect("create group");
+    let mut group = alice.create_group(&[], "none").await.expect("create group");
 
     // Add first acceptor
     group
@@ -418,7 +421,7 @@ async fn test_group_without_acceptors() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     // Create group without any acceptors - should still work for local operations
-    let mut group = alice.create_group(&[]).await.expect("create group");
+    let mut group = alice.create_group(&[], "none").await.expect("create group");
 
     let context = group.context().await.expect("get context");
     assert_eq!(context.member_count, 1);
@@ -443,7 +446,7 @@ async fn test_multiple_key_updates() {
 
     let alice = test_group_client("alice", test_endpoint().await);
 
-    let mut group = alice.create_group(&[]).await.expect("create group");
+    let mut group = alice.create_group(&[], "none").await.expect("create group");
 
     group
         .add_acceptor(acceptor_addr)
@@ -481,7 +484,7 @@ async fn test_remove_member() {
     // Alice creates group
     let alice = test_group_client("alice", test_endpoint().await);
 
-    let mut alice_group = alice.create_group(&[]).await.expect("create group");
+    let mut alice_group = alice.create_group(&[], "none").await.expect("create group");
 
     alice_group
         .add_acceptor(acceptor_addr)
@@ -542,7 +545,7 @@ async fn test_three_member_group() {
     // Alice creates group using GroupClient
     let alice = test_group_client("alice", test_endpoint().await);
 
-    let mut alice_group = alice.create_group(&[]).await.expect("create group");
+    let mut alice_group = alice.create_group(&[], "none").await.expect("create group");
 
     alice_group
         .add_acceptor(acceptor_addr.clone())
@@ -620,7 +623,7 @@ async fn test_send_application_message() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     // Create group without acceptors (messages work locally)
-    let mut group = alice.create_group(&[]).await.expect("create group");
+    let mut group = alice.create_group(&[], "none").await.expect("create group");
 
     // Send an application message
     let message_data = b"Hello, World!";
@@ -651,7 +654,7 @@ async fn test_group_creation_with_initial_acceptor() {
 
     // Create group WITH an initial acceptor
     let mut group = alice
-        .create_group(std::slice::from_ref(&acceptor_addr))
+        .create_group(std::slice::from_ref(&acceptor_addr), "none")
         .await
         .expect("create group with acceptor");
 
@@ -684,7 +687,7 @@ async fn test_concurrent_operations_single_member() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     let mut group = alice
-        .create_group(&[acceptor_addr])
+        .create_group(&[acceptor_addr], "none")
         .await
         .expect("create group");
 
@@ -716,7 +719,10 @@ async fn test_group_client_create_group() {
     let alice = test_group_client("alice", test_endpoint().await);
 
     // Create group without acceptors
-    let mut alice_group = alice.create_group(&[]).await.expect("alice create group");
+    let mut alice_group = alice
+        .create_group(&[], "none")
+        .await
+        .expect("alice create group");
 
     let ctx = alice_group.context().await.expect("context");
     assert_eq!(ctx.member_count, 1);
@@ -741,7 +747,7 @@ async fn test_group_client_with_acceptor() {
 
     // Create group with acceptor
     let mut alice_group = alice
-        .create_group(&[acceptor_addr])
+        .create_group(&[acceptor_addr], "none")
         .await
         .expect("alice create group");
 

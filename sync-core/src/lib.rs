@@ -18,8 +18,9 @@ pub mod welcome;
 pub use crdt::{Crdt, CrdtError, CrdtFactory, NoCrdt, NoCrdtFactory};
 pub use extension::{
     AcceptorAdd, AcceptorRemove, AcceptorsExt, CrdtRegistrationExt, MemberAddrExt,
-    ACCEPTORS_EXTENSION_TYPE, ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE,
-    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
+    SupportedCrdtsExt, ACCEPTORS_EXTENSION_TYPE, ACCEPTOR_ADD_EXTENSION_TYPE,
+    ACCEPTOR_REMOVE_EXTENSION_TYPE, CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
+    SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
 pub use handshake::{GroupId, Handshake, HandshakeResponse, StreamType};
 pub use message::{EncryptedAppMessage, GroupMessage, MessageId, MessageRequest, MessageResponse};

@@ -11,7 +11,8 @@ use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
-    MEMBER_ADDR_EXTENSION_TYPE,
+    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory,
+    SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
 pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
 
@@ -88,6 +89,8 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
         .extension_type(ACCEPTOR_ADD_EXTENSION_TYPE)
         .extension_type(ACCEPTOR_REMOVE_EXTENSION_TYPE)
         .extension_type(MEMBER_ADDR_EXTENSION_TYPE)
+        .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
+        .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
         .build();
 
     TestClientResult {
@@ -102,6 +105,8 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
 /// This combines a fully configured MLS client with an iroh endpoint,
 /// providing a convenient high-level API for creating and joining groups.
 ///
+/// The client is pre-registered with a `NoCrdtFactory` for the "none" type.
+///
 /// # Arguments
 /// * `name` - A human-readable name for this client (e.g., "alice", "bob")
 /// * `endpoint` - The iroh endpoint for networking
@@ -114,7 +119,10 @@ pub fn test_group_client(
     endpoint: iroh::Endpoint,
 ) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
     let result = test_client(name);
-    GroupClient::new(result.client, result.signer, result.cipher_suite, endpoint)
+    let mut client = GroupClient::new(result.client, result.signer, result.cipher_suite, endpoint);
+    // Register default CRDT factory
+    client.register_crdt_factory(NoCrdtFactory);
+    client
 }
 
 // Re-export for convenience

@@ -97,6 +97,7 @@ pub trait Crdt: Send + Sync {
 ///
 /// Registered with a group to create CRDT instances for new groups or
 /// when joining existing groups.
+#[allow(clippy::wrong_self_convention)]
 pub trait CrdtFactory: Send + Sync {
     /// The CRDT type ID this factory creates.
     ///
@@ -125,7 +126,7 @@ pub trait CrdtFactory: Send + Sync {
 pub struct NoCrdt;
 
 impl Crdt for NoCrdt {
-    fn type_id(&self) -> &str {
+    fn type_id(&self) -> &'static str {
         "none"
     }
 
@@ -150,7 +151,7 @@ impl Crdt for NoCrdt {
 pub struct NoCrdtFactory;
 
 impl CrdtFactory for NoCrdtFactory {
-    fn type_id(&self) -> &str {
+    fn type_id(&self) -> &'static str {
         "none"
     }
 

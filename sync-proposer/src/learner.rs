@@ -337,8 +337,10 @@ where
 
         // Check sender is a valid group member
         if !self.is_member(proposal.member_id) {
-            return Err(Report::new(ValidationError)
-                .attach({ format!("member {:?} not found in roster", proposal.member_id) }));
+            return Err(Report::new(ValidationError).attach(format!(
+                "member {:?} not found in roster",
+                proposal.member_id
+            )));
         }
 
         // All proposals must have signatures

@@ -52,8 +52,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorAdd, AcceptorId, AcceptorRemove, Crdt, CrdtFactory, EncryptedAppMessage, Epoch,
-    GroupId, GroupMessage, GroupProposal, Handshake, MemberId, MessageId, WelcomeBundle,
+    AcceptorAdd, AcceptorId, AcceptorRemove, Crdt, CrdtFactory, CrdtRegistrationExt,
+    EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, MemberId,
+    MessageId, WelcomeBundle,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -128,6 +129,17 @@ enum AcceptorInbound {
     /// Acceptor connection failed or closed
     Disconnected { acceptor_id: AcceptorId },
 }
+
+/// A pending encrypted message waiting for epoch advancement
+struct PendingMessage {
+    /// The encrypted message
+    msg: EncryptedAppMessage,
+    /// Number of processing attempts
+    attempts: u32,
+}
+
+/// Maximum number of times to retry processing a pending message
+const MAX_MESSAGE_ATTEMPTS: u32 = 10;
 
 /// Messages from `GroupActor` to `AcceptorActor`s
 #[derive(Clone)]
@@ -292,7 +304,7 @@ where
     /// * `cipher_suite` - The cipher suite provider
     /// * `connection_manager` - The connection manager for p2p connections
     /// * `acceptors` - Endpoint addresses of acceptors to register with (can be empty)
-    /// * `crdt_factory` - Optional CRDT factory to create the group's CRDT
+    /// * `crdt_factory` - CRDT factory to create the group's CRDT
     ///
     /// # Errors
     /// Returns an error if group creation or acceptor registration fails.
@@ -302,18 +314,29 @@ where
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
         acceptors: &[EndpointAddr],
-        crdt_factory: Option<&dyn CrdtFactory>,
+        crdt_factory: &dyn CrdtFactory,
     ) -> Result<Self, Report<GroupError>>
     where
         CS: Clone,
     {
         use crate::connector::register_group_with_addr;
 
+        let crdt_type_id = crdt_factory.type_id().to_owned();
+
         // Create a new MLS group (blocking I/O via storage)
         let (learner, group_id, group_info_bytes) = blocking(|| {
+            // Include CRDT type in group context extensions
+            let mut group_context_extensions = mls_rs::ExtensionList::default();
+            group_context_extensions
+                .set_from(CrdtRegistrationExt::new(&crdt_type_id))
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach(format!("failed to set CRDT registration extension: {e:?}"))
+                })?;
+
             let group = client
                 .create_group(
-                    mls_rs::ExtensionList::default(),
+                    group_context_extensions,
                     mls_rs::ExtensionList::default(),
                     None,
                 )
@@ -362,8 +385,8 @@ where
             connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
-        // Create CRDT if factory provided
-        let crdt: Option<Box<dyn Crdt>> = crdt_factory.map(|f| f.create());
+        // Create CRDT from factory
+        let crdt = crdt_factory.create();
 
         Ok(Self::spawn_actors(
             learner,
@@ -381,11 +404,11 @@ where
     /// * `signer` - The signing secret key
     /// * `cipher_suite` - The cipher suite provider
     /// * `connection_manager` - The connection manager for p2p connections
-    /// * `welcome_bytes` - The Welcome message bytes (raw MLS welcome or WelcomeBundle)
-    /// * `crdt_factory` - Optional CRDT factory to create the group's CRDT from the welcome snapshot
+    /// * `welcome_bytes` - The Welcome message bytes (raw MLS welcome or `WelcomeBundle`)
+    /// * `crdt_factories` - Map of CRDT type IDs to factories for lookup
     ///
     /// # Errors
-    /// Returns an error if joining fails.
+    /// Returns an error if joining fails or if the CRDT type is not supported.
     #[allow(clippy::unused_async)] // Keep async for API consistency
     pub(crate) async fn join(
         client: &Client<C>,
@@ -393,7 +416,7 @@ where
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
         welcome_bytes: &[u8],
-        crdt_factory: Option<&dyn CrdtFactory>,
+        crdt_factories: &std::collections::HashMap<String, std::sync::Arc<dyn CrdtFactory>>,
     ) -> Result<Self, Report<GroupError>>
     where
         CS: Clone,
@@ -405,7 +428,7 @@ where
             .map_err(|e| Report::new(GroupError).attach(format!("invalid welcome bundle: {e}")))?;
 
         // Join the group (blocking I/O via storage)
-        let (learner, group_id) = blocking(|| {
+        let (learner, group_id, crdt_type_id) = blocking(|| {
             // Parse the MLS Welcome message from the bundle
             let welcome = MlsMessage::from_bytes(&welcome_bundle.mls_welcome).map_err(|e| {
                 Report::new(GroupError).attach(format!("invalid welcome message: {e:?}"))
@@ -431,10 +454,28 @@ where
                 .map(|ext| ext.0)
                 .unwrap_or_default();
 
+            // Read CRDT type from group context extensions
+            let crdt_type_id = group
+                .context()
+                .extensions
+                .get_as::<CrdtRegistrationExt>()
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach(format!("failed to read CRDT registration extension: {e:?}"))
+                })?
+                .map_or_else(|| "none".to_owned(), |ext| ext.type_id);
+
             // Create the learner
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
 
-            Ok::<_, Report<GroupError>>((learner, group_id))
+            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id))
+        })?;
+
+        // Look up the CRDT factory
+        let crdt_factory = crdt_factories.get(&crdt_type_id).ok_or_else(|| {
+            Report::new(GroupError).attach(format!(
+                "CRDT type '{crdt_type_id}' not registered. Register a factory with register_crdt_factory()"
+            ))
         })?;
 
         // Add address hints for all acceptors to the connection manager
@@ -442,21 +483,16 @@ where
             connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
-        // Create CRDT from snapshot if factory provided and snapshot exists
-        let crdt: Option<Box<dyn Crdt>> = match (crdt_factory, welcome_bundle.has_crdt()) {
-            (Some(factory), true) => Some(
-                factory
-                    .from_snapshot(&welcome_bundle.crdt_snapshot)
-                    .map_err(|e| {
-                        Report::new(GroupError)
-                            .attach(format!("failed to create CRDT from snapshot: {e}"))
-                    })?,
-            ),
-            (Some(factory), false) => {
-                // Factory provided but no snapshot - create empty CRDT
-                Some(factory.create())
-            }
-            (None, _) => None,
+        // Create CRDT from snapshot if present, otherwise create empty
+        let crdt = if welcome_bundle.has_crdt() {
+            crdt_factory
+                .from_snapshot(&welcome_bundle.crdt_snapshot)
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach(format!("failed to create CRDT from snapshot: {e}"))
+                })?
+        } else {
+            crdt_factory.create()
         };
 
         Ok(Self::spawn_actors(
@@ -474,7 +510,7 @@ where
         group_id: GroupId,
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
-        crdt: Option<Box<dyn Crdt>>,
+        crdt: Box<dyn Crdt>,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
@@ -801,13 +837,16 @@ where
     seen_messages: HashSet<(MemberId, Epoch, u32)>,
 
     /// Pending encrypted messages for future epochs (buffered until we advance)
-    pending_messages: Vec<EncryptedAppMessage>,
+    pending_messages: Vec<PendingMessage>,
+
+    /// The epoch when we joined the group (messages from earlier epochs cannot be decrypted)
+    join_epoch: Epoch,
 
     /// Active proposal state (waiting for quorum)
     active_proposal: Option<ActiveProposal>,
 
-    /// Optional CRDT for application state synchronization
-    crdt: Option<Box<dyn Crdt>>,
+    /// CRDT for application state synchronization
+    crdt: Box<dyn Crdt>,
 }
 
 /// State for an active proposal waiting for quorum
@@ -864,10 +903,11 @@ where
         app_message_tx: mpsc::Sender<ReceivedAppMessage>,
         event_tx: broadcast::Sender<GroupEvent>,
         cancel_token: CancellationToken,
-        crdt: Option<Box<dyn Crdt>>,
+        crdt: Box<dyn Crdt>,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
         let message_epoch = learner.mls_epoch();
+        let join_epoch = message_epoch; // Remember the epoch we joined at
         let (acceptor_inbound_tx, acceptor_rx) = mpsc::channel(256);
 
         Self {
@@ -890,6 +930,7 @@ where
             message_epoch,
             seen_messages: HashSet::new(),
             pending_messages: Vec::new(),
+            join_epoch,
             active_proposal: None,
             crdt,
         }
@@ -1110,7 +1151,7 @@ where
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         // Capture CRDT snapshot before building commit (snapshot of current state)
-        let crdt_snapshot = self.crdt.as_ref().and_then(|crdt| crdt.snapshot().ok());
+        let crdt_snapshot = self.crdt.snapshot().ok();
 
         // Build the commit
         let result = blocking(|| {
@@ -1886,45 +1927,15 @@ where
         let received = match received {
             Ok(msg) => msg,
             Err(e) => {
-                // Could be from a future epoch - buffer it
-                // For now, just log and skip
-                tracing::debug!(?e, "failed to process message, possibly future epoch");
-                self.pending_messages.push(msg);
+                // Could be from a future epoch - buffer it for later retry
+                tracing::debug!(?e, "failed to process message, buffering for retry");
+                self.pending_messages
+                    .push(PendingMessage { msg, attempts: 1 });
                 return;
             }
         };
 
-        // Extract application data
-        let ReceivedMessage::ApplicationMessage(app_msg) = received else {
-            tracing::debug!("received non-application message on message stream");
-            return;
-        };
-
-        // Extract message identity from authenticated data
-        let index = if app_msg.authenticated_data.len() >= 4 {
-            u32::from_be_bytes(app_msg.authenticated_data[..4].try_into().unwrap_or([0; 4]))
-        } else {
-            0
-        };
-
-        let sender = MemberId(app_msg.sender_index);
-        let epoch = self.learner.mls_epoch();
-
-        // Deduplicate
-        let key = (sender, epoch, index);
-        if self.seen_messages.contains(&key) {
-            return;
-        }
-        self.seen_messages.insert(key);
-
-        let received_msg = ReceivedAppMessage {
-            sender,
-            epoch,
-            index,
-            data: app_msg.data().to_vec(),
-        };
-
-        let _ = self.app_message_tx.try_send(received_msg);
+        self.handle_decrypted_message(received);
     }
 
     /// Apply a proposal to the MLS group state
@@ -2040,13 +2051,96 @@ where
 
     /// Try to process any pending messages that may now be decryptable
     fn try_process_pending_messages(&mut self) {
+        use mls_rs::MlsMessage;
+
         let pending = std::mem::take(&mut self.pending_messages);
-        for msg in pending {
-            // Re-queue via the inbound channel so it goes through normal processing
-            let _ = self
-                .acceptor_inbound_tx
-                .try_send(AcceptorInbound::EncryptedMessage { msg });
+        let current_epoch = self.learner.mls_epoch();
+        let mut still_pending = Vec::new();
+
+        for mut pending_msg in pending {
+            // Check if message has exceeded retry limit
+            if pending_msg.attempts >= MAX_MESSAGE_ATTEMPTS {
+                tracing::debug!(
+                    attempts = pending_msg.attempts,
+                    "dropping message after max retry attempts"
+                );
+                continue;
+            }
+
+            // Try to deserialize and process
+            let Ok(mls_message) = MlsMessage::from_bytes(&pending_msg.msg.ciphertext) else {
+                tracing::debug!("dropping malformed pending message");
+                continue;
+            };
+
+            // Try to process
+            let result = blocking(|| {
+                self.learner
+                    .group_mut()
+                    .process_incoming_message(mls_message)
+            });
+
+            match result {
+                Ok(received) => {
+                    // Successfully processed - handle like normal
+                    self.handle_decrypted_message(received);
+                }
+                Err(e) => {
+                    // Still can't process - check if it's worth retrying
+                    pending_msg.attempts += 1;
+
+                    // Don't retry if we've advanced past this message's likely epoch
+                    // (heuristic: if we're more than 5 epochs ahead and still failing, give up)
+                    if current_epoch.0 > self.join_epoch.0 + 5 && pending_msg.attempts > 3 {
+                        tracing::debug!(
+                            ?e,
+                            current_epoch = current_epoch.0,
+                            join_epoch = self.join_epoch.0,
+                            "dropping old pending message"
+                        );
+                        continue;
+                    }
+
+                    still_pending.push(pending_msg);
+                }
+            }
         }
+
+        self.pending_messages = still_pending;
+    }
+
+    /// Handle a successfully decrypted message
+    fn handle_decrypted_message(&mut self, received: ReceivedMessage) {
+        let ReceivedMessage::ApplicationMessage(app_msg) = received else {
+            tracing::debug!("received non-application message on message stream");
+            return;
+        };
+
+        // Extract message identity from authenticated data
+        let index = if app_msg.authenticated_data.len() >= 4 {
+            u32::from_be_bytes(app_msg.authenticated_data[..4].try_into().unwrap_or([0; 4]))
+        } else {
+            0
+        };
+
+        let sender = MemberId(app_msg.sender_index);
+        let epoch = self.learner.mls_epoch();
+
+        // Deduplicate
+        let key = (sender, epoch, index);
+        if self.seen_messages.contains(&key) {
+            return;
+        }
+        self.seen_messages.insert(key);
+
+        let received_msg = ReceivedAppMessage {
+            sender,
+            epoch,
+            index,
+            data: app_msg.data().to_vec(),
+        };
+
+        let _ = self.app_message_tx.try_send(received_msg);
     }
 }
 

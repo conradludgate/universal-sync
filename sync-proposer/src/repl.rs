@@ -9,12 +9,11 @@ use std::fmt::Write;
 
 use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
-use mls_rs::crypto::SignatureSecretKey;
-use mls_rs::{CipherSuiteProvider, Client, ExtensionList, MlsMessage};
+use mls_rs::{CipherSuiteProvider, MlsMessage};
 use tracing::info;
 use universal_sync_core::{AcceptorId, GroupId};
 
-use crate::connection::ConnectionManager;
+use crate::GroupClient;
 use crate::group::Group;
 
 /// REPL context holding all state
@@ -23,14 +22,8 @@ where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
-    /// MLS client
-    pub client: Client<C>,
-    /// Signing key
-    pub signer: SignatureSecretKey,
-    /// Cipher suite provider
-    pub cipher_suite: CS,
-    /// Connection manager for P2P connections
-    pub connection_manager: ConnectionManager,
+    /// Group client for creating and joining groups
+    pub client: GroupClient<C, CS>,
     /// Currently loaded groups
     pub groups: HashMap<GroupId, Group<C, CS>>,
 }
@@ -141,7 +134,7 @@ where
     fn cmd_key_package(&self) -> Result<String, String> {
         let kp = self
             .client
-            .generate_key_package_message(ExtensionList::default(), ExtensionList::default(), None)
+            .generate_key_package()
             .map_err(|e| format!("Failed to generate key package: {e:?}"))?;
 
         let bytes = kp
@@ -152,16 +145,11 @@ where
     }
 
     async fn cmd_create_group(&mut self) -> Result<String, String> {
-        let group = Group::create(
-            &self.client,
-            self.signer.clone(),
-            self.cipher_suite.clone(),
-            &self.connection_manager,
-            &[],
-            None, // No CRDT
-        )
-        .await
-        .map_err(|e| format!("Failed to create group: {e:?}"))?;
+        let group = self
+            .client
+            .create_group(&[], "none")
+            .await
+            .map_err(|e| format!("Failed to create group: {e:?}"))?;
 
         let group_id = group.group_id();
         let group_id_hex = bs58::encode(group_id.as_bytes()).into_string();
@@ -176,16 +164,11 @@ where
             .into_vec()
             .map_err(|e| format!("Invalid base58: {e}"))?;
 
-        let mut group = Group::join(
-            &self.client,
-            self.signer.clone(),
-            self.cipher_suite.clone(),
-            &self.connection_manager,
-            &welcome_bytes,
-            None, // No CRDT
-        )
-        .await
-        .map_err(|e| format!("Failed to join group: {e:?}"))?;
+        let mut group = self
+            .client
+            .join_group(&welcome_bytes)
+            .await
+            .map_err(|e| format!("Failed to join group: {e:?}"))?;
 
         let group_id = group.group_id();
         let output =

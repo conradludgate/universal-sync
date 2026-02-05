@@ -23,6 +23,9 @@ pub const MEMBER_ADDR_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF798)
 /// Extension type for CRDT registration (group context extension)
 pub const CRDT_REGISTRATION_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF799);
 
+/// Extension type for supported CRDTs list (key package extension)
+pub const SUPPORTED_CRDTS_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF79A);
+
 /// MLS group context extension containing the full list of acceptors
 ///
 /// This extension is set when the group is created and updated whenever
@@ -375,6 +378,78 @@ impl MlsCodecExtension for CrdtRegistrationExt {
     }
 }
 
+/// MLS key package extension listing supported CRDT types.
+///
+/// This extension is included in key packages to advertise which CRDT
+/// implementations the member supports. The group creator should only
+/// add members whose supported CRDTs include the group's CRDT type.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SupportedCrdtsExt {
+    /// List of supported CRDT type identifiers
+    pub type_ids: Vec<String>,
+}
+
+impl SupportedCrdtsExt {
+    /// Create a new supported CRDTs extension
+    #[must_use]
+    pub fn new(type_ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            type_ids: type_ids.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Check if a CRDT type is supported
+    #[must_use]
+    pub fn supports(&self, type_id: &str) -> bool {
+        self.type_ids.iter().any(|id| id == type_id)
+    }
+}
+
+impl MlsSize for SupportedCrdtsExt {
+    fn mls_encoded_len(&self) -> usize {
+        // Length prefix (4 bytes) + encoded data
+        4 + postcard::to_allocvec(&self.type_ids).map_or(0, |v| v.len())
+    }
+}
+
+impl MlsEncode for SupportedCrdtsExt {
+    #[expect(clippy::cast_possible_truncation)]
+    fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+        let bytes = postcard::to_allocvec(&self.type_ids)
+            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
+        let len = bytes.len() as u32;
+        writer.extend_from_slice(&len.to_be_bytes());
+        writer.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl MlsDecode for SupportedCrdtsExt {
+    fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
+        if reader.len() < 4 {
+            return Err(mls_rs_codec::Error::UnexpectedEOF);
+        }
+        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
+        *reader = &reader[4..];
+
+        if reader.len() < len {
+            return Err(mls_rs_codec::Error::UnexpectedEOF);
+        }
+
+        let type_ids: Vec<String> = postcard::from_bytes(&reader[..len])
+            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
+        *reader = &reader[len..];
+
+        Ok(Self { type_ids })
+    }
+}
+
+impl MlsCodecExtension for SupportedCrdtsExt {
+    fn extension_type() -> ExtensionType {
+        SUPPORTED_CRDTS_EXTENSION_TYPE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use iroh::SecretKey;
@@ -453,6 +528,33 @@ mod tests {
         assert!(AcceptorAdd::extension_type().raw_value() >= 0xF000);
         assert!(AcceptorRemove::extension_type().raw_value() >= 0xF000);
         assert!(CrdtRegistrationExt::extension_type().raw_value() >= 0xF000);
+        assert!(SupportedCrdtsExt::extension_type().raw_value() >= 0xF000);
+    }
+
+    #[test]
+    fn test_supported_crdts_roundtrip() {
+        let ext = SupportedCrdtsExt::new(["yjs", "automerge", "none"]);
+
+        let encoded = ext.mls_encode_to_vec().unwrap();
+
+        let decoded = SupportedCrdtsExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(ext, decoded);
+        assert_eq!(decoded.type_ids.len(), 3);
+        assert!(decoded.supports("yjs"));
+        assert!(decoded.supports("automerge"));
+        assert!(decoded.supports("none"));
+        assert!(!decoded.supports("unknown"));
+    }
+
+    #[test]
+    fn test_supported_crdts_empty() {
+        let ext = SupportedCrdtsExt::default();
+        assert!(ext.type_ids.is_empty());
+
+        let encoded = ext.mls_encode_to_vec().unwrap();
+
+        let decoded = SupportedCrdtsExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(ext, decoded);
     }
 
     #[test]
