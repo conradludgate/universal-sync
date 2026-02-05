@@ -69,6 +69,7 @@ where
     /// Create a new synced document from a group and yrs document.
     ///
     /// The document uses a text field named "content" by default.
+    #[must_use]
     pub fn new(group: Group<C, CS>, doc: Doc) -> Self {
         Self {
             doc: Arc::new(Mutex::new(doc)),
@@ -175,11 +176,13 @@ where
     }
 
     /// Get a reference to the underlying group.
+    #[must_use]
     pub fn group(&self) -> &Group<C, CS> {
         &self.group
     }
 
     /// Get a clone of the document Arc for observation.
+    #[must_use]
     pub fn doc_handle(&self) -> Arc<Mutex<Doc>> {
         Arc::clone(&self.doc)
     }

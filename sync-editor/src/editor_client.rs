@@ -56,7 +56,7 @@ fn derive_yrs_client_id(signing_key: &[u8]) -> u64 {
 pub fn create_editor_client(
     name: &str,
     endpoint: Endpoint,
-) -> EditorClient<impl MlsConfig + Clone, impl CipherSuiteProvider + Clone> {
+) -> EditorClient<impl MlsConfig, impl CipherSuiteProvider + Clone> {
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
         .cipher_suite_provider(DEFAULT_CIPHER_SUITE)
@@ -200,6 +200,7 @@ where
 /// Get a document from a group.
 ///
 /// This is a helper for getting a `SyncedDocument` from an existing `Group`.
+#[must_use]
 pub fn document_from_group<C, CS>(
     group: universal_sync_proposer::Group<C, CS>,
     signing_public_key: &[u8],

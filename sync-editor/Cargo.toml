@@ -12,6 +12,11 @@ path = "src/lib.rs"
 name = "sync-editor"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable Tauri integration (requires frontend setup)
+tauri = ["dep:tauri", "dep:tauri-plugin-shell"]
+
 [dependencies]
 universal-sync-core = { path = "../sync-core" }
 universal-sync-proposer = { path = "../sync-proposer" }
@@ -31,8 +36,9 @@ sha2.workspace = true
 error-stack.workspace = true
 bs58.workspace = true
 
-# Tauri dependencies (to be enabled later)
-# tauri = { version = "2", features = [] }
+# Tauri dependencies (optional, enabled with "tauri" feature)
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
