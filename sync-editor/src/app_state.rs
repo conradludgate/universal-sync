@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::CipherSuiteProvider;
 use tokio::sync::RwLock;
@@ -27,8 +26,6 @@ where
     pub client: EditorClient<C, CS>,
     /// Active documents by group ID
     pub documents: HashMap<GroupId, SyncedDocument<C, CS>>,
-    /// Known acceptor addresses (name -> address)
-    pub acceptors: HashMap<String, EndpointAddr>,
 }
 
 impl<C, CS> AppState<C, CS>
@@ -42,19 +39,7 @@ where
         Self {
             client,
             documents: HashMap::new(),
-            acceptors: HashMap::new(),
         }
-    }
-
-    /// Add an acceptor address.
-    pub fn add_acceptor(&mut self, name: String, addr: EndpointAddr) {
-        self.acceptors.insert(name, addr);
-    }
-
-    /// Get all acceptor addresses.
-    #[must_use]
-    pub fn acceptor_addrs(&self) -> Vec<EndpointAddr> {
-        self.acceptors.values().cloned().collect()
     }
 
     /// Get a document by group ID.

@@ -47,8 +47,7 @@ fn main() {
             tauri_app::apply_delta,
             tauri_app::get_key_package,
             tauri_app::add_member,
-            tauri_app::add_global_acceptor,
-            tauri_app::add_doc_acceptor,
+            tauri_app::add_acceptor,
             tauri_app::list_documents,
         ])
         .setup(|_app| {

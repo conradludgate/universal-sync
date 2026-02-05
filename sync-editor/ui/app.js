@@ -27,8 +27,7 @@ const state = {
     currentDocument: null,
     isConnected: false,
     pendingChanges: [],
-    globalAcceptors: [], // { name, addr } - used when creating new documents
-    docAcceptors: [], // { name, addr } - acceptors added to current document
+    docAcceptors: [], // { name, addr } - acceptors for current document
 };
 
 // DOM Elements
@@ -63,18 +62,7 @@ const elements = {
     btnInviteCancel: document.getElementById('btn-invite-cancel'),
     inviteModalClose: document.getElementById('invite-modal-close'),
     
-    // Global acceptor modal (for new documents)
-    btnGlobalAcceptors: document.getElementById('btn-global-acceptors'),
-    globalAcceptorModal: document.getElementById('global-acceptor-modal'),
-    globalAcceptorList: document.getElementById('global-acceptor-list'),
-    globalAcceptorEmpty: document.getElementById('global-acceptor-empty'),
-    globalAcceptorName: document.getElementById('global-acceptor-name'),
-    globalAcceptorAddr: document.getElementById('global-acceptor-addr'),
-    btnGlobalAcceptorAdd: document.getElementById('btn-global-acceptor-add'),
-    btnGlobalAcceptorDone: document.getElementById('btn-global-acceptor-done'),
-    globalAcceptorModalClose: document.getElementById('global-acceptor-modal-close'),
-    
-    // Document acceptor modal (add to existing doc)
+    // Document acceptor modal
     btnDocAcceptors: document.getElementById('btn-doc-acceptors'),
     acceptorModal: document.getElementById('acceptor-modal'),
     acceptorList: document.getElementById('acceptor-list'),
@@ -160,60 +148,6 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// --- Global Acceptors (for new documents) ---
-
-function renderGlobalAcceptorList() {
-    const items = elements.globalAcceptorList.querySelectorAll('.acceptor-item');
-    items.forEach(item => item.remove());
-    
-    if (state.globalAcceptors.length === 0) {
-        elements.globalAcceptorEmpty.classList.remove('hidden');
-    } else {
-        elements.globalAcceptorEmpty.classList.add('hidden');
-        
-        state.globalAcceptors.forEach((acceptor, index) => {
-            const item = document.createElement('div');
-            item.className = 'acceptor-item';
-            item.innerHTML = `
-                <div class="acceptor-item-info">
-                    <span class="acceptor-item-name">${escapeHtml(acceptor.name)}</span>
-                    <span class="acceptor-item-addr" title="${escapeHtml(acceptor.addr)}">${acceptor.addr.slice(0, 32)}...</span>
-                </div>
-                <button class="acceptor-item-remove" data-index="${index}" title="Remove">✕</button>
-            `;
-            elements.globalAcceptorList.appendChild(item);
-        });
-        
-        elements.globalAcceptorList.querySelectorAll('.acceptor-item-remove').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const index = parseInt(e.target.dataset.index, 10);
-                removeGlobalAcceptor(index);
-            });
-        });
-    }
-}
-
-async function addGlobalAcceptor(name, addr) {
-    try {
-        await invoke('add_global_acceptor', { name, addrB58: addr });
-        state.globalAcceptors.push({ name, addr });
-        renderGlobalAcceptorList();
-        showToast(`Added acceptor: ${name}`, 'success');
-    } catch (error) {
-        console.error('Failed to add acceptor:', error);
-        showToast(`Failed to add acceptor: ${error}`, 'error');
-    }
-}
-
-function removeGlobalAcceptor(index) {
-    const acceptor = state.globalAcceptors[index];
-    state.globalAcceptors.splice(index, 1);
-    renderGlobalAcceptorList();
-    showToast(`Removed acceptor: ${acceptor.name}`, 'info');
-}
-
-// --- Document Acceptors (for existing documents) ---
-
 function renderDocAcceptorList() {
     const items = elements.acceptorList.querySelectorAll('.acceptor-item');
     items.forEach(item => item.remove());
@@ -244,7 +178,7 @@ async function addDocAcceptor(name, addr) {
     }
     
     try {
-        await invoke('add_doc_acceptor', { 
+        await invoke('add_acceptor', { 
             groupId: state.currentDocument.group_id,
             addrB58: addr 
         });
@@ -569,36 +503,7 @@ function setupEventListeners() {
     // Editor input
     elements.editor.addEventListener('input', handleEditorInput);
     
-    // Global acceptor modal (for new documents)
-    elements.btnGlobalAcceptors.addEventListener('click', () => {
-        renderGlobalAcceptorList();
-        showModal(elements.globalAcceptorModal);
-    });
-    
-    const closeGlobalAcceptorModal = () => hideModal(elements.globalAcceptorModal);
-    elements.btnGlobalAcceptorDone.addEventListener('click', closeGlobalAcceptorModal);
-    elements.globalAcceptorModalClose.addEventListener('click', closeGlobalAcceptorModal);
-    elements.globalAcceptorModal.querySelector('.modal-backdrop').addEventListener('click', closeGlobalAcceptorModal);
-    
-    elements.btnGlobalAcceptorAdd.addEventListener('click', async () => {
-        const name = elements.globalAcceptorName.value.trim();
-        const addr = elements.globalAcceptorAddr.value.trim();
-        
-        if (!name) {
-            showToast('Please enter a name for the acceptor', 'error');
-            return;
-        }
-        if (!addr) {
-            showToast('Please enter the acceptor address', 'error');
-            return;
-        }
-        
-        await addGlobalAcceptor(name, addr);
-        elements.globalAcceptorName.value = '';
-        elements.globalAcceptorAddr.value = '';
-    });
-
-    // Document acceptor modal (for existing documents)
+    // Document acceptor modal
     elements.btnDocAcceptors.addEventListener('click', () => {
         if (!state.currentDocument) {
             showToast('No document open', 'error');
@@ -684,13 +589,14 @@ async function setupTauriEvents() {
 // ============================================================================
 
 async function init() {
-    console.log('Sync Editor initializing...');
-    console.log('Running in Tauri:', isTauri);
-    
     setupEventListeners();
-    await setupTauriEvents();
     
-    console.log('Sync Editor ready!');
+    try {
+        await setupTauriEvents();
+    } catch (e) {
+        // Non-fatal - real-time sync events won't work
+        console.warn('Tauri events not available:', e.message || e);
+    }
 }
 
 // Start the app

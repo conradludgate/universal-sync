@@ -17,9 +17,6 @@
                 <span class="logo-text">sync<span class="logo-accent">editor</span></span>
             </div>
             <div class="header-actions">
-                <button id="btn-global-acceptors" class="btn btn-secondary" title="Configure acceptors for new documents">
-                    ⚙️ Acceptors
-                </button>
                 <button id="btn-new-doc" class="btn btn-primary">
                     <span class="btn-icon">+</span>
                     New Document
@@ -154,51 +151,7 @@
             </div>
         </div>
 
-        <!-- Global Acceptor Modal (for new documents) -->
-        <div id="global-acceptor-modal" class="modal hidden">
-            <div class="modal-backdrop"></div>
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3>Default Acceptors</h3>
-                    <button class="modal-close" id="global-acceptor-modal-close">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <p class="modal-intro">Configure acceptor servers used when creating new documents.</p>
-                    
-                    <div class="acceptor-list" id="global-acceptor-list">
-                        <div class="acceptor-empty" id="global-acceptor-empty">No acceptors configured</div>
-                    </div>
-                    
-                    <div class="acceptor-add-form">
-                        <label>
-                            <span>Add Acceptor</span>
-                        </label>
-                        <div class="acceptor-input-row">
-                            <input 
-                                type="text" 
-                                id="global-acceptor-name" 
-                                class="input-text" 
-                                placeholder="Name (e.g. main)"
-                            />
-                            <textarea 
-                                id="global-acceptor-addr" 
-                                class="input-textarea" 
-                                placeholder="Paste acceptor address..."
-                                rows="2"
-                            ></textarea>
-                            <button id="btn-global-acceptor-add" class="btn btn-primary btn-sm">
-                                Add
-                            </button>
-                        </div>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button id="btn-global-acceptor-done" class="btn btn-primary">Done</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Document Acceptor Modal (add to existing doc) -->
+        <!-- Document Acceptor Modal -->
         <div id="acceptor-modal" class="modal hidden">
             <div class="modal-backdrop"></div>
             <div class="modal-content">
