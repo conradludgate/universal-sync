@@ -12,12 +12,14 @@
 
 pub mod acceptor;
 pub mod connector;
+pub mod epoch_roster;
 pub mod registry;
 pub mod server;
 pub mod state_store;
 
 pub use acceptor::{AcceptorError, GroupAcceptor};
 pub use connector::{ConnectorError, PAXOS_ALPN};
+pub use epoch_roster::EpochRoster;
 pub use registry::AcceptorRegistry;
 pub use server::{GroupRegistry, IrohAcceptorConnection, accept_connection};
 pub use state_store::{FjallStateStore, GroupStateStore, SharedFjallStateStore};

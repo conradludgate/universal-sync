@@ -124,6 +124,13 @@ where
 
     /// Set of all known acceptors (for validating sync proposals)
     acceptors: BTreeSet<AcceptorId>,
+
+    /// Optional state store for epoch roster lookups
+    ///
+    /// When set, this allows looking up member public keys from historical epochs
+    /// instead of just the current roster. This is needed because member indices
+    /// can change across epochs (e.g., when members are removed).
+    state_store: Option<crate::state_store::GroupStateStore>,
 }
 
 impl<C, CS> GroupAcceptor<C, CS>
@@ -149,7 +156,15 @@ where
             cipher_suite,
             secret_key,
             acceptors: acceptors.into_iter().collect(),
+            state_store: None,
         }
+    }
+
+    /// Set the state store for epoch roster lookups
+    #[must_use]
+    pub fn with_state_store(mut self, state_store: crate::state_store::GroupStateStore) -> Self {
+        self.state_store = Some(state_store);
+        self
     }
 
     /// Get this acceptor's own ID (derived from secret key)
@@ -167,13 +182,40 @@ where
         &self.external_group
     }
 
-    /// Get a member's public signing key from the roster
+    /// Get a member's public signing key from the current roster
     fn get_member_public_key(&self, member_id: MemberId) -> Option<SignaturePublicKey> {
         self.external_group
             .roster()
             .member_with_index(member_id.0)
             .map(|m| m.signing_identity.signature_key)
             .ok()
+    }
+
+    /// Get a member's public signing key for a specific epoch
+    ///
+    /// First tries to look up from stored epoch rosters (if state store is set),
+    /// then falls back to the current roster if the epoch matches or no roster is found.
+    fn get_member_public_key_for_epoch(
+        &self,
+        member_id: MemberId,
+        epoch: Epoch,
+    ) -> Option<SignaturePublicKey> {
+        // If we have a state store, try to look up from epoch rosters
+        if let Some(ref store) = self.state_store
+            && let Some(roster) = store.get_epoch_roster_at_or_before(epoch)
+            && let Some(key_bytes) = roster.get_member_key(member_id)
+        {
+            return Some(SignaturePublicKey::new_slice(key_bytes));
+        }
+
+        // Fall back to current roster if epoch matches current or no epoch roster found
+        let current_epoch = Epoch(self.external_group.group_context().epoch);
+        if epoch == current_epoch {
+            return self.get_member_public_key(member_id);
+        }
+
+        // No way to validate this proposal - member may have been removed
+        None
     }
 
     /// Check if an acceptor ID is in the known set
@@ -289,12 +331,19 @@ where
         }
 
         // Regular proposals from MLS group members
+        // Look up the public key for the epoch the proposal was created in
         let public_key = self
-            .get_member_public_key(proposal.member_id)
+            .get_member_public_key_for_epoch(proposal.member_id, proposal.epoch)
             .ok_or_else(|| {
-                tracing::debug!("proposal member not found in roster");
-                Report::new(ValidationError)
-                    .attach({ format!("member {:?} not found in roster", proposal.member_id) })
+                tracing::debug!(
+                    member_id = ?proposal.member_id,
+                    epoch = ?proposal.epoch,
+                    "proposal member not found in roster for epoch"
+                );
+                Report::new(ValidationError).attach(format!(
+                    "member {:?} not found in roster for epoch {:?}",
+                    proposal.member_id, proposal.epoch
+                ))
             })?;
 
         let data = proposal.unsigned().to_bytes();
@@ -331,13 +380,14 @@ where
             .external_group
             .process_incoming_message(message.mls_message)?;
 
-        // Log what we processed
+        // Log what we processed and store epoch roster for commits
         match result {
             ExternalReceivedMessage::Commit(_) => {
-                tracing::debug!(
-                    epoch = self.external_group.group_context().epoch,
-                    "learned commit"
-                );
+                let new_epoch = Epoch(self.external_group.group_context().epoch);
+                tracing::debug!(epoch = ?new_epoch, "learned commit");
+
+                // Store the epoch roster for future signature validation
+                self.store_current_epoch_roster(new_epoch);
             }
             ExternalReceivedMessage::Proposal(_) => {
                 tracing::debug!("learned proposal");
@@ -372,4 +422,39 @@ where
     // This acceptor validates proposals from MLS group members and
     // stores accepted values, but only applies them when learning
     // confirms that consensus was reached.
+}
+
+// Private helper methods
+impl<C, CS> GroupAcceptor<C, CS>
+where
+    C: ExternalMlsConfig + Clone,
+    CS: CipherSuiteProvider,
+{
+    /// Store the current roster as an epoch snapshot
+    fn store_current_epoch_roster(&self, epoch: Epoch) {
+        if let Some(ref store) = self.state_store {
+            use crate::epoch_roster::EpochRoster;
+
+            // Collect member public keys from the current roster
+            let members: Vec<_> = self
+                .external_group
+                .roster()
+                .members_iter()
+                .map(|m| {
+                    (
+                        MemberId(m.index),
+                        m.signing_identity.signature_key.as_bytes().to_vec(),
+                    )
+                })
+                .collect();
+
+            let roster = EpochRoster::new(epoch, members);
+
+            if let Err(e) = store.store_epoch_roster(&roster) {
+                tracing::warn!(?e, ?epoch, "failed to store epoch roster");
+            } else {
+                tracing::debug!(?epoch, "stored epoch roster");
+            }
+        }
+    }
 }

@@ -158,9 +158,12 @@ where
         let group_info_bytes = self.state_store.get_group_info(group_id)?;
 
         // Recreate the acceptor from stored GroupInfo
-        let mut acceptor = self.create_acceptor_from_bytes(&group_info_bytes).ok()?;
+        let acceptor = self.create_acceptor_from_bytes(&group_info_bytes).ok()?;
 
         let state = self.state_store.for_group(*group_id);
+
+        // Attach state store for epoch roster lookups during validation
+        let mut acceptor = acceptor.with_state_store(state.clone());
 
         // Replay all accepted messages to bring the acceptor up to date
         // This is necessary because the GroupInfo we stored is from epoch 0,

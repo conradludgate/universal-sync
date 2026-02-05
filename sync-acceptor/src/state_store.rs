@@ -18,6 +18,8 @@ use universal_sync_core::{EncryptedAppMessage, Epoch, GroupId, GroupMessage, Gro
 use universal_sync_paxos::acceptor::RoundState;
 use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
 
+use crate::epoch_roster::EpochRoster;
+
 /// Type alias for the broadcast sender map
 type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
 
@@ -34,6 +36,7 @@ type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal
 /// - `groups`: `group_id` -> `GroupInfo` bytes (for registry persistence)
 /// - `messages`: (`group_id`, `arrival_seq`) -> `EncryptedAppMessage`
 /// - `message_seq`: `group_id` -> next sequence number
+/// - `epoch_rosters`: (`group_id`, epoch) -> `EpochRoster` (for signature validation)
 pub struct FjallStateStore {
     /// The fjall database
     db: Database,
@@ -47,6 +50,8 @@ pub struct FjallStateStore {
     messages: Keyspace,
     /// Keyspace for per-group sequence counters: `group_id` -> next seq
     message_seq: Keyspace,
+    /// Keyspace for epoch rosters: (`group_id`, epoch) -> `EpochRoster`
+    epoch_rosters: Keyspace,
     /// Per-group broadcast channels for live subscriptions (proposals)
     broadcasts: GroupBroadcasts,
     /// Per-group broadcast channels for application messages
@@ -79,6 +84,7 @@ impl FjallStateStore {
         let groups = db.keyspace("groups", KeyspaceCreateOptions::default)?;
         let messages = db.keyspace("messages", KeyspaceCreateOptions::default)?;
         let message_seq = db.keyspace("message_seq", KeyspaceCreateOptions::default)?;
+        let epoch_rosters = db.keyspace("epoch_rosters", KeyspaceCreateOptions::default)?;
 
         Ok(Self {
             db,
@@ -87,6 +93,7 @@ impl FjallStateStore {
             groups,
             messages,
             message_seq,
+            epoch_rosters,
             broadcasts: RwLock::new(HashMap::new()),
             message_broadcasts: RwLock::new(HashMap::new()),
         })
@@ -449,6 +456,57 @@ impl FjallStateStore {
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
+
+    // ========== Epoch Roster Methods ==========
+
+    /// Store an epoch roster snapshot
+    fn store_epoch_roster_sync(
+        &self,
+        group_id: &GroupId,
+        roster: &EpochRoster,
+    ) -> Result<(), fjall::Error> {
+        let key = Self::build_key(group_id, roster.epoch);
+        self.epoch_rosters.insert(key, roster.to_bytes())?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    /// Get an epoch roster snapshot
+    fn get_epoch_roster_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
+        let key = Self::build_key(group_id, epoch);
+        self.epoch_rosters
+            .get(key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| EpochRoster::from_bytes(&bytes))
+    }
+
+    /// Get the closest epoch roster at or before the given epoch
+    ///
+    /// This is useful when we don't have a snapshot for the exact epoch
+    /// but need to validate against the closest prior state.
+    fn get_epoch_roster_at_or_before_sync(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+    ) -> Option<EpochRoster> {
+        let prefix = Self::build_group_prefix(group_id);
+        let target_key = Self::build_key(group_id, epoch);
+
+        // Scan backwards from the target epoch
+        for guard in self
+            .epoch_rosters
+            .range(prefix.as_slice()..=target_key.as_slice())
+            .rev()
+        {
+            if let Ok((_, value)) = guard.into_inner()
+                && let Some(roster) = EpochRoster::from_bytes(&value)
+            {
+                return Some(roster);
+            }
+        }
+        None
+    }
 }
 
 /// Wrapper to make `FjallStateStore` shareable across groups
@@ -544,6 +602,37 @@ impl SharedFjallStateStore {
     ) -> broadcast::Receiver<EncryptedAppMessage> {
         self.inner.subscribe_messages(group_id)
     }
+
+    // ========== Epoch Roster Methods ==========
+
+    /// Store an epoch roster snapshot
+    ///
+    /// # Errors
+    /// Returns an error if persisting to the database fails.
+    pub fn store_epoch_roster(
+        &self,
+        group_id: &GroupId,
+        roster: &EpochRoster,
+    ) -> Result<(), fjall::Error> {
+        self.inner.store_epoch_roster_sync(group_id, roster)
+    }
+
+    /// Get an epoch roster snapshot for a specific epoch
+    #[must_use]
+    pub fn get_epoch_roster(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
+        self.inner.get_epoch_roster_sync(group_id, epoch)
+    }
+
+    /// Get the closest epoch roster at or before the given epoch
+    #[must_use]
+    pub fn get_epoch_roster_at_or_before(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+    ) -> Option<EpochRoster> {
+        self.inner
+            .get_epoch_roster_at_or_before_sync(group_id, epoch)
+    }
 }
 
 /// Per-group view of the state store
@@ -570,6 +659,27 @@ impl GroupStateStore {
     pub fn get_accepted_from(&self, from_epoch: Epoch) -> Vec<(GroupProposal, GroupMessage)> {
         self.inner
             .get_accepted_from_sync(&self.group_id, from_epoch)
+    }
+
+    /// Store an epoch roster snapshot for this group
+    ///
+    /// # Errors
+    /// Returns an error if persisting to the database fails.
+    pub fn store_epoch_roster(&self, roster: &EpochRoster) -> Result<(), fjall::Error> {
+        self.inner.store_epoch_roster_sync(&self.group_id, roster)
+    }
+
+    /// Get an epoch roster snapshot for a specific epoch
+    #[must_use]
+    pub fn get_epoch_roster(&self, epoch: Epoch) -> Option<EpochRoster> {
+        self.inner.get_epoch_roster_sync(&self.group_id, epoch)
+    }
+
+    /// Get the closest epoch roster at or before the given epoch
+    #[must_use]
+    pub fn get_epoch_roster_at_or_before(&self, epoch: Epoch) -> Option<EpochRoster> {
+        self.inner
+            .get_epoch_roster_at_or_before_sync(&self.group_id, epoch)
     }
 }
 
