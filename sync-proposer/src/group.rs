@@ -1284,6 +1284,11 @@ where
         data: &[u8],
         reply: oneshot::Sender<Result<EncryptedAppMessage, Report<GroupError>>>,
     ) {
+        // Update the internal CRDT to keep it in sync for snapshots
+        if let Err(e) = self.crdt.merge(data) {
+            tracing::warn!(?e, "failed to merge local update into CRDT snapshot");
+        }
+
         // Get current epoch and check if we need to reset the message counter
         let current_epoch = self.learner.mls_epoch();
         if current_epoch != self.message_epoch {
@@ -2148,11 +2153,18 @@ where
         }
         self.seen_messages.insert(key);
 
+        let data = app_msg.data().to_vec();
+
+        // Update the internal CRDT to keep it in sync for snapshots
+        if let Err(e) = self.crdt.merge(&data) {
+            tracing::warn!(?e, "failed to merge remote update into CRDT snapshot");
+        }
+
         let received_msg = ReceivedAppMessage {
             sender,
             epoch,
             index,
-            data: app_msg.data().to_vec(),
+            data,
         };
 
         let _ = self.app_message_tx.try_send(received_msg);

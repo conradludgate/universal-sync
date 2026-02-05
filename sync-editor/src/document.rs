@@ -144,7 +144,12 @@ where
 
         // Send the update to the group
         let mut group = self.group.lock().await;
-        tracing::debug!(update_len = update.len(), "sending insert update to group");
+        tracing::debug!(
+            update_len = update.len(),
+            position = position,
+            inserted_text = %content,
+            "sending insert update to group"
+        );
         group.send_message(&update).await?;
 
         Ok(())
@@ -308,6 +313,8 @@ where
                             tracing::debug!(
                                 before_len = before_text.len(),
                                 after_len = text.len(),
+                                before_text = %before_text,
+                                after_text = %text,
                                 "sync loop: applied update"
                             );
 
