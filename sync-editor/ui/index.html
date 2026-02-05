@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sync Editor</title>
+    <link rel="stylesheet" href="styles/main.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">⚡</span>
+                <span class="logo-text">sync<span class="logo-accent">editor</span></span>
+            </div>
+            <div class="header-actions">
+                <button id="btn-new-doc" class="btn btn-primary">
+                    <span class="btn-icon">+</span>
+                    New Document
+                </button>
+                <button id="btn-join-doc" class="btn btn-secondary">
+                    Join
+                </button>
+            </div>
+        </header>
+
+        <main class="main">
+            <!-- Empty state -->
+            <div id="empty-state" class="empty-state">
+                <div class="empty-state-content">
+                    <div class="empty-state-icon">📝</div>
+                    <h2>No document open</h2>
+                    <p>Create a new document or join an existing one to start collaborating.</p>
+                    <div class="empty-state-actions">
+                        <button id="btn-new-doc-empty" class="btn btn-primary btn-lg">
+                            Create New Document
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Editor (hidden by default) -->
+            <div id="editor-container" class="editor-container hidden">
+                <div class="editor-toolbar">
+                    <div class="doc-info">
+                        <span class="doc-id" id="doc-id">Document ID</span>
+                        <button id="btn-copy-id" class="btn btn-icon" title="Copy document ID">
+                            📋
+                        </button>
+                    </div>
+                    <div class="collaborators" id="collaborators">
+                        <div class="collaborator" style="--color: #ff6b6b" title="You">Y</div>
+                    </div>
+                    <div class="sync-status" id="sync-status">
+                        <span class="sync-indicator synced"></span>
+                        Synced
+                    </div>
+                </div>
+                <div class="editor-wrapper">
+                    <textarea 
+                        id="editor" 
+                        class="editor" 
+                        placeholder="Start typing..."
+                        spellcheck="false"
+                    ></textarea>
+                    <div class="editor-overlay" id="editor-overlay">
+                        <div class="cursor remote" id="remote-cursor" style="display: none;">
+                            <div class="cursor-caret"></div>
+                            <div class="cursor-label">Guest</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Join Modal -->
+        <div id="join-modal" class="modal hidden">
+            <div class="modal-backdrop"></div>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Join Document</h3>
+                    <button class="modal-close" id="join-modal-close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <label for="join-welcome">
+                        <span>Welcome Message</span>
+                        <small>Paste the welcome message from the document owner</small>
+                    </label>
+                    <textarea 
+                        id="join-welcome" 
+                        class="input-textarea" 
+                        placeholder="Paste welcome message here..."
+                        rows="4"
+                    ></textarea>
+                </div>
+                <div class="modal-footer">
+                    <button id="btn-join-cancel" class="btn btn-secondary">Cancel</button>
+                    <button id="btn-join-confirm" class="btn btn-primary">Join</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Invite Modal -->
+        <div id="invite-modal" class="modal hidden">
+            <div class="modal-backdrop"></div>
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Invite Collaborator</h3>
+                    <button class="modal-close" id="invite-modal-close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <label for="invite-kp">
+                        <span>Key Package</span>
+                        <small>Paste the collaborator's key package</small>
+                    </label>
+                    <textarea 
+                        id="invite-kp" 
+                        class="input-textarea" 
+                        placeholder="Paste key package here..."
+                        rows="4"
+                    ></textarea>
+                </div>
+                <div class="modal-footer">
+                    <button id="btn-invite-cancel" class="btn btn-secondary">Cancel</button>
+                    <button id="btn-invite-confirm" class="btn btn-primary">Add Member</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast notifications -->
+        <div id="toast-container" class="toast-container"></div>
+    </div>
+
+    <script src="app.js" type="module"></script>
+</body>
+</html>
