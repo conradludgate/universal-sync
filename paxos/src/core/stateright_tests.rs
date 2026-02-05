@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use itertools::Itertools;
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Model};
 
@@ -385,6 +386,101 @@ fn paxos_model_with_config(
         }
         true
     });
+
+    // PromiseIntegrity: An acceptor's promise is always >= any accepted proposal
+    // (Mirrors TLA+ invariant at lines 261-264)
+    model = model.property(
+        stateright::Expectation::Always,
+        "PromiseIntegrity",
+        |_, state| {
+            for s in &state.actor_states {
+                if let PaxosActorState::Acceptor(acc) = s.as_ref() {
+                    for (round, (acc_prop, _)) in &acc.accepted {
+                        if let Some(promised) = acc.promised.get(round) {
+                            if promised < acc_prop {
+                                return false; // Promise should be >= accepted
+                            }
+                        } else {
+                            // Accepted without promise is a violation
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        },
+    );
+
+    // Consistency: If a QUORUM all accepted (p1, v1) and another QUORUM all accepted (p2, v2)
+    // for the same round with p2 > p1, then v1 == v2
+    // (Mirrors TLA+ invariant at lines 250-258)
+    //
+    // Note: This is different from checking individual acceptors! Individual acceptors
+    // can have different (proposal, value) pairs as long as no conflicting quorums exist.
+    model = model.property(
+        stateright::Expectation::Always,
+        "Consistency",
+        |_cfg, state| {
+            // Collect acceptor states
+            let acceptors: Vec<&AcceptorState> = state
+                .actor_states
+                .iter()
+                .filter_map(|s| {
+                    if let PaxosActorState::Acceptor(acc) = s.as_ref() {
+                        Some(acc)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let n = acceptors.len();
+            let quorum_size = n / 2 + 1;
+
+            // Generate all possible quorums
+            let quorums: Vec<Vec<usize>> = (0..n).combinations(quorum_size).collect();
+
+            // For each round that has any accepted values
+            let mut rounds: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for acc in &acceptors {
+                for round in acc.accepted.keys() {
+                    rounds.insert(*round);
+                }
+            }
+
+            for round in rounds {
+                // Find (proposal, value) pairs where entire quorum accepted that exact pair
+                let mut quorum_accepted: Vec<(ProposalKey, Value)> = Vec::new();
+
+                for quorum in &quorums {
+                    // Check if all acceptors in this quorum accepted the same (proposal, value)
+                    let accepted_in_quorum: Vec<_> = quorum
+                        .iter()
+                        .map(|&i| acceptors[i].accepted.get(&round))
+                        .collect();
+
+                    // All must have accepted something
+                    if accepted_in_quorum.iter().all(Option::is_some) {
+                        let first = accepted_in_quorum[0].unwrap();
+                        // All must match
+                        if accepted_in_quorum.iter().all(|a| a.unwrap() == first) {
+                            quorum_accepted.push(*first);
+                        }
+                    }
+                }
+
+                // Check consistency: if p2 > p1, values must match
+                for (p1, v1) in &quorum_accepted {
+                    for (p2, v2) in &quorum_accepted {
+                        if p2 > p1 && v1 != v2 {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        },
+    );
 
     model
 }

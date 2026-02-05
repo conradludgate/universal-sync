@@ -18,6 +18,7 @@ pub(crate) mod acceptor;
 pub(crate) mod proposer;
 pub(crate) mod types;
 
+pub use acceptor::decision;
 pub use acceptor::AcceptorCore;
 pub use proposer::{AcceptPhaseResult, PreparePhaseResult, ProposerCore};
 pub use types::{AcceptorRequest, AcceptorResponse, ProposalKey};

@@ -4706,6 +4706,7 @@ dependencies = [
  "bytes",
  "error-stack",
  "futures",
+ "itertools",
  "num_cpus",
  "pin-project-lite",
  "postcard",

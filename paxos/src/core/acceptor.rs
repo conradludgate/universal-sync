@@ -1,10 +1,68 @@
 //! Pure acceptor state machine - no I/O, no async, no synchronization
 //!
 //! This module contains the core state transition logic for a Paxos acceptor.
+//! The decision logic matches the TLA+ specification in `spec/MultiPaxos.tla`.
 
 use std::collections::BTreeMap;
 
 use super::types::{AcceptorRequest, AcceptorResponse};
+
+/// Pure decision functions for Paxos acceptor logic.
+///
+/// These functions encode the TLA+ specification and can be used by both
+/// in-memory (`AcceptorCore`) and persistent (`AcceptorStateStore`) implementations.
+///
+/// From TLA+ spec:
+/// - **Promise (Phase 1b)**: Succeeds if `proposal >= promised` AND `proposal >= accepted`
+/// - **Accept (Phase 2b)**: Succeeds if `promised == proposal` (exact match) AND `proposal >= accepted`
+pub mod decision {
+    /// Check if a Prepare request should be accepted.
+    ///
+    /// From TLA+ `Promise(a, p)` (lines 127-133):
+    /// ```text
+    /// /\ ProposalGE(p, promised[a][r])
+    /// /\ ProposalGE(p, AcceptedProposal(a, r))
+    /// ```
+    ///
+    /// Returns `true` if the prepare should succeed (proposal is not dominated).
+    #[must_use]
+    pub fn should_promise<P: Ord>(
+        proposal: &P,
+        current_promised: Option<&P>,
+        current_accepted: Option<&P>,
+    ) -> bool {
+        // Reject if a strictly higher proposal was already promised
+        let dominated_by_promise = current_promised.is_some_and(|p| p > proposal);
+        // Reject if a strictly higher proposal was already accepted
+        let dominated_by_accept = current_accepted.is_some_and(|p| p > proposal);
+
+        !dominated_by_promise && !dominated_by_accept
+    }
+
+    /// Check if an Accept request should be accepted.
+    ///
+    /// From TLA+ `Accept(a, p, v)` (lines 143-162):
+    /// ```text
+    /// /\ promised[a][r] = p                    -- exact match required
+    /// /\ ProposalGE(p, AcceptedProposal(a, r))
+    /// ```
+    ///
+    /// Returns `true` if the accept should succeed.
+    #[must_use]
+    pub fn should_accept<P: Ord>(
+        proposal: &P,
+        current_promised: Option<&P>,
+        current_accepted: Option<&P>,
+    ) -> bool {
+        // Require exact promise match - no leadership optimization
+        // Accept only succeeds if this exact proposal was promised
+        let exactly_promised = current_promised.is_some_and(|p| p == proposal);
+        // Reject if a strictly higher proposal was already accepted
+        let dominated_by_accept = current_accepted.is_some_and(|p| p > proposal);
+
+        exactly_promised && !dominated_by_accept
+    }
+}
 
 /// Pure acceptor state - no I/O, no async, no synchronization
 ///
@@ -88,28 +146,25 @@ where
     ///
     /// On success, updates the promised value and returns the current accepted value.
     /// On failure, returns the current state without modification.
+    ///
+    /// Uses [`decision::should_promise`] for the TLA+-matching decision logic.
     pub(crate) fn prepare(&mut self, round: R, proposal: P) -> PrepareResult<P, M> {
         let current_promised = self.promised.get(&round);
         let current_accepted = self.accepted.get(&round);
+        let accepted_proposal = current_accepted.as_ref().map(|(p, _)| p);
 
-        // Check if dominated by a higher promise or accept
-        let dominated_by_promise = current_promised.is_some_and(|p| *p > proposal);
-        let dominated_by_accept = current_accepted
-            .as_ref()
-            .is_some_and(|(p, _)| *p > proposal);
-
-        if dominated_by_promise || dominated_by_accept {
-            PrepareResult::Rejected {
-                promised: current_promised
-                    .cloned()
-                    .unwrap_or_else(|| proposal.clone()),
-                accepted: current_accepted.cloned(),
-            }
-        } else {
+        if decision::should_promise(&proposal, current_promised, accepted_proposal) {
             // Update promise
             self.promised.insert(round, proposal.clone());
             PrepareResult::Promised {
                 promised: proposal,
+                accepted: current_accepted.cloned(),
+            }
+        } else {
+            PrepareResult::Rejected {
+                promised: current_promised
+                    .cloned()
+                    .unwrap_or_else(|| proposal.clone()),
                 accepted: current_accepted.cloned(),
             }
         }
@@ -123,24 +178,20 @@ where
     ///
     /// On success, updates the accepted value.
     /// On failure, returns Rejected without modification.
+    ///
+    /// Uses [`decision::should_accept`] for the TLA+-matching decision logic.
     pub(crate) fn accept(&mut self, round: R, proposal: P, message: M) -> AcceptResult<P, M> {
         let current_promised = self.promised.get(&round);
         let current_accepted = self.accepted.get(&round);
+        let accepted_proposal = current_accepted.as_ref().map(|(p, _)| p);
 
-        // Require exact promise match - no leadership optimization
-        // Accept only succeeds if this exact proposal was promised
-        let not_promised = current_promised.is_none_or(|p| *p != proposal);
-        let dominated_by_accept = current_accepted
-            .as_ref()
-            .is_some_and(|(p, _)| *p > proposal);
-
-        if not_promised || dominated_by_accept {
-            AcceptResult::Rejected
-        } else {
+        if decision::should_accept(&proposal, current_promised, accepted_proposal) {
             // Update accepted value
             self.accepted
                 .insert(round, (proposal.clone(), message.clone()));
             AcceptResult::Accepted { proposal, message }
+        } else {
+            AcceptResult::Rejected
         }
     }
 

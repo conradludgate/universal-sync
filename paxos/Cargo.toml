@@ -28,3 +28,4 @@ serde.workspace = true
 postcard.workspace = true
 stateright = "0.31.0"
 num_cpus = "1.17.0"
+itertools = "0.14.0"

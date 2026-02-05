@@ -16,6 +16,7 @@ use futures::{Stream, StreamExt, stream};
 use tokio::sync::broadcast;
 use universal_sync_core::{EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal};
 use universal_sync_paxos::acceptor::RoundState;
+use universal_sync_paxos::core::decision;
 use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
 
 use crate::epoch_roster::EpochRoster;
@@ -646,12 +647,6 @@ pub struct GroupStateStore {
 }
 
 impl GroupStateStore {
-    // /// Get the group ID
-    // #[must_use]
-    // pub(crate) fn group_id(&self) -> &GroupId {
-    //     &self.group_id
-    // }
-
     /// Get all accepted messages from the given epoch onwards
     ///
     /// This is useful for replaying messages to catch up a newly created acceptor.
@@ -740,20 +735,11 @@ where
             let current_promised = inner.get_promised_sync(&group_id, epoch);
             let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-            // Reject if a higher proposal was already promised
-            if let Some(ref promised) = current_promised
-                && promised.key() >= key
-            {
-                return Err(RoundState {
-                    promised: current_promised,
-                    accepted: current_accepted,
-                });
-            }
+            // Use shared decision logic from TLA+ spec
+            let promised_key = current_promised.as_ref().map(Proposal::key);
+            let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
 
-            // Reject if a higher proposal was already accepted
-            if let Some((ref accepted, _)) = current_accepted
-                && accepted.key() >= key
-            {
+            if !decision::should_promise(&key, promised_key.as_ref(), accepted_key.as_ref()) {
                 return Err(RoundState {
                     promised: current_promised,
                     accepted: current_accepted,
@@ -792,20 +778,11 @@ where
             let current_promised = inner.get_promised_sync(&group_id, epoch);
             let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-            // Require exact promise match - no leader optimization
-            // Accept only succeeds if this exact proposal was promised
-            let not_promised = current_promised.as_ref().is_none_or(|p| p.key() != key);
-            if not_promised {
-                return Err(RoundState {
-                    promised: current_promised,
-                    accepted: current_accepted,
-                });
-            }
+            // Use shared decision logic from TLA+ spec
+            let promised_key = current_promised.as_ref().map(Proposal::key);
+            let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
 
-            // Reject if a higher proposal was already accepted
-            if let Some((ref accepted, _)) = current_accepted
-                && accepted.key() >= key
-            {
+            if !decision::should_accept(&key, promised_key.as_ref(), accepted_key.as_ref()) {
                 return Err(RoundState {
                     promised: current_promised,
                     accepted: current_accepted,
