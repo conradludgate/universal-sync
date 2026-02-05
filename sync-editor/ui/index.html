@@ -51,12 +51,19 @@
                             📋
                         </button>
                     </div>
-                    <div class="collaborators" id="collaborators">
-                        <div class="collaborator" style="--color: #ff6b6b" title="You">Y</div>
+                    <div class="toolbar-center">
+                        <button id="btn-add-member" class="btn btn-secondary btn-sm" title="Add a collaborator">
+                            + Add Member
+                        </button>
                     </div>
-                    <div class="sync-status" id="sync-status">
-                        <span class="sync-indicator synced"></span>
-                        Synced
+                    <div class="toolbar-right">
+                        <div class="collaborators" id="collaborators">
+                            <div class="collaborator" style="--color: #ff6b6b" title="You">Y</div>
+                        </div>
+                        <div class="sync-status" id="sync-status">
+                            <span class="sync-indicator synced"></span>
+                            Synced
+                        </div>
                     </div>
                 </div>
                 <div class="editor-wrapper">
@@ -85,41 +92,68 @@
                     <button class="modal-close" id="join-modal-close">&times;</button>
                 </div>
                 <div class="modal-body">
-                    <label for="join-welcome">
-                        <span>Welcome Message</span>
-                        <small>Paste the welcome message from the document owner</small>
-                    </label>
-                    <textarea 
-                        id="join-welcome" 
-                        class="input-textarea" 
-                        placeholder="Paste welcome message here..."
-                        rows="4"
-                    ></textarea>
+                    <!-- Step 1: Get invite code -->
+                    <div class="join-step" id="join-step-1">
+                        <div class="step-header">
+                            <span class="step-number">1</span>
+                            <span>Get your invite code</span>
+                        </div>
+                        <p class="step-description">Share this code with a document member so they can add you.</p>
+                        <div class="invite-code-box">
+                            <textarea 
+                                id="my-invite-code" 
+                                class="input-textarea invite-code" 
+                                readonly
+                                rows="3"
+                                placeholder="Generating..."
+                            ></textarea>
+                            <button id="btn-copy-invite-code" class="btn btn-secondary btn-sm">
+                                📋 Copy
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="step-divider"></div>
+
+                    <!-- Step 2: Paste welcome -->
+                    <div class="join-step" id="join-step-2">
+                        <div class="step-header">
+                            <span class="step-number">2</span>
+                            <span>Enter welcome message</span>
+                        </div>
+                        <p class="step-description">After you've been added, paste the welcome message here.</p>
+                        <textarea 
+                            id="join-welcome" 
+                            class="input-textarea" 
+                            placeholder="Paste welcome message here..."
+                            rows="3"
+                        ></textarea>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button id="btn-join-cancel" class="btn btn-secondary">Cancel</button>
-                    <button id="btn-join-confirm" class="btn btn-primary">Join</button>
+                    <button id="btn-join-confirm" class="btn btn-primary">Join Document</button>
                 </div>
             </div>
         </div>
 
-        <!-- Invite Modal -->
+        <!-- Add Member Modal -->
         <div id="invite-modal" class="modal hidden">
             <div class="modal-backdrop"></div>
             <div class="modal-content">
                 <div class="modal-header">
-                    <h3>Invite Collaborator</h3>
+                    <h3>Add Member</h3>
                     <button class="modal-close" id="invite-modal-close">&times;</button>
                 </div>
                 <div class="modal-body">
                     <label for="invite-kp">
-                        <span>Key Package</span>
-                        <small>Paste the collaborator's key package</small>
+                        <span>Invite Code</span>
+                        <small>Paste the invite code from the person you want to add</small>
                     </label>
                     <textarea 
                         id="invite-kp" 
                         class="input-textarea" 
-                        placeholder="Paste key package here..."
+                        placeholder="Paste their invite code here..."
                         rows="4"
                     ></textarea>
                 </div>

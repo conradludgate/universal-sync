@@ -44,15 +44,18 @@ const elements = {
     btnNewDocEmpty: document.getElementById('btn-new-doc-empty'),
     btnJoinDoc: document.getElementById('btn-join-doc'),
     btnCopyId: document.getElementById('btn-copy-id'),
+    btnAddMember: document.getElementById('btn-add-member'),
     
     // Join modal
     joinModal: document.getElementById('join-modal'),
+    myInviteCode: document.getElementById('my-invite-code'),
+    btnCopyInviteCode: document.getElementById('btn-copy-invite-code'),
     joinWelcome: document.getElementById('join-welcome'),
     btnJoinConfirm: document.getElementById('btn-join-confirm'),
     btnJoinCancel: document.getElementById('btn-join-cancel'),
     joinModalClose: document.getElementById('join-modal-close'),
     
-    // Invite modal
+    // Invite modal (for document owner to add members)
     inviteModal: document.getElementById('invite-modal'),
     inviteKp: document.getElementById('invite-kp'),
     btnInviteConfirm: document.getElementById('btn-invite-confirm'),
@@ -121,6 +124,34 @@ function updateSyncStatus(status) {
             indicator.className = 'sync-indicator error';
             elements.syncStatus.lastChild.textContent = 'Error';
             break;
+    }
+}
+
+// ============================================================================
+// Invite Code (Key Package)
+// ============================================================================
+
+async function generateInviteCode() {
+    try {
+        const keyPackage = await invoke('get_key_package');
+        return keyPackage;
+    } catch (error) {
+        console.error('Failed to generate invite code:', error);
+        throw error;
+    }
+}
+
+async function showJoinModal() {
+    showModal(elements.joinModal);
+    elements.myInviteCode.value = 'Generating...';
+    elements.joinWelcome.value = '';
+    
+    try {
+        const inviteCode = await generateInviteCode();
+        elements.myInviteCode.value = inviteCode;
+    } catch (error) {
+        elements.myInviteCode.value = 'Error generating invite code';
+        showToast('Failed to generate invite code', 'error');
     }
 }
 
@@ -272,15 +303,31 @@ function setupEventListeners() {
     elements.btnNewDocEmpty.addEventListener('click', createDocument);
     
     // Join document
-    elements.btnJoinDoc.addEventListener('click', () => showModal(elements.joinModal));
+    elements.btnJoinDoc.addEventListener('click', () => showJoinModal());
     elements.btnJoinCancel.addEventListener('click', () => hideModal(elements.joinModal));
     elements.joinModalClose.addEventListener('click', () => hideModal(elements.joinModal));
     elements.joinModal.querySelector('.modal-backdrop').addEventListener('click', () => hideModal(elements.joinModal));
     
+    // Copy invite code
+    elements.btnCopyInviteCode.addEventListener('click', async () => {
+        const inviteCode = elements.myInviteCode.value;
+        if (!inviteCode || inviteCode === 'Generating...' || inviteCode.startsWith('Error')) {
+            showToast('No invite code to copy', 'error');
+            return;
+        }
+        
+        try {
+            await navigator.clipboard.writeText(inviteCode);
+            showToast('Invite code copied!', 'success');
+        } catch (error) {
+            showToast('Failed to copy', 'error');
+        }
+    });
+    
     elements.btnJoinConfirm.addEventListener('click', async () => {
         const welcome = elements.joinWelcome.value.trim();
         if (!welcome) {
-            showToast('Please enter a welcome message', 'error');
+            showToast('Please enter the welcome message', 'error');
             return;
         }
         hideModal(elements.joinModal);
@@ -297,6 +344,47 @@ function setupEventListeners() {
             showToast('Copied document ID!', 'success');
         } catch (error) {
             showToast('Failed to copy', 'error');
+        }
+    });
+    
+    // Add member button
+    elements.btnAddMember.addEventListener('click', () => {
+        if (!state.currentDocument) {
+            showToast('No document open', 'error');
+            return;
+        }
+        elements.inviteKp.value = '';
+        showModal(elements.inviteModal);
+    });
+    
+    // Invite modal (add member)
+    elements.btnInviteCancel.addEventListener('click', () => hideModal(elements.inviteModal));
+    elements.inviteModalClose.addEventListener('click', () => hideModal(elements.inviteModal));
+    elements.inviteModal.querySelector('.modal-backdrop').addEventListener('click', () => hideModal(elements.inviteModal));
+    
+    elements.btnInviteConfirm.addEventListener('click', async () => {
+        const inviteCode = elements.inviteKp.value.trim();
+        if (!inviteCode) {
+            showToast('Please enter an invite code', 'error');
+            return;
+        }
+        
+        if (!state.currentDocument) {
+            showToast('No document open', 'error');
+            return;
+        }
+        
+        try {
+            await invoke('add_member', {
+                groupId: state.currentDocument.group_id,
+                keyPackageB58: inviteCode,
+            });
+            hideModal(elements.inviteModal);
+            showToast('Member added! Share the welcome message with them.', 'success');
+            // TODO: Show the welcome message to copy
+        } catch (error) {
+            console.error('Failed to add member:', error);
+            showToast(`Failed to add member: ${error}`, 'error');
         }
     });
     
