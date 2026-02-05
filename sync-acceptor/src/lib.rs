@@ -13,12 +13,16 @@
 pub mod acceptor;
 pub mod connector;
 pub mod epoch_roster;
+pub mod learner;
 pub mod registry;
 pub mod server;
 pub mod state_store;
 
-pub use acceptor::{AcceptorError, GroupAcceptor};
-pub use connector::{ConnectorError, PAXOS_ALPN};
+pub use acceptor::{AcceptorChangeEvent, AcceptorError, GroupAcceptor};
+pub use connector::{ConnectorError, ProposalRequest, ProposalResponse, PAXOS_ALPN};
+pub use learner::{
+    GroupLearningActor, LearningCommand, LearningEvent, PeerEvent, learning_channels,
+};
 pub use epoch_roster::EpochRoster;
 pub use registry::AcceptorRegistry;
 pub use server::{GroupRegistry, IrohAcceptorConnection, accept_connection};

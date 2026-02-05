@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use iroh::SecretKey;
+use iroh::{EndpointAddr, SecretKey};
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::external_client::{ExternalClient, ExternalGroup};
 use mls_rs::mls_rs_codec::MlsDecode;
@@ -88,23 +88,21 @@ where
         self.state_store.list_groups()
     }
 
-    /// Extract acceptors from an extension list
-    fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<AcceptorId> {
+    /// Extract acceptor addresses from an extension list
+    fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<EndpointAddr> {
         for ext in extensions.iter() {
             if ext.extension_type == ACCEPTORS_EXTENSION_TYPE
                 && let Ok(acceptors_ext) =
                     AcceptorsExt::mls_decode(&mut ext.extension_data.as_slice())
             {
-                return acceptors_ext.acceptor_ids();
+                return acceptors_ext.acceptors().to_vec();
             }
         }
         vec![]
     }
 
-    /// Extract acceptors from an external group's context extensions
-    fn extract_acceptors_from_group<C2: ExternalMlsConfig + Clone>(
-        external_group: &ExternalGroup<C2>,
-    ) -> Vec<AcceptorId> {
+    /// Extract acceptor addresses from an external group's context extensions
+    fn extract_acceptors_from_group(external_group: &ExternalGroup<C>) -> Vec<EndpointAddr> {
         // Try group context extensions first
         let ctx_acceptors =
             Self::extract_acceptors_from_extensions(&external_group.group_context().extensions);

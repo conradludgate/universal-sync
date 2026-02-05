@@ -43,11 +43,9 @@
 //! ```
 
 mod handler;
-mod learning;
 mod runner;
 mod state;
 
 pub use handler::{AcceptOutcome, AcceptorHandler, InvalidProposal, PromiseOutcome};
-pub use learning::AcceptorLearner;
-pub use runner::run_acceptor;
+pub use runner::{run_acceptor, run_acceptor_with_epoch_waiter};
 pub use state::{AcceptorReceiver, AcceptorSubscription, RoundState, SharedAcceptorState};

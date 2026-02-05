@@ -44,3 +44,28 @@ impl From<std::io::Error> for ConnectorError {
         ConnectorError::Io(e)
     }
 }
+
+// =============================================================================
+// Proposal stream types (for push-based proposer/learning)
+// =============================================================================
+
+use universal_sync_core::{GroupMessage, GroupProposal};
+
+/// Wire format for proposal requests
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum ProposalRequest {
+    /// Phase 1: Prepare
+    Prepare(GroupProposal),
+    /// Phase 2: Accept
+    Accept(GroupProposal, GroupMessage),
+}
+
+/// Wire format for proposal responses
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProposalResponse {
+    /// Highest promised proposal
+    pub promised: GroupProposal,
+    /// Highest accepted (proposal, message) pair
+    pub accepted: Option<(GroupProposal, GroupMessage)>,
+}

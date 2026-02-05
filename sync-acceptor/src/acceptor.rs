@@ -31,15 +31,14 @@
 //! an acceptor that has accepted a value only needs 1 confirmation from
 //! another acceptor before applying.
 
-use std::collections::BTreeSet;
-
-use iroh::{PublicKey, SecretKey, Signature};
+use iroh::{EndpointAddr, PublicKey, SecretKey, Signature};
 use mls_rs::CipherSuiteProvider;
 use mls_rs::crypto::SignaturePublicKey;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::external_client::{ExternalGroup, ExternalReceivedMessage};
 use universal_sync_core::{
-    AcceptorId, Attempt, Epoch, GroupMessage, GroupProposal, MemberId, UnsignedProposal,
+    AcceptorAdd, AcceptorId, AcceptorRemove, Attempt, Epoch, GroupMessage, GroupProposal, MemberId,
+    UnsignedProposal,
 };
 
 use crate::connector::ConnectorError;
@@ -96,6 +95,23 @@ impl From<std::io::Error> for AcceptorError {
     }
 }
 
+/// Event emitted when the acceptor set changes during apply
+#[derive(Debug, Clone)]
+pub enum AcceptorChangeEvent {
+    /// An acceptor was added
+    Added {
+        /// The acceptor ID
+        id: AcceptorId,
+        /// The endpoint address
+        addr: EndpointAddr,
+    },
+    /// An acceptor was removed
+    Removed {
+        /// The acceptor ID
+        id: AcceptorId,
+    },
+}
+
 /// A federated server that validates and orders group operations
 ///
 /// Wraps an MLS `ExternalGroup` to verify signatures without being
@@ -122,8 +138,11 @@ where
     /// This acceptor's iroh secret key (for signing sync proposals)
     secret_key: SecretKey,
 
-    /// Set of all known acceptors (for validating sync proposals)
-    acceptors: BTreeSet<AcceptorId>,
+    /// Map of known acceptors: ID -> endpoint address
+    ///
+    /// This is updated when commits containing `AcceptorAdd`/`AcceptorRemove`
+    /// are applied.
+    acceptors: std::collections::BTreeMap<AcceptorId, EndpointAddr>,
 
     /// Optional state store for epoch roster lookups
     ///
@@ -144,18 +163,24 @@ where
     /// * `external_group` - The MLS external group
     /// * `cipher_suite` - Cipher suite for MLS signature verification
     /// * `secret_key` - This acceptor's iroh secret key (for signing sync proposals)
-    /// * `acceptors` - Initial set of known acceptors (from `GroupInfo` extensions)
+    /// * `acceptors` - Initial set of known acceptors with addresses (from `GroupInfo` extensions)
     pub fn new(
         external_group: ExternalGroup<C>,
         cipher_suite: CS,
         secret_key: SecretKey,
-        acceptors: impl IntoIterator<Item = AcceptorId>,
+        acceptors: impl IntoIterator<Item = EndpointAddr>,
     ) -> Self {
         Self {
             external_group,
             cipher_suite,
             secret_key,
-            acceptors: acceptors.into_iter().collect(),
+            acceptors: acceptors
+                .into_iter()
+                .map(|addr| {
+                    let id = AcceptorId::from_bytes(*addr.id.as_bytes());
+                    (id, addr)
+                })
+                .collect(),
             state_store: None,
         }
     }
@@ -172,14 +197,41 @@ where
         AcceptorId::from_bytes(*self.secret_key.public().as_bytes())
     }
 
-    /// Update the set of known acceptors
-    pub fn set_acceptors(&mut self, acceptors: impl IntoIterator<Item = AcceptorId>) {
-        self.acceptors = acceptors.into_iter().collect();
+    /// Update the set of known acceptors from addresses
+    pub fn set_acceptors(&mut self, acceptors: impl IntoIterator<Item = EndpointAddr>) {
+        self.acceptors = acceptors
+            .into_iter()
+            .map(|addr| {
+                let id = AcceptorId::from_bytes(*addr.id.as_bytes());
+                (id, addr)
+            })
+            .collect();
     }
 
     /// Get a reference to the external group
     pub fn external_group(&self) -> &ExternalGroup<C> {
         &self.external_group
+    }
+
+    /// Get the acceptor addresses
+    pub fn acceptor_addrs(&self) -> impl Iterator<Item = (&AcceptorId, &EndpointAddr)> {
+        self.acceptors.iter()
+    }
+
+    /// Add an acceptor by address
+    ///
+    /// Returns the `AcceptorId` that was added.
+    pub fn add_acceptor(&mut self, addr: EndpointAddr) -> AcceptorId {
+        let id = AcceptorId::from_bytes(*addr.id.as_bytes());
+        self.acceptors.insert(id, addr);
+        id
+    }
+
+    /// Remove an acceptor by ID
+    ///
+    /// Returns the address if the acceptor was present.
+    pub fn remove_acceptor(&mut self, id: &AcceptorId) -> Option<EndpointAddr> {
+        self.acceptors.remove(id)
     }
 
     /// Get a member's public signing key from the current roster
@@ -220,7 +272,7 @@ where
 
     /// Check if an acceptor ID is in the known set
     fn is_known_acceptor(&self, id: &AcceptorId) -> bool {
-        self.acceptors.contains(id)
+        self.acceptors.contains_key(id)
     }
 }
 
@@ -246,7 +298,7 @@ where
     }
 
     fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId, IntoIter: ExactSizeIterator> {
-        self.acceptors.iter().copied()
+        self.acceptors.keys().copied().collect::<Vec<_>>()
     }
 
     fn propose(&self, attempt: Attempt) -> GroupProposal {
@@ -382,9 +434,22 @@ where
 
         // Log what we processed and store epoch roster for commits
         match result {
-            ExternalReceivedMessage::Commit(_) => {
+            ExternalReceivedMessage::Commit(commit_desc) => {
                 let new_epoch = Epoch(self.external_group.group_context().epoch);
                 tracing::debug!(epoch = ?new_epoch, "learned commit");
+
+                // Process acceptor changes from the commit
+                let changes = self.process_commit_acceptor_changes(&commit_desc);
+                for change in &changes {
+                    match change {
+                        AcceptorChangeEvent::Added { id, .. } => {
+                            tracing::debug!(?id, "acceptor added");
+                        }
+                        AcceptorChangeEvent::Removed { id } => {
+                            tracing::debug!(?id, "acceptor removed");
+                        }
+                    }
+                }
 
                 // Store the epoch roster for future signature validation
                 self.store_current_epoch_roster(new_epoch);
@@ -430,6 +495,53 @@ where
     C: ExternalMlsConfig + Clone,
     CS: CipherSuiteProvider,
 {
+    /// Process acceptor changes from a commit
+    ///
+    /// Extracts `AcceptorAdd`/`AcceptorRemove` from the applied proposals
+    /// and updates the acceptor set accordingly.
+    ///
+    /// Returns a list of change events for the caller to handle (e.g., to
+    /// spawn or close peer connections).
+    fn process_commit_acceptor_changes(
+        &mut self,
+        commit_desc: &mls_rs::group::CommitMessageDescription,
+    ) -> Vec<AcceptorChangeEvent> {
+        use mls_rs::group::proposal::Proposal as MlsProposal;
+        use mls_rs::group::CommitEffect;
+
+        let mut changes = Vec::new();
+
+        // Get the applied proposals from the commit effect
+        let applied_proposals = match &commit_desc.effect {
+            CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
+                &new_epoch.applied_proposals
+            }
+            CommitEffect::ReInit(_) => return changes, // No proposals to process
+        };
+
+        // Iterate through applied proposals looking for GroupContextExtensions
+        for proposal_info in applied_proposals {
+            if let MlsProposal::GroupContextExtensions(extensions) = &proposal_info.proposal {
+                // Check for AcceptorAdd
+                if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
+                    let id = add.acceptor_id();
+                    let addr = add.0.clone();
+                    self.acceptors.insert(id, addr.clone());
+                    changes.push(AcceptorChangeEvent::Added { id, addr });
+                }
+
+                // Check for AcceptorRemove
+                if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
+                    let id = remove.acceptor_id();
+                    self.acceptors.remove(&id);
+                    changes.push(AcceptorChangeEvent::Removed { id });
+                }
+            }
+        }
+
+        changes
+    }
+
     /// Store the current roster as an epoch snapshot
     fn store_current_epoch_roster(&self, epoch: Epoch) {
         if let Some(ref store) = self.state_store {
