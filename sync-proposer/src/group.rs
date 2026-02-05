@@ -1791,9 +1791,21 @@ where
         send.finish().change_context(GroupError)?;
 
         // Wait for the stream to be fully closed (data acknowledged)
-        send.stopped().await.change_context(GroupError)?;
-
-        tracing::debug!("welcome sent successfully");
+        // Error code 0 means graceful close - the peer received the data
+        match send.stopped().await {
+            Ok(_) => tracing::debug!("welcome sent successfully"),
+            Err(e) => {
+                // Check if it's a graceful close (error code 0)
+                let is_graceful = e
+                    .to_string()
+                    .contains("closed by peer: 0");
+                if is_graceful {
+                    tracing::debug!("welcome sent successfully (peer closed gracefully)");
+                } else {
+                    return Err(e).change_context(GroupError);
+                }
+            }
+        }
 
         Ok(())
     }
