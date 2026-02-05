@@ -52,7 +52,7 @@ mod editor_client;
 
 pub use app_state::{AppState, SharedAppState, shared_state};
 pub use commands::{DeltaCommand, DocumentInfo, parse_group_id};
-pub use document::{DocumentError, SyncedDocument, TextDelta};
+pub use document::{DocumentError, DocumentUpdateEvent, SyncHandle, SyncedDocument, TextDelta};
 pub use editor_client::{create_editor_client, document_from_group, EditorClient};
 
 #[cfg(feature = "tauri")]

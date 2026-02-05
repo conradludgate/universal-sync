@@ -173,6 +173,7 @@ async fn test_two_clients_sync() {
     // Alice adds Bob to the document
     alice_doc
         .group_mut()
+        .await
         .add_member(bob_kp)
         .await
         .expect("alice add bob");

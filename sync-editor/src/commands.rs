@@ -248,6 +248,7 @@ pub mod tauri_commands {
             .ok_or_else(|| format!("document not found: {group_id}"))?;
 
         doc.group_mut()
+            .await
             .add_member(key_package)
             .await
             .map_err(|e| format!("failed to add member: {e:?}"))?;
