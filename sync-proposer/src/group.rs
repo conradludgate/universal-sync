@@ -462,6 +462,22 @@ where
             let mls_group_id = group.context().group_id.clone();
             let group_id = GroupId::from_slice(&mls_group_id);
 
+            // Debug: log all extensions in group context
+            let ctx_ext_types: Vec<_> = group
+                .context()
+                .extensions
+                .iter()
+                .map(|e| format!("0x{:04X}", e.extension_type.raw_value()))
+                .collect();
+            tracing::debug!(?ctx_ext_types, "Group context extension types");
+
+            // Try to read CRDT registration extension
+            let crdt_ext = group
+                .context()
+                .extensions
+                .get_as::<CrdtRegistrationExt>();
+            tracing::debug!(?crdt_ext, "CRDT registration extension from group context");
+
             // Read acceptors from GroupInfo extensions
             let acceptors = info
                 .group_info_extensions
