@@ -298,6 +298,7 @@ pub async fn add_member(
 
 /// Add a global acceptor (used when creating new documents).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub async fn add_global_acceptor(
     state: tauri::State<'_, SharedAppState>,
     name: String,

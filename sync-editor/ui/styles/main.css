@@ -418,6 +418,7 @@ body {
 
 .modal-content {
     position: relative;
+    z-index: 1;
     background: var(--bg-elevated);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
