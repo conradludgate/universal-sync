@@ -113,7 +113,7 @@ impl Crdt for YrsCrdt {
             .map_err(|e| CrdtError::new(format!("decode error: {e}")))?;
 
         let my_client_id = self.doc.client_id();
-        tracing::debug!(my_client_id, operation_len = operation.len(), "YrsCrdt::apply");
+        tracing::info!(my_client_id, operation_len = operation.len(), "YrsCrdt::apply");
 
         self.doc
             .transact_mut()
@@ -124,7 +124,7 @@ impl Crdt for YrsCrdt {
         let text = self.doc.get_or_insert_text("content");
         let txn = self.doc.transact();
         let content = text.get_string(&txn);
-        tracing::debug!(my_client_id, text_after_apply = %content, "YrsCrdt::apply result");
+        tracing::info!(my_client_id, text_len = content.len(), text_after_apply = %content, "YrsCrdt::apply result");
 
         Ok(())
     }
