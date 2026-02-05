@@ -5,6 +5,7 @@
 use iroh::EndpointAddr;
 use mls_rs::extension::{ExtensionType, MlsCodecExtension};
 use mls_rs::mls_rs_codec::{self as mls_rs_codec, MlsDecode, MlsEncode, MlsSize};
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::proposal::AcceptorId;
 
@@ -25,6 +26,51 @@ pub const CRDT_REGISTRATION_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0
 
 /// Extension type for supported CRDTs list (key package extension)
 pub const SUPPORTED_CRDTS_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF79A);
+
+/// Custom error code for postcard serialization failures
+const POSTCARD_ERROR: u8 = 1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Codec helpers for length-prefixed postcard encoding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate encoded length for a postcard-serializable value with length prefix
+fn postcard_encoded_len<T: Serialize>(value: &T) -> usize {
+    postcard::to_allocvec(value).map_or(4, |v| 4 + v.len())
+}
+
+/// Encode a value using postcard with a 4-byte length prefix
+#[expect(clippy::cast_possible_truncation)]
+fn postcard_encode<T: Serialize>(value: &T, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+    let bytes = postcard::to_allocvec(value)
+        .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
+    let len = bytes.len() as u32;
+    writer.extend_from_slice(&len.to_be_bytes());
+    writer.extend_from_slice(&bytes);
+    Ok(())
+}
+
+/// Decode a value using postcard with a 4-byte length prefix
+fn postcard_decode<T: DeserializeOwned>(reader: &mut &[u8]) -> Result<T, mls_rs_codec::Error> {
+    let data = read_length_prefixed(reader)?;
+    postcard::from_bytes(data).map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))
+}
+
+/// Read a length-prefixed slice from the reader
+fn read_length_prefixed<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], mls_rs_codec::Error> {
+    if reader.len() < 4 {
+        return Err(mls_rs_codec::Error::UnexpectedEOF);
+    }
+    let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
+    *reader = &reader[4..];
+
+    if reader.len() < len {
+        return Err(mls_rs_codec::Error::UnexpectedEOF);
+    }
+    let data = &reader[..len];
+    *reader = &reader[len..];
+    Ok(data)
+}
 
 /// MLS group context extension containing the full list of acceptors
 ///
@@ -61,45 +107,19 @@ impl AcceptorsExt {
 
 impl MlsSize for AcceptorsExt {
     fn mls_encoded_len(&self) -> usize {
-        // Serialize with postcard to get actual length
-        postcard::to_allocvec(&self.0).map_or(4, |v| 4 + v.len())
+        postcard_encoded_len(&self.0)
     }
 }
 
-/// Custom error code for postcard serialization failures
-const POSTCARD_ERROR: u8 = 1;
-
 impl MlsEncode for AcceptorsExt {
-    #[expect(clippy::cast_possible_truncation)]
     fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
-        // Serialize addresses with postcard
-        let bytes = postcard::to_allocvec(&self.0)
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        // Write length prefix
-        let len = bytes.len() as u32;
-        writer.extend_from_slice(&len.to_be_bytes());
-        writer.extend_from_slice(&bytes);
-        Ok(())
+        postcard_encode(&self.0, writer)
     }
 }
 
 impl MlsDecode for AcceptorsExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
-        if reader.len() < 4 {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
-        *reader = &reader[4..];
-
-        if reader.len() < len {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-
-        let acceptors: Vec<EndpointAddr> = postcard::from_bytes(&reader[..len])
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        *reader = &reader[len..];
-
-        Ok(Self(acceptors))
+        Ok(Self(postcard_decode(reader)?))
     }
 }
 
@@ -140,42 +160,19 @@ impl AcceptorAdd {
 
 impl MlsSize for AcceptorAdd {
     fn mls_encoded_len(&self) -> usize {
-        // Serialize with postcard to get actual length
-        postcard::to_allocvec(&self.0).map_or(4, |v| 4 + v.len())
+        postcard_encoded_len(&self.0)
     }
 }
 
 impl MlsEncode for AcceptorAdd {
-    #[expect(clippy::cast_possible_truncation)]
     fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
-        // Serialize address with postcard
-        let bytes = postcard::to_allocvec(&self.0)
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        // Write length prefix
-        let len = bytes.len() as u32;
-        writer.extend_from_slice(&len.to_be_bytes());
-        writer.extend_from_slice(&bytes);
-        Ok(())
+        postcard_encode(&self.0, writer)
     }
 }
 
 impl MlsDecode for AcceptorAdd {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
-        if reader.len() < 4 {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
-        *reader = &reader[4..];
-
-        if reader.len() < len {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-
-        let addr: EndpointAddr = postcard::from_bytes(&reader[..len])
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        *reader = &reader[len..];
-
-        Ok(Self(addr))
+        Ok(Self(postcard_decode(reader)?))
     }
 }
 
@@ -260,42 +257,19 @@ impl MemberAddrExt {
 
 impl MlsSize for MemberAddrExt {
     fn mls_encoded_len(&self) -> usize {
-        // Serialize with postcard to get actual length
-        postcard::to_allocvec(&self.0).map_or(4, |v| 4 + v.len())
+        postcard_encoded_len(&self.0)
     }
 }
 
 impl MlsEncode for MemberAddrExt {
-    #[expect(clippy::cast_possible_truncation)]
     fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
-        // Serialize address with postcard
-        let bytes = postcard::to_allocvec(&self.0)
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        // Write length prefix
-        let len = bytes.len() as u32;
-        writer.extend_from_slice(&len.to_be_bytes());
-        writer.extend_from_slice(&bytes);
-        Ok(())
+        postcard_encode(&self.0, writer)
     }
 }
 
 impl MlsDecode for MemberAddrExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
-        if reader.len() < 4 {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
-        *reader = &reader[4..];
-
-        if reader.len() < len {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-
-        let addr: EndpointAddr = postcard::from_bytes(&reader[..len])
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        *reader = &reader[len..];
-
-        Ok(Self(addr))
+        Ok(Self(postcard_decode(reader)?))
     }
 }
 
@@ -336,7 +310,6 @@ impl CrdtRegistrationExt {
 
 impl MlsSize for CrdtRegistrationExt {
     fn mls_encoded_len(&self) -> usize {
-        // Length prefix (4 bytes) + string bytes
         4 + self.type_id.len()
     }
 }
@@ -354,20 +327,9 @@ impl MlsEncode for CrdtRegistrationExt {
 
 impl MlsDecode for CrdtRegistrationExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
-        if reader.len() < 4 {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
-        *reader = &reader[4..];
-
-        if reader.len() < len {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-
-        let type_id = String::from_utf8(reader[..len].to_vec())
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        *reader = &reader[len..];
-
+        let data = read_length_prefixed(reader)?;
+        let type_id =
+            String::from_utf8(data.to_vec()).map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
         Ok(Self { type_id })
     }
 }
@@ -407,40 +369,21 @@ impl SupportedCrdtsExt {
 
 impl MlsSize for SupportedCrdtsExt {
     fn mls_encoded_len(&self) -> usize {
-        // Length prefix (4 bytes) + encoded data
-        4 + postcard::to_allocvec(&self.type_ids).map_or(0, |v| v.len())
+        postcard_encoded_len(&self.type_ids)
     }
 }
 
 impl MlsEncode for SupportedCrdtsExt {
-    #[expect(clippy::cast_possible_truncation)]
     fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
-        let bytes = postcard::to_allocvec(&self.type_ids)
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        let len = bytes.len() as u32;
-        writer.extend_from_slice(&len.to_be_bytes());
-        writer.extend_from_slice(&bytes);
-        Ok(())
+        postcard_encode(&self.type_ids, writer)
     }
 }
 
 impl MlsDecode for SupportedCrdtsExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
-        if reader.len() < 4 {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-        let len = u32::from_be_bytes([reader[0], reader[1], reader[2], reader[3]]) as usize;
-        *reader = &reader[4..];
-
-        if reader.len() < len {
-            return Err(mls_rs_codec::Error::UnexpectedEOF);
-        }
-
-        let type_ids: Vec<String> = postcard::from_bytes(&reader[..len])
-            .map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))?;
-        *reader = &reader[len..];
-
-        Ok(Self { type_ids })
+        Ok(Self {
+            type_ids: postcard_decode(reader)?,
+        })
     }
 }
 
