@@ -15,7 +15,7 @@ use universal_sync_core::{
     SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
 use universal_sync_proposer::{GroupClient, ReplContext};
-pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
+pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory, client_id_from_signing_key};
 
 /// Default cipher suite for testing
 pub const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;

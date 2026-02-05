@@ -27,6 +27,7 @@ yrs = { version = "0.25" }
 zeroize = "1.8"
 
 error-stack = "0.6"
+sha2 = "0.10"
 bs58 = "0.5"
 async-stream = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

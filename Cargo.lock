@@ -4763,6 +4763,7 @@ dependencies = [
  "mls-rs",
  "mls-rs-crypto-rustcrypto",
  "postcard",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
