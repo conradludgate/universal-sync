@@ -164,6 +164,33 @@ impl Crdt for NoCrdt {
     }
 }
 
+// Implement Crdt for Box<dyn Crdt> so methods are properly delegated
+impl Crdt for Box<dyn Crdt> {
+    fn type_id(&self) -> &str {
+        (**self).type_id()
+    }
+
+    fn apply(&mut self, operation: &[u8]) -> Result<(), CrdtError> {
+        (**self).apply(operation)
+    }
+
+    fn merge(&mut self, snapshot: &[u8]) -> Result<(), CrdtError> {
+        (**self).merge(snapshot)
+    }
+
+    fn snapshot(&self) -> Result<Vec<u8>, CrdtError> {
+        (**self).snapshot()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        (**self).as_any_mut()
+    }
+}
+
 /// Factory for creating [`NoCrdt`] instances.
 #[derive(Debug, Default, Clone)]
 pub struct NoCrdtFactory;
