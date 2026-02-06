@@ -11,7 +11,7 @@ use tracing::{debug, trace};
 
 use crate::acceptor::{AcceptorMessage, AcceptorRequest};
 use crate::core::{AcceptPhaseResult, PreparePhaseResult, ProposerCore};
-use crate::traits::{Learner, Proposal, ProposalKey};
+use crate::{Learner, Proposal, ProposalKey};
 
 #[derive(Debug, Clone)]
 pub enum ProposeResult<L: Learner> {
@@ -191,7 +191,7 @@ mod tests {
     use error_stack::Report;
 
     use super::*;
-    use crate::traits::{Validated, ValidationError};
+    use crate::{Validated, ValidationError};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestProposal {

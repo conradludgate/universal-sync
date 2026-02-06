@@ -4,8 +4,8 @@ use std::fmt;
 
 use tracing::trace;
 
-use super::AcceptorMessage;
-use crate::traits::{AcceptorStateStore, Learner, Proposal};
+use super::{AcceptorMessage, AcceptorStateStore};
+use crate::{Learner, Proposal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InvalidProposal;

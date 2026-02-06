@@ -11,8 +11,8 @@ use tokio::sync::watch;
 use tracing::{debug, instrument, trace, warn};
 
 use super::handler::{AcceptOutcome, AcceptorHandler, InvalidProposal, PromiseOutcome};
-use super::{AcceptorMessage, AcceptorRequest};
-use crate::traits::{AcceptorStateStore, Learner, Proposal};
+use super::{AcceptorMessage, AcceptorRequest, AcceptorStateStore};
+use crate::{Learner, Proposal};
 
 pin_project! {
     #[derive(Debug)]

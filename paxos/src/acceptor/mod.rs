@@ -5,13 +5,52 @@ use std::fmt;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::traits::Learner;
+use crate::{Learner, Proposal};
 
 mod handler;
 mod runner;
 
 pub use handler::AcceptorHandler;
 pub use runner::run_acceptor_with_epoch_waiter;
+
+/// Shared state for an acceptor, allowing multiple connections to coordinate.
+///
+/// All connections to the same acceptor must share this state.
+///
+/// Implementations MUST persist state before returning success from
+/// `promise()`/`accept()` (use fsync) and reload on restart for crash recovery.
+/// Both `promise()` and `accept()` must be atomic per-round.
+#[expect(async_fn_in_trait)]
+pub trait AcceptorStateStore<L: Learner>: Send + Sync {
+    type Subscription: futures::Stream<Item = (L::Proposal, L::Message)> + Send;
+
+    async fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L>;
+
+    /// MUST reject if a higher proposal was already promised or accepted for this round.
+    async fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>>;
+
+    /// MUST reject if a higher proposal was already promised or accepted for this round.
+    /// On success, broadcasts to all subscribed learners.
+    async fn accept(
+        &self,
+        proposal: &L::Proposal,
+        message: &L::Message,
+    ) -> Result<(), RoundState<L>>;
+
+    /// Returns historical values (rounds >= `from_round`) then live broadcasts.
+    async fn subscribe_from(
+        &self,
+        from_round: <L::Proposal as Proposal>::RoundId,
+    ) -> Self::Subscription;
+
+    async fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
+
+    /// Returns historical values only (no live subscription).
+    async fn get_accepted_from(
+        &self,
+        from_round: <L::Proposal as Proposal>::RoundId,
+    ) -> Vec<(L::Proposal, L::Message)>;
+}
 
 pub struct RoundState<L: Learner> {
     pub promised: Option<L::Proposal>,

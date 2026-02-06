@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use tracing::trace;
 
-use crate::traits::{Learner, Proposal, ProposalKey};
+use crate::{Learner, Proposal, ProposalKey};
 
 type Key<L> = ProposalKey<<L as Learner>::Proposal>;
 
