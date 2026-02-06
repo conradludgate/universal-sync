@@ -123,7 +123,7 @@ where
             self.cipher_suite.clone(),
             &self.connection_manager,
             acceptors,
-            crdt_factory.as_ref(),
+            crdt_factory.clone(),
         )
         .await
     }

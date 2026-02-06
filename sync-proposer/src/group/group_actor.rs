@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
@@ -11,8 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, CompactionClaim, CompactionComplete,
-    CompactionConfig, CrdtRegistrationExt, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
-    GroupProposal, Handshake, MemberId, MemberFingerprint, MessageId, StateVector, PAXOS_ALPN,
+    CompactionConfig, CrdtFactory, CrdtRegistrationExt, EncryptedAppMessage, Epoch, GroupId,
+    GroupMessage, GroupProposal, Handshake, MemberId, MemberFingerprint, MessageId, StateVector,
+    PAXOS_ALPN,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -56,6 +58,7 @@ where
     active_proposal: Option<ActiveProposal>,
     compaction_state: CompactionState,
     compaction_config: CompactionConfig,
+    crdt_factory: Arc<dyn CrdtFactory>,
 }
 
 struct ActiveProposal {
@@ -135,6 +138,8 @@ const MAX_PROPOSAL_RETRIES: u32 = 3;
 const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Default deadline for compaction claims (seconds from now).
 const COMPACTION_DEADLINE_SECS: u64 = 120;
+/// How often to check whether compaction should be triggered (seconds).
+const COMPACTION_CHECK_INTERVAL_SECS: u64 = 10;
 
 impl<C, CS> GroupActor<C, CS>
 where
@@ -152,6 +157,7 @@ where
         event_tx: broadcast::Sender<GroupEvent>,
         cancel_token: CancellationToken,
         compaction_config: CompactionConfig,
+        crdt_factory: Arc<dyn CrdtFactory>,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
         let join_epoch = learner.mls_epoch();
@@ -183,6 +189,7 @@ where
             active_proposal: None,
             compaction_state: CompactionState::default(),
             compaction_config,
+            crdt_factory,
         }
     }
 
@@ -191,6 +198,10 @@ where
 
         let mut timeout_check = tokio::time::interval(std::time::Duration::from_secs(1));
         timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut compaction_check =
+            tokio::time::interval(std::time::Duration::from_secs(COMPACTION_CHECK_INTERVAL_SECS));
+        compaction_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -213,6 +224,10 @@ where
 
                 _ = timeout_check.tick() => {
                     self.check_proposal_timeout();
+                }
+
+                _ = compaction_check.tick() => {
+                    self.maybe_trigger_compaction().await;
                 }
             }
         }
@@ -1375,5 +1390,112 @@ where
         self.compaction_state.l0_count_since_compaction += 1;
 
         let _ = self.app_message_tx.try_send(app_msg.data().to_vec());
+    }
+
+    // ---- Compaction coordination ----
+
+    /// Check whether compaction should be triggered based on L0 count and
+    /// config thresholds. If conditions are met, build and submit a
+    /// CompactionClaim commit through Paxos.
+    async fn maybe_trigger_compaction(&mut self) {
+        // Don't trigger compaction if we already have an active proposal
+        if self.active_proposal.is_some() {
+            return;
+        }
+
+        // Don't trigger if no acceptors (no point compacting if nowhere to store)
+        if self.learner.acceptor_ids().len() == 0 {
+            return;
+        }
+
+        // Prune expired claims so we can re-claim if needed
+        self.compaction_state.prune_expired_claims();
+
+        // Check each level's threshold (from lowest to highest)
+        // thresholds[0] is the threshold for L0 → L1 compaction, etc.
+        let thresholds = self.compaction_config.thresholds.clone();
+        let l0_count = self.compaction_state.l0_count_since_compaction;
+
+        for (i, &threshold) in thresholds.iter().enumerate() {
+            let level = (i + 1) as u8; // L1, L2, ...
+
+            // Check if we've accumulated enough messages
+            if l0_count < u64::from(threshold) {
+                continue;
+            }
+
+            // Check if there's already an active claim at this level
+            if self.compaction_state.has_active_claim(level) {
+                continue;
+            }
+
+            // We should trigger compaction at this level
+            tracing::info!(
+                level,
+                l0_count,
+                threshold,
+                "triggering compaction claim"
+            );
+
+            self.submit_compaction_claim(level).await;
+
+            // Only trigger one level at a time
+            break;
+        }
+    }
+
+    /// Build and submit a CompactionClaim commit through Paxos consensus.
+    async fn submit_compaction_claim(&mut self, level: u8) {
+        let watermark = self.state_vector.clone();
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + COMPACTION_DEADLINE_SECS;
+
+        let claim = CompactionClaim {
+            level,
+            watermark,
+            deadline,
+        };
+
+        let custom_proposal = match claim.to_custom_proposal() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(?e, "failed to encode CompactionClaim proposal");
+                return;
+            }
+        };
+
+        let result = blocking(|| {
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .custom_proposal(custom_proposal)
+                .build()
+                .change_context(GroupError)
+        });
+
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                self.start_proposal(message, reply_tx).await;
+
+                // We don't block waiting for the reply; the compaction coordination
+                // is driven by observing CompactionClaimed events in process_commit_effect.
+                // Spawn a background task to log the result.
+                tokio::spawn(async move {
+                    match reply_rx.await {
+                        Ok(Ok(())) => tracing::debug!("compaction claim commit accepted"),
+                        Ok(Err(e)) => tracing::warn!(?e, "compaction claim commit failed"),
+                        Err(_) => tracing::debug!("compaction claim reply dropped"),
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to build compaction claim commit");
+            }
+        }
     }
 }

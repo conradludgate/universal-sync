@@ -22,6 +22,8 @@ use mls_rs::{CipherSuiteProvider, Client, MlsMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use std::sync::Arc;
+
 use universal_sync_core::{
     AcceptorId, AcceptorsExt, CompactionConfig, Crdt, CrdtFactory, CrdtRegistrationExt,
     CrdtSnapshotExt, EncryptedAppMessage, Epoch, GroupId, Handshake, MessageId,
@@ -217,7 +219,7 @@ where
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
         acceptors: &[EndpointAddr],
-        crdt_factory: &dyn CrdtFactory,
+        crdt_factory: Arc<dyn CrdtFactory>,
     ) -> Result<Self, Report<GroupError>>
     where
         CS: Clone,
@@ -297,6 +299,7 @@ where
             connection_manager.clone(),
             crdt,
             compaction_config,
+            crdt_factory,
         ))
     }
 
@@ -307,7 +310,7 @@ where
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
         welcome_bytes: &[u8],
-        crdt_factories: &std::collections::HashMap<String, std::sync::Arc<dyn CrdtFactory>>,
+        crdt_factories: &std::collections::HashMap<String, Arc<dyn CrdtFactory>>,
     ) -> Result<Self, Report<GroupError>>
     where
         CS: Clone,
@@ -394,6 +397,7 @@ where
             connection_manager.clone(),
             crdt,
             compaction_config,
+            crdt_factory.clone(),
         ))
     }
 
@@ -404,6 +408,7 @@ where
         connection_manager: ConnectionManager,
         crdt: Box<dyn Crdt>,
         compaction_config: CompactionConfig,
+        crdt_factory: Arc<dyn CrdtFactory>,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
@@ -420,6 +425,7 @@ where
             event_tx.clone(),
             cancel_token.clone(),
             compaction_config,
+            crdt_factory,
         );
 
         let actor_handle = tokio::spawn(actor.run());
