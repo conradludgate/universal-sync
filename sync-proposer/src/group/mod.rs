@@ -52,7 +52,7 @@ pub(crate) fn group_info_ext_list(
 ) -> mls_rs::ExtensionList {
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
-        .set_from(GroupInfoExt::new(acceptors, None))
+        .set_from(GroupInfoExt::new(acceptors, vec![]))
         .expect("GroupInfoExt encoding should not fail");
     extensions
 }
@@ -344,7 +344,7 @@ where
                 .map(|e| e.acceptors.clone())
                 .unwrap_or_default();
 
-            let crdt_snapshot_opt = group_info_ext.and_then(|e| e.snapshot);
+            let crdt_snapshot_opt = group_info_ext.map(|e| e.snapshot);
 
             let crdt_type_id = group
                 .context()

@@ -31,10 +31,6 @@ pub const SYNC_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF796);
 /// Single proposal type for all sync protocol custom proposals (private use range).
 pub const SYNC_PROPOSAL_TYPE: ProposalType = ProposalType::new(0xF796);
 
-// ---------------------------------------------------------------------------
-// GroupContextExt — group context extension
-// ---------------------------------------------------------------------------
-
 /// CRDT type registration (group context extension).
 ///
 /// Set at group creation. Joiners check this to select the right CRDT factory.
@@ -75,10 +71,6 @@ impl MlsCodecExtension for GroupContextExt {
         SYNC_EXTENSION_TYPE
     }
 }
-
-// ---------------------------------------------------------------------------
-// KeyPackageExt — key package extension
-// ---------------------------------------------------------------------------
 
 /// Member endpoint address and supported CRDTs (key package extension).
 ///
@@ -132,25 +124,21 @@ impl MlsCodecExtension for KeyPackageExt {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GroupInfoExt — group info extension (welcome)
-// ---------------------------------------------------------------------------
-
-/// Current acceptor list and optional CRDT snapshot (group info extension).
+/// Current acceptor list and CRDT snapshot (group info extension).
 ///
 /// Sent in Welcome messages so joiners can discover acceptors and optionally
 /// bootstrap their CRDT state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInfoExt {
     pub acceptors: Vec<EndpointAddr>,
-    pub snapshot: Option<Vec<u8>>,
+    pub snapshot: Vec<u8>,
 }
 
 impl GroupInfoExt {
     #[must_use]
     pub fn new(
         acceptors: impl IntoIterator<Item = EndpointAddr>,
-        snapshot: Option<Vec<u8>>,
+        snapshot: Vec<u8>,
     ) -> Self {
         Self {
             acceptors: acceptors.into_iter().collect(),
@@ -348,23 +336,23 @@ mod tests {
     #[test]
     fn group_info_ext_roundtrip() {
         let addrs = vec![test_addr(1), test_addr(2)];
-        let ext = GroupInfoExt::new(addrs, Some(b"crdt snapshot data".to_vec()));
+        let ext = GroupInfoExt::new(addrs, b"crdt snapshot data".to_vec());
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert_eq!(decoded.snapshot.as_deref().unwrap(), b"crdt snapshot data");
+        assert_eq!(decoded.snapshot, b"crdt snapshot data");
         assert_eq!(decoded.acceptors.len(), 2);
     }
 
     #[test]
     fn group_info_ext_no_snapshot() {
-        let ext = GroupInfoExt::new(Vec::<EndpointAddr>::new(), None);
+        let ext = GroupInfoExt::new(Vec::<EndpointAddr>::new(), vec![]);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert!(decoded.snapshot.is_none());
+        assert!(decoded.snapshot.is_empty());
     }
 
     #[test]
@@ -374,7 +362,7 @@ mod tests {
         let expected_id1 = AcceptorId::from_bytes(*addr1.id.as_bytes());
         let expected_id2 = AcceptorId::from_bytes(*addr2.id.as_bytes());
 
-        let ext = GroupInfoExt::new(vec![addr1, addr2], None);
+        let ext = GroupInfoExt::new(vec![addr1, addr2], vec![]);
         let ids = ext.acceptor_ids();
 
         assert_eq!(ids.len(), 2);
