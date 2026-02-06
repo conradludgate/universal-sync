@@ -14,10 +14,10 @@ sync-testing/    - Integration tests
 
 ## Error Handling
 
-Use `error-stack` for all errors. Define ONE marker error type per domain:
+Use `error-stack` for all errors. Define ONE unit-struct marker error type per domain:
 
 ```rust
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct GroupError;
 
 impl std::fmt::Display for GroupError {
@@ -29,12 +29,41 @@ impl std::fmt::Display for GroupError {
 impl std::error::Error for GroupError {}
 ```
 
-Use context methods to add information:
-- `.change_context(GroupError)` to convert between domains
-- `.attach("context")` for human-readable context
-- `.attach_opaque()` for structured data
+Return `Result<T, Report<E>>` — never `Result<T, String>` (except at FFI/Tauri boundaries).
 
-**Don't**: Create enum variants for every error case, use `thiserror`, or lose inner error context.
+### Converting errors between domains
+
+Use `.change_context(TargetError)` to convert. This preserves the full error chain:
+
+```rust
+// GOOD: inner error preserved in the Report chain
+let data = foo().change_context(GroupError)?;
+
+// BAD: inner error lost or stringified
+let data = foo().map_err(|e| Report::new(GroupError).attach(format!("{e:?}")))?;
+```
+
+### Adding context
+
+- `.attach("static context")` for simple string context
+- `.attach_lazy(|| format!("dynamic: {x}"))` for formatted context (avoids allocation on success)
+- `.attach(OperationContext::CREATING_GROUP)` for structured context types from `sync-core/error.rs`
+
+```rust
+// GOOD: lazy formatting
+result.change_context(GroupError).attach_lazy(|| format!("member {id} not found"))?;
+
+// BAD: eager formatting (allocates even on success)
+result.change_context(GroupError).attach(format!("member {id} not found"))?;
+```
+
+### Don't
+
+- Create enum error types with `String` fields — use unit structs + `.attach()`
+- Use `thiserror` — use `error-stack` marker types instead
+- Use `Result<T, String>` in library/internal code — only at Tauri command boundaries
+- Write `.map_err(|e| Report::new(E).attach(format!("{e:?}")))` — use `.change_context(E)` instead
+- Write `.map_err(|e| ConnectorError::Variant(e.to_string()))` — use `.change_context(ConnectorError)` instead
 
 ## Validation Pattern
 

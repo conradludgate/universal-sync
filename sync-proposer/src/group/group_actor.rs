@@ -1714,3 +1714,86 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_claim(level: u8, deadline: u64) -> ActiveCompactionClaim {
+        ActiveCompactionClaim {
+            claimer: MemberFingerprint([0u8; 32]),
+            level,
+            watermark: StateVector::default(),
+            deadline,
+            is_ours: false,
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn compaction_state_no_active_claims() {
+        let state = CompactionState::default();
+        assert!(!state.has_active_claim(1));
+        assert!(!state.has_active_claim(2));
+    }
+
+    #[test]
+    fn compaction_state_active_claim_not_expired() {
+        let mut state = CompactionState::default();
+        state
+            .active_claims
+            .insert(1, make_claim(1, now_secs() + 60));
+        assert!(state.has_active_claim(1));
+        assert!(!state.has_active_claim(2));
+    }
+
+    #[test]
+    fn compaction_state_expired_claim() {
+        let mut state = CompactionState::default();
+        state.active_claims.insert(1, make_claim(1, now_secs() - 1));
+        assert!(!state.has_active_claim(1));
+    }
+
+    #[test]
+    fn compaction_state_prune_expired() {
+        let mut state = CompactionState::default();
+        state.active_claims.insert(1, make_claim(1, now_secs() - 1));
+        state
+            .active_claims
+            .insert(2, make_claim(2, now_secs() + 60));
+        assert_eq!(state.active_claims.len(), 2);
+
+        state.prune_expired_claims();
+        assert_eq!(state.active_claims.len(), 1);
+        assert!(state.active_claims.contains_key(&2));
+    }
+
+    #[test]
+    fn compaction_state_multiple_levels() {
+        let mut state = CompactionState::default();
+        state
+            .active_claims
+            .insert(1, make_claim(1, now_secs() + 60));
+        state
+            .active_claims
+            .insert(2, make_claim(2, now_secs() + 60));
+        assert!(state.has_active_claim(1));
+        assert!(state.has_active_claim(2));
+        assert!(!state.has_active_claim(3));
+    }
+
+    #[test]
+    fn compaction_state_default_values() {
+        let state = CompactionState::default();
+        assert_eq!(state.l0_count_since_compaction, 0);
+        assert!(state.last_compacted_watermark.is_empty());
+        assert!(!state.force_compaction);
+        assert!(state.active_claims.is_empty());
+    }
+}
