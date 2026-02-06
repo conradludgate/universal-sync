@@ -48,31 +48,18 @@ fn parse_group_id(b58: &str) -> Result<GroupId, String> {
 }
 
 #[tauri::command]
-pub async fn create_document(
-    state: tauri::State<'_, AppState>,
-) -> Result<DocumentInfo, String> {
-    coord_request(&state, |reply| CoordinatorRequest::CreateDocument {
-        reply,
-    })
-    .await
+pub async fn create_document(state: tauri::State<'_, AppState>) -> Result<DocumentInfo, String> {
+    coord_request(&state, |reply| CoordinatorRequest::CreateDocument { reply }).await
 }
 
 #[tauri::command]
 pub async fn get_key_package(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    coord_request(&state, |reply| CoordinatorRequest::GetKeyPackage {
-        reply,
-    })
-    .await
+    coord_request(&state, |reply| CoordinatorRequest::GetKeyPackage { reply }).await
 }
 
 #[tauri::command]
-pub async fn recv_welcome(
-    state: tauri::State<'_, AppState>,
-) -> Result<DocumentInfo, String> {
-    coord_request(&state, |reply| CoordinatorRequest::RecvWelcome {
-        reply,
-    })
-    .await
+pub async fn recv_welcome(state: tauri::State<'_, AppState>) -> Result<DocumentInfo, String> {
+    coord_request(&state, |reply| CoordinatorRequest::RecvWelcome { reply }).await
 }
 
 #[tauri::command]

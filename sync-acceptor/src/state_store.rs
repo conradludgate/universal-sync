@@ -8,13 +8,48 @@ use std::task::{Context, Poll};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use futures::{Stream, StreamExt, stream};
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use universal_sync_core::{EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal};
 use universal_sync_paxos::acceptor::RoundState;
 use universal_sync_paxos::core::decision;
 use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
 
-use crate::epoch_roster::EpochRoster;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EpochRoster {
+    pub(crate) epoch: Epoch,
+    pub(crate) members: Vec<(universal_sync_core::MemberId, Vec<u8>)>,
+}
+
+impl EpochRoster {
+    pub(crate) fn new(
+        epoch: Epoch,
+        members: impl IntoIterator<Item = (universal_sync_core::MemberId, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            epoch,
+            members: members.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn get_member_key(&self, member_id: universal_sync_core::MemberId) -> Option<&[u8]> {
+        self.members
+            .iter()
+            .find(|(id, _)| *id == member_id)
+            .map(|(_, key)| key.as_slice())
+    }
+
+    #[must_use]
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("serialization should not fail")
+    }
+
+    #[must_use]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+}
 
 type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
 
@@ -457,7 +492,6 @@ impl SharedFjallStateStore {
     ) -> broadcast::Receiver<EncryptedAppMessage> {
         self.inner.subscribe_messages(group_id)
     }
-
 }
 
 #[derive(Clone)]
@@ -636,5 +670,31 @@ where
         tokio::task::spawn_blocking(move || inner.get_accepted_from_sync(&group_id, from_round))
             .await
             .expect("spawn_blocking panicked")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use universal_sync_core::MemberId;
+
+    use super::*;
+
+    #[test]
+    fn test_epoch_roster_roundtrip() {
+        let roster = EpochRoster::new(
+            Epoch(5),
+            vec![
+                (MemberId(0), vec![1, 2, 3, 4]),
+                (MemberId(1), vec![5, 6, 7, 8]),
+            ],
+        );
+
+        let bytes = roster.to_bytes();
+        let decoded = EpochRoster::from_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded.epoch, Epoch(5));
+        assert_eq!(decoded.get_member_key(MemberId(0)), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(decoded.get_member_key(MemberId(1)), Some(&[5, 6, 7, 8][..]));
+        assert_eq!(decoded.get_member_key(MemberId(2)), None);
     }
 }

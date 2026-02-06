@@ -129,11 +129,9 @@ where
         Handshake::JoinMessages(group_id) => {
             handle_message_stream(group_id, reader, writer, registry).await
         }
-        Handshake::SendWelcome(_) => {
-            Err(ConnectorError::Handshake(
-                "acceptors do not handle welcome messages".to_string(),
-            ))
-        }
+        Handshake::SendWelcome(_) => Err(ConnectorError::Handshake(
+            "acceptors do not handle welcome messages".to_string(),
+        )),
     }
 }
 
@@ -185,7 +183,6 @@ where
 
     debug!(?group_id, "proposal stream handshake complete");
 
-   
     let response = HandshakeResponse::Ok;
     let response_bytes =
         postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;
@@ -242,7 +239,6 @@ where
 
     debug!("message stream handshake complete");
 
-   
     let response = HandshakeResponse::Ok;
     let response_bytes =
         postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;

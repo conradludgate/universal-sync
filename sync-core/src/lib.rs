@@ -2,15 +2,17 @@
 
 #![warn(clippy::pedantic)]
 
+use std::path::Path;
+
+use error_stack::{Report, ResultExt};
+
 pub mod codec;
 pub mod crdt;
 pub mod error;
 pub mod extension;
-pub mod handshake;
-pub mod message;
 pub mod proposal;
+pub mod protocol;
 pub mod sink_stream;
-pub mod util;
 pub use crdt::{Crdt, CrdtError, CrdtFactory, NoCrdt, NoCrdtFactory};
 pub use error::{
     AcceptorContext, ConnectorError, EpochContext, GroupContext, MemberContext, OperationContext,
@@ -21,11 +23,52 @@ pub use extension::{
     ACCEPTOR_REMOVE_EXTENSION_TYPE, CRDT_REGISTRATION_EXTENSION_TYPE, CRDT_SNAPSHOT_EXTENSION_TYPE,
     MEMBER_ADDR_EXTENSION_TYPE, SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
-pub use handshake::{GroupId, Handshake, HandshakeResponse, StreamType};
-pub use message::{EncryptedAppMessage, GroupMessage, MessageId, MessageRequest, MessageResponse};
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
+pub use protocol::{
+    EncryptedAppMessage, GroupId, GroupMessage, Handshake, HandshakeResponse, MessageId,
+    MessageRequest, MessageResponse, StreamType,
+};
 pub use sink_stream::FromIoError;
-pub use util::{load_secret_key, KeyLoadError};
 
 /// ALPN protocol identifier for Paxos connections
 pub const PAXOS_ALPN: &[u8] = b"universal-sync/paxos/1";
+
+#[derive(Debug)]
+pub struct KeyLoadError;
+
+impl std::fmt::Display for KeyLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to load secret key")
+    }
+}
+
+impl std::error::Error for KeyLoadError {}
+
+/// Load a 32-byte secret key from a file (raw bytes or base58).
+pub fn load_secret_key(path: impl AsRef<Path>) -> Result<[u8; 32], Report<KeyLoadError>> {
+    let path = path.as_ref();
+    let contents = std::fs::read(path)
+        .change_context(KeyLoadError)
+        .attach_opaque_with(|| format!("reading key file: {}", path.display()))?;
+
+    // Try parsing as raw bytes first
+    if let Ok(bytes) = contents.as_slice().try_into() {
+        return Ok(bytes);
+    }
+
+    // Try parsing as base58
+    let b58_str = String::from_utf8(contents)
+        .change_context(KeyLoadError)
+        .attach("key file is not valid UTF-8")?;
+
+    let b58_str = b58_str.trim();
+
+    let bytes = bs58::decode(b58_str)
+        .into_vec()
+        .change_context(KeyLoadError)
+        .attach("invalid base58 encoding")?;
+
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        Report::new(KeyLoadError).attach(format!("expected 32 bytes, got {}", v.len()))
+    })
+}

@@ -13,8 +13,14 @@ pub struct AppState {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Delta {
-    Insert { position: u32, text: String },
-    Delete { position: u32, length: u32 },
+    Insert {
+        position: u32,
+        text: String,
+    },
+    Delete {
+        position: u32,
+        length: u32,
+    },
     Replace {
         position: u32,
         length: u32,
@@ -140,8 +146,9 @@ pub enum DocRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json;
+
+    use super::*;
 
     #[test]
     fn delta_insert_round_trip() {

@@ -3,8 +3,6 @@
 #![warn(clippy::pedantic)]
 
 pub(crate) mod acceptor;
-pub(crate) mod connector;
-pub(crate) mod epoch_roster;
 pub(crate) mod learner;
 pub(crate) mod registry;
 pub(crate) mod server;

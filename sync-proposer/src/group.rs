@@ -10,6 +10,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
@@ -22,7 +23,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorAdd, AcceptorId, AcceptorRemove, Crdt, CrdtFactory, CrdtRegistrationExt,
+    AcceptorAdd, AcceptorId, AcceptorRemove, AcceptorsExt, Crdt, CrdtFactory, CrdtRegistrationExt,
     CrdtSnapshotExt, EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, Handshake,
     MemberId, MessageId, OperationContext, PAXOS_ALPN,
 };
@@ -31,16 +32,45 @@ use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
 
 use crate::connection::ConnectionManager;
 use crate::connector::{ProposalRequest, ProposalResponse};
-use crate::error::GroupError;
-use crate::flows::welcome_group_info_extensions;
 use crate::learner::GroupLearner;
+
+/// Marker error for group operations. Use `error_stack::Report<GroupError>` with
+/// context attachments for details.
+#[derive(Debug)]
+pub struct GroupError;
+
+impl fmt::Display for GroupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("group operation failed")
+    }
+}
+
+impl std::error::Error for GroupError {}
+
+/// Build GroupInfo extensions for a welcome message (acceptor addresses + CRDT snapshot).
+#[must_use]
+pub(crate) fn welcome_group_info_extensions(
+    acceptors: impl IntoIterator<Item = EndpointAddr>,
+    crdt_snapshot: Vec<u8>,
+) -> mls_rs::ExtensionList {
+    let mut extensions = mls_rs::ExtensionList::default();
+    extensions
+        .set_from(AcceptorsExt::new(acceptors))
+        .expect("AcceptorsExt encoding should not fail");
+    extensions
+        .set_from(CrdtSnapshotExt::new(crdt_snapshot))
+        .expect("CrdtSnapshotExt encoding should not fail");
+    extensions
+}
 
 enum GroupRequest<C, CS>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Send + Sync + 'static,
 {
-    GetContext { reply: oneshot::Sender<GroupContext> },
+    GetContext {
+        reply: oneshot::Sender<GroupContext>,
+    },
     AddMember {
         key_package: Box<MlsMessage>,
         member_addr: EndpointAddr,
@@ -51,7 +81,9 @@ where
         member_index: u32,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     },
-    UpdateKeys { reply: oneshot::Sender<Result<(), Report<GroupError>>> },
+    UpdateKeys {
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    },
     SendMessage {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
@@ -71,9 +103,16 @@ where
 
 #[allow(clippy::large_enum_variant)]
 enum AcceptorInbound {
-    ProposalResponse { acceptor_id: AcceptorId, response: ProposalResponse },
-    EncryptedMessage { msg: EncryptedAppMessage },
-    Disconnected { acceptor_id: AcceptorId },
+    ProposalResponse {
+        acceptor_id: AcceptorId,
+        response: ProposalResponse,
+    },
+    EncryptedMessage {
+        msg: EncryptedAppMessage,
+    },
+    Disconnected {
+        acceptor_id: AcceptorId,
+    },
 }
 
 struct PendingMessage {

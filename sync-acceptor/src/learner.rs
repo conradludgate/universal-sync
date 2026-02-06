@@ -14,6 +14,19 @@ use universal_sync_paxos::proposer::QuorumTracker;
 use crate::acceptor::GroupAcceptor;
 use crate::state_store::GroupStateStore;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ProposalRequest {
+    Prepare(GroupProposal),
+    Accept(GroupProposal, GroupMessage),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProposalResponse {
+    pub(crate) promised: GroupProposal,
+    pub(crate) accepted: Option<(GroupProposal, GroupMessage)>,
+}
+
 #[derive(Debug)]
 enum PeerEvent {
     Accepted {
@@ -277,14 +290,10 @@ async fn run_peer_connection(
     let recv = reader.into_inner();
     let send = writer.into_inner();
 
-    let mut reader: FramedRead<
-        iroh::endpoint::RecvStream,
-        PostcardCodec<crate::connector::ProposalResponse>,
-    > = FramedRead::new(recv, PostcardCodec::new());
-    let mut writer: FramedWrite<
-        iroh::endpoint::SendStream,
-        PostcardCodec<crate::connector::ProposalRequest>,
-    > = FramedWrite::new(send, PostcardCodec::new());
+    let mut reader: FramedRead<iroh::endpoint::RecvStream, PostcardCodec<ProposalResponse>> =
+        FramedRead::new(recv, PostcardCodec::new());
+    let mut writer: FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>> =
+        FramedWrite::new(send, PostcardCodec::new());
 
     // Send a sync Prepare to initiate the learning stream
     // Use attempt=0 to indicate this is a learning request
@@ -297,7 +306,7 @@ async fn run_peer_connection(
     };
 
     writer
-        .send(crate::connector::ProposalRequest::Prepare(sync_proposal))
+        .send(ProposalRequest::Prepare(sync_proposal))
         .await
         .map_err(|e| ConnectorError::Io(std::io::Error::other(e)))?;
 

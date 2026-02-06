@@ -7,8 +7,7 @@ use core::hash::Hash;
 use error_stack::Report;
 use futures::{Sink, Stream};
 
-use crate::acceptor::RoundState;
-use crate::messages::{AcceptorMessage, AcceptorRequest};
+use crate::acceptor::{AcceptorMessage, AcceptorRequest, RoundState};
 
 #[derive(Debug)]
 pub struct ValidationError;

@@ -152,16 +152,40 @@ impl fmt::Display for OperationContext {
 }
 
 impl OperationContext {
-    pub const CREATING_GROUP: Self = Self { operation: "creating group" };
-    pub const JOINING_GROUP: Self = Self { operation: "joining group" };
-    pub const ADDING_MEMBER: Self = Self { operation: "adding member" };
-    pub const REMOVING_MEMBER: Self = Self { operation: "removing member" };
-    pub const ADDING_ACCEPTOR: Self = Self { operation: "adding acceptor" };
-    pub const REMOVING_ACCEPTOR: Self = Self { operation: "removing acceptor" };
-    pub const PROPOSING: Self = Self { operation: "proposing via Paxos" };
-    pub const CONNECTING: Self = Self { operation: "connecting to acceptor" };
-    pub const VALIDATING_PROPOSAL: Self = Self { operation: "validating proposal" };
-    pub const APPLYING_VALUE: Self = Self { operation: "applying learned value" };
-    pub const SENDING_WELCOME: Self = Self { operation: "sending welcome message" };
-    pub const PROCESSING_MLS: Self = Self { operation: "processing MLS message" };
+    pub const CREATING_GROUP: Self = Self {
+        operation: "creating group",
+    };
+    pub const JOINING_GROUP: Self = Self {
+        operation: "joining group",
+    };
+    pub const ADDING_MEMBER: Self = Self {
+        operation: "adding member",
+    };
+    pub const REMOVING_MEMBER: Self = Self {
+        operation: "removing member",
+    };
+    pub const ADDING_ACCEPTOR: Self = Self {
+        operation: "adding acceptor",
+    };
+    pub const REMOVING_ACCEPTOR: Self = Self {
+        operation: "removing acceptor",
+    };
+    pub const PROPOSING: Self = Self {
+        operation: "proposing via Paxos",
+    };
+    pub const CONNECTING: Self = Self {
+        operation: "connecting to acceptor",
+    };
+    pub const VALIDATING_PROPOSAL: Self = Self {
+        operation: "validating proposal",
+    };
+    pub const APPLYING_VALUE: Self = Self {
+        operation: "applying learned value",
+    };
+    pub const SENDING_WELCOME: Self = Self {
+        operation: "sending welcome message",
+    };
+    pub const PROCESSING_MLS: Self = Self {
+        operation: "processing MLS message",
+    };
 }

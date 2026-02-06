@@ -90,13 +90,8 @@ pub enum PreparePhaseResult<K, P, M> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AcceptPhaseResult<K, P, M> {
     Pending,
-    Learned {
-        proposal: P,
-        value: M,
-    },
-    Rejected {
-        superseded_by: K,
-    },
+    Learned { proposal: P, value: M },
+    Rejected { superseded_by: K },
 }
 
 impl<K, P, M, I> ProposerCore<K, P, M, I>

@@ -326,7 +326,7 @@ where
 
     fn store_current_epoch_roster(&self, epoch: Epoch) {
         if let Some(ref store) = self.state_store {
-            use crate::epoch_roster::EpochRoster;
+            use crate::state_store::EpochRoster;
 
             let members: Vec<_> = self
                 .external_group

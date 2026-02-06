@@ -160,9 +160,7 @@ pub(crate) async fn register_group_with_addr(
         .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
 
     match response {
-        HandshakeResponse::Ok => {
-            Ok(GroupId::from_slice(group_info))
-        }
+        HandshakeResponse::Ok => Ok(GroupId::from_slice(group_info)),
         HandshakeResponse::GroupNotFound => Err(ConnectorError::Handshake(
             "unexpected: group not found".to_string(),
         )),

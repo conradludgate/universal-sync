@@ -6,13 +6,12 @@
 
 use std::collections::HashMap;
 
-use mls_rs::client_builder::MlsConfig;
 use mls_rs::CipherSuiteProvider;
+use mls_rs::client_builder::MlsConfig;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use universal_sync_core::GroupId;
 use universal_sync_proposer::{Group, GroupClient};
-
 use yrs::Transact;
 
 use crate::document::DocumentActor;
@@ -86,10 +85,7 @@ where
                 // If there's already a pending request, the old oneshot is dropped
                 self.pending_welcome_reply = Some(reply);
             }
-            CoordinatorRequest::JoinDocumentBytes {
-                welcome_b58,
-                reply,
-            } => {
+            CoordinatorRequest::JoinDocumentBytes { welcome_b58, reply } => {
                 let result = self.join_document_bytes(&welcome_b58).await;
                 let _ = reply.send(result);
             }

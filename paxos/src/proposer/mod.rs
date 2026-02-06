@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 pub use quorum::QuorumTracker;
 use tracing::{debug, trace};
 
+use crate::acceptor::{AcceptorMessage, AcceptorRequest};
 use crate::core::{AcceptPhaseResult, PreparePhaseResult, ProposerCore};
-use crate::messages::{AcceptorMessage, AcceptorRequest};
 use crate::traits::{Learner, Proposal, ProposalKey};
 
 #[derive(Debug, Clone)]

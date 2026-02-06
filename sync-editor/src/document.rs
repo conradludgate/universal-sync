@@ -218,8 +218,8 @@ where
         let kp_bytes = bs58::decode(key_package_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
-        let key_package = MlsMessage::from_bytes(&kp_bytes)
-            .map_err(|e| format!("invalid key package: {e:?}"))?;
+        let key_package =
+            MlsMessage::from_bytes(&kp_bytes).map_err(|e| format!("invalid key package: {e:?}"))?;
         self.group
             .add_member(key_package)
             .await
@@ -306,10 +306,11 @@ where
         let bytes = bs58::decode(acceptor_id_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
-        let acceptor_id =
-            universal_sync_core::AcceptorId::from_bytes(bytes.try_into().map_err(|_| {
-                "acceptor ID must be 32 bytes".to_string()
-            })?);
+        let acceptor_id = universal_sync_core::AcceptorId::from_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| "acceptor ID must be 32 bytes".to_string())?,
+        );
         self.group
             .remove_acceptor(acceptor_id)
             .await

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::types::{AcceptorRequest, AcceptorResponse};
+use super::{AcceptorRequest, AcceptorResponse};
 
 /// Pure decision functions matching the TLA+ spec.
 ///
@@ -70,10 +70,7 @@ pub(crate) enum PrepareResult<P, M> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AcceptResult<P, M> {
-    Accepted {
-        proposal: P,
-        message: M,
-    },
+    Accepted { proposal: P, message: M },
     Rejected,
 }
 

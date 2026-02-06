@@ -21,7 +21,10 @@ use universal_sync_proposer::GroupClient;
 use universal_sync_proposer::repl::ReplContext;
 
 #[derive(Parser, Debug)]
-#[command(name = "proposer", about = "Interactive REPL for Universal Sync proposers")]
+#[command(
+    name = "proposer",
+    about = "Interactive REPL for Universal Sync proposers"
+)]
 struct Args {
     #[arg(short, long, default_value = "./proposer-data")]
     data: PathBuf,

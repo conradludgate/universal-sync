@@ -12,8 +12,7 @@ use tokio::sync::mpsc;
 use universal_sync_core::{CrdtFactory, MemberAddrExt, SupportedCrdtsExt};
 
 use crate::connection::ConnectionManager;
-use crate::error::GroupError;
-use crate::group::Group;
+use crate::group::{Group, GroupError};
 
 /// Combines an MLS client, iroh endpoint, connection manager, and CRDT factory
 /// registry. When joining a group, looks up the factory for the group's CRDT type

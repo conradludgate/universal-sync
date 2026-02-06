@@ -5,17 +5,14 @@
 
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
-use universal_sync_core::GroupId;
-use universal_sync_testing::{
-    init_tracing, spawn_acceptor, test_endpoint, test_yrs_group_client,
-};
-
+use sync_editor::actor::CoordinatorActor;
+use sync_editor::document::DocumentActor;
 use sync_editor::types::{
     CoordinatorRequest, Delta, DocRequest, DocumentInfo, DocumentUpdatedPayload, EventEmitter,
 };
-use sync_editor::actor::CoordinatorActor;
-use sync_editor::document::DocumentActor;
+use tokio::sync::{mpsc, oneshot};
+use universal_sync_core::GroupId;
+use universal_sync_testing::{init_tracing, spawn_acceptor, test_endpoint, test_yrs_group_client};
 
 // =============================================================================
 // Mock event emitter
@@ -323,9 +320,7 @@ async fn coordinator_create_document() {
     assert_eq!(info.text, "");
 
     // Verify we can get text from the created document
-    let group_id = GroupId::from_slice(
-        &bs58::decode(&info.group_id).into_vec().unwrap(),
-    );
+    let group_id = GroupId::from_slice(&bs58::decode(&info.group_id).into_vec().unwrap());
     let text = send_coord_doc(&tx, group_id, |reply| DocRequest::GetText { reply })
         .await
         .expect("get text");
@@ -425,11 +420,12 @@ async fn coordinator_join_via_welcome() {
     let (alice_tx, _alice_events) = spawn_coordinator(alice_client);
 
     // Create doc
-    let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument { reply })
-        .await
-        .expect("alice create doc");
-    let alice_group_id =
-        GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
+    let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
+        reply,
+    })
+    .await
+    .expect("alice create doc");
+    let alice_group_id = GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
 
     // Add acceptor
     let addr_b58 = bs58::encode(postcard::to_allocvec(&acceptor_addr).unwrap()).into_string();
@@ -505,11 +501,12 @@ async fn full_two_peer_sync() {
     let (alice_tx, mut alice_events) = spawn_coordinator(alice_client);
 
     // Create doc
-    let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument { reply })
-        .await
-        .expect("alice create doc");
-    let alice_group_id =
-        GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
+    let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
+        reply,
+    })
+    .await
+    .expect("alice create doc");
+    let alice_group_id = GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
 
     // Add acceptor
     let addr_b58 = bs58::encode(postcard::to_allocvec(&acceptor_addr).unwrap()).into_string();
@@ -591,10 +588,11 @@ async fn full_two_peer_sync() {
     assert_eq!(alice_event.text, "Hello World");
 
     // Verify final state
-    let alice_text =
-        send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::GetText { reply })
-            .await
-            .unwrap();
+    let alice_text = send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::GetText {
+        reply,
+    })
+    .await
+    .unwrap();
     let bob_text = send_coord_doc(&bob_tx, bob_group_id, |reply| DocRequest::GetText { reply })
         .await
         .unwrap();
