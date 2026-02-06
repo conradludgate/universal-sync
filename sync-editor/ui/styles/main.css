@@ -575,14 +575,14 @@ body {
     font-size: 0.75rem;
 }
 
-/* Acceptor modal */
-.acceptor-list {
+/* Peers modal */
+.peer-list {
     margin-bottom: var(--space-lg);
-    max-height: 150px;
+    max-height: 250px;
     overflow-y: auto;
 }
 
-.acceptor-empty {
+.peer-empty {
     color: var(--ink-muted);
     font-size: 0.875rem;
     font-style: italic;
@@ -592,7 +592,21 @@ body {
     border-radius: var(--radius-md);
 }
 
-.acceptor-item {
+.peer-section-label {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-muted);
+    padding: var(--space-xs) var(--space-sm);
+    margin-top: var(--space-sm);
+}
+
+.peer-section-label:first-child {
+    margin-top: 0;
+}
+
+.peer-item {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -602,28 +616,32 @@ body {
     margin-bottom: var(--space-xs);
 }
 
-.acceptor-item-info {
+.peer-item-info {
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
 }
 
-.acceptor-item-name {
-    font-weight: 500;
-    font-size: 0.875rem;
-}
-
-.acceptor-item-addr {
-    font-size: 0.6875rem;
-    color: var(--ink-muted);
+.peer-item-id {
+    font-size: 0.8125rem;
     font-family: var(--font-mono);
-    max-width: 250px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.acceptor-item-remove {
+.peer-item-tag {
+    font-size: 0.625rem;
+    color: var(--ink-muted);
+}
+
+.peer-item-tag.self-tag {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.peer-item-remove {
     background: transparent;
     border: none;
     color: var(--ink-muted);
@@ -631,30 +649,26 @@ body {
     padding: var(--space-xs);
     border-radius: var(--radius-sm);
     transition: all var(--transition-fast);
+    flex-shrink: 0;
 }
 
-.acceptor-item-remove:hover {
+.peer-item-remove:hover {
     color: var(--error);
     background: var(--accent-subtle);
 }
 
-.acceptor-add-form label {
+.peer-add-form label {
     display: block;
     margin-bottom: var(--space-sm);
 }
 
-.acceptor-input-row {
+.peer-input-row {
     display: flex;
     gap: var(--space-sm);
     align-items: flex-start;
 }
 
-.acceptor-input-row .input-text {
-    width: 100px;
-    flex-shrink: 0;
-}
-
-.acceptor-input-row .input-textarea {
+.peer-input-row .input-textarea {
     flex: 1;
     font-size: 0.75rem;
 }

@@ -7,7 +7,7 @@
 use tokio::sync::oneshot;
 use universal_sync_core::GroupId;
 
-use crate::types::{AppState, CoordinatorRequest, Delta, DocRequest, DocumentInfo};
+use crate::types::{AppState, CoordinatorRequest, Delta, DocRequest, DocumentInfo, PeerEntry};
 
 /// Helper: send a coordinator request and await the reply.
 async fn coord_request<T>(
@@ -152,6 +152,53 @@ pub async fn list_acceptors(
     group_id: String,
 ) -> Result<Vec<String>, String> {
     doc_request(&state, &group_id, |reply| DocRequest::ListAcceptors {
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_peers(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+) -> Result<Vec<PeerEntry>, String> {
+    doc_request(&state, &group_id, |reply| DocRequest::ListPeers { reply }).await
+}
+
+#[tauri::command]
+pub async fn add_peer(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+    input_b58: String,
+) -> Result<(), String> {
+    doc_request(&state, &group_id, |reply| DocRequest::AddPeer {
+        input_b58,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_member(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+    member_index: u32,
+) -> Result<(), String> {
+    doc_request(&state, &group_id, |reply| DocRequest::RemoveMember {
+        member_index,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_acceptor(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+    acceptor_id_b58: String,
+) -> Result<(), String> {
+    doc_request(&state, &group_id, |reply| DocRequest::RemoveAcceptor {
+        acceptor_id_b58,
         reply,
     })
     .await

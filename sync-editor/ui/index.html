@@ -52,11 +52,8 @@
                         </button>
                     </div>
                     <div class="toolbar-center">
-                        <button id="btn-add-member" class="btn btn-secondary btn-sm" title="Add a collaborator">
-                            + Add Member
-                        </button>
-                        <button id="btn-doc-acceptors" class="btn btn-secondary btn-sm" title="Manage acceptor servers">
-                            ⚙️ Acceptors
+                        <button id="btn-peers" class="btn btn-secondary btn-sm" title="Manage members and acceptors">
+                            👥 Peers
                         </button>
                     </div>
                     <div class="toolbar-right">
@@ -124,67 +121,39 @@
             </div>
         </div>
 
-        <!-- Add Member Modal -->
-        <div id="invite-modal" class="modal hidden">
+        <!-- Peers Modal (members + acceptors) -->
+        <div id="peers-modal" class="modal hidden">
             <div class="modal-backdrop"></div>
             <div class="modal-content">
                 <div class="modal-header">
-                    <h3>Add Member</h3>
-                    <button class="modal-close" id="invite-modal-close">&times;</button>
+                    <h3>Peers</h3>
+                    <button class="modal-close" id="peers-modal-close">&times;</button>
                 </div>
                 <div class="modal-body">
-                    <label for="invite-kp">
-                        <span>Invite Code</span>
-                        <small>Paste the invite code from the person you want to add</small>
-                    </label>
-                    <textarea 
-                        id="invite-kp" 
-                        class="input-textarea" 
-                        placeholder="Paste their invite code here..."
-                        rows="4"
-                    ></textarea>
-                </div>
-                <div class="modal-footer">
-                    <button id="btn-invite-cancel" class="btn btn-secondary">Cancel</button>
-                    <button id="btn-invite-confirm" class="btn btn-primary">Add Member</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Document Acceptor Modal -->
-        <div id="acceptor-modal" class="modal hidden">
-            <div class="modal-backdrop"></div>
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3>Document Acceptors</h3>
-                    <button class="modal-close" id="acceptor-modal-close">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <p class="modal-intro">Acceptors provide consensus for group membership changes. Add at least one before creating a document.</p>
-                    
-                    <div class="acceptor-list" id="acceptor-list">
-                        <div class="acceptor-empty" id="acceptor-empty">No acceptors configured</div>
+                    <div class="peer-list" id="peer-list">
+                        <div class="peer-empty" id="peer-empty">No peers</div>
                     </div>
-                    
-                    <div class="acceptor-add-form">
+
+                    <div class="peer-add-form">
                         <label>
-                            <span>Add Acceptor</span>
+                            <span>Add Peer</span>
+                            <small>Paste an invite code (member) or acceptor address</small>
                         </label>
-                        <div class="acceptor-input-row">
-                            <textarea 
-                                id="acceptor-addr" 
-                                class="input-textarea" 
-                                placeholder="Paste acceptor address..."
-                                rows="2"
+                        <div class="peer-input-row">
+                            <textarea
+                                id="peer-input"
+                                class="input-textarea"
+                                placeholder="Paste invite code or acceptor address..."
+                                rows="3"
                             ></textarea>
-                            <button id="btn-add-acceptor-confirm" class="btn btn-primary btn-sm">
+                            <button id="btn-add-peer" class="btn btn-primary btn-sm">
                                 Add
                             </button>
                         </div>
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button id="btn-acceptor-done" class="btn btn-primary">Done</button>
+                    <button id="btn-peers-done" class="btn btn-primary">Done</button>
                 </div>
             </div>
         </div>

@@ -27,7 +27,6 @@ const state = {
     currentDocument: null,
     isConnected: false,
     pendingChanges: [],
-    docAcceptors: [], // acceptor IDs for current document
 };
 
 // DOM Elements
@@ -45,7 +44,7 @@ const elements = {
     btnNewDocEmpty: document.getElementById('btn-new-doc-empty'),
     btnJoinDoc: document.getElementById('btn-join-doc'),
     btnCopyId: document.getElementById('btn-copy-id'),
-    btnAddMember: document.getElementById('btn-add-member'),
+    btnPeers: document.getElementById('btn-peers'),
     
     // Join modal
     joinModal: document.getElementById('join-modal'),
@@ -55,22 +54,14 @@ const elements = {
     btnJoinCancel: document.getElementById('btn-join-cancel'),
     joinModalClose: document.getElementById('join-modal-close'),
     
-    // Invite modal (for document owner to add members)
-    inviteModal: document.getElementById('invite-modal'),
-    inviteKp: document.getElementById('invite-kp'),
-    btnInviteConfirm: document.getElementById('btn-invite-confirm'),
-    btnInviteCancel: document.getElementById('btn-invite-cancel'),
-    inviteModalClose: document.getElementById('invite-modal-close'),
-    
-    // Document acceptor modal
-    btnDocAcceptors: document.getElementById('btn-doc-acceptors'),
-    acceptorModal: document.getElementById('acceptor-modal'),
-    acceptorList: document.getElementById('acceptor-list'),
-    acceptorEmpty: document.getElementById('acceptor-empty'),
-    acceptorAddr: document.getElementById('acceptor-addr'),
-    btnAddAcceptorConfirm: document.getElementById('btn-add-acceptor-confirm'),
-    btnAcceptorDone: document.getElementById('btn-acceptor-done'),
-    acceptorModalClose: document.getElementById('acceptor-modal-close'),
+    // Peers modal (unified members + acceptors)
+    peersModal: document.getElementById('peers-modal'),
+    peerList: document.getElementById('peer-list'),
+    peerEmpty: document.getElementById('peer-empty'),
+    peerInput: document.getElementById('peer-input'),
+    btnAddPeer: document.getElementById('btn-add-peer'),
+    btnPeersDone: document.getElementById('btn-peers-done'),
+    peersModalClose: document.getElementById('peers-modal-close'),
 };
 
 // ============================================================================
@@ -138,7 +129,7 @@ function updateSyncStatus(status) {
 }
 
 // ============================================================================
-// Acceptor Management
+// Peer Management (members + acceptors)
 // ============================================================================
 
 function escapeHtml(text) {
@@ -147,62 +138,120 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function renderDocAcceptorList() {
-    const items = elements.acceptorList.querySelectorAll('.acceptor-item');
-    items.forEach(item => item.remove());
-    
-    if (state.docAcceptors.length === 0) {
-        elements.acceptorEmpty.classList.remove('hidden');
-    } else {
-        elements.acceptorEmpty.classList.add('hidden');
-        
-        state.docAcceptors.forEach((acceptorId) => {
+function shortId(id) {
+    return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-8)}` : id;
+}
+
+function renderPeerList(peers) {
+    // Remove existing items (keep the empty placeholder)
+    elements.peerList.querySelectorAll('.peer-item, .peer-section-label').forEach(el => el.remove());
+
+    if (peers.length === 0) {
+        elements.peerEmpty.classList.remove('hidden');
+        return;
+    }
+    elements.peerEmpty.classList.add('hidden');
+
+    const members = peers.filter(p => p.kind === 'Member');
+    const acceptors = peers.filter(p => p.kind === 'Acceptor');
+
+    if (members.length > 0) {
+        const label = document.createElement('div');
+        label.className = 'peer-section-label';
+        label.textContent = 'Members';
+        elements.peerList.appendChild(label);
+
+        members.forEach(m => {
             const item = document.createElement('div');
-            item.className = 'acceptor-item';
-            // Display first/last parts of the ID for readability
-            const shortId = acceptorId.length > 16 
-                ? `${acceptorId.slice(0, 8)}...${acceptorId.slice(-8)}`
-                : acceptorId;
+            item.className = 'peer-item';
+            const selfTag = m.is_self ? ' <span class="peer-item-tag self-tag">(you)</span>' : '';
             item.innerHTML = `
-                <div class="acceptor-item-info">
-                    <span class="acceptor-item-id" title="${escapeHtml(acceptorId)}">${escapeHtml(shortId)}</span>
+                <div class="peer-item-info">
+                    <span class="peer-item-id" title="${escapeHtml(m.identity)}">${escapeHtml(shortId(m.identity))}${selfTag}</span>
                 </div>
+                ${!m.is_self ? `<button class="peer-item-remove" data-action="remove-member" data-index="${m.index}" title="Remove member">✕</button>` : ''}
             `;
-            elements.acceptorList.appendChild(item);
+            elements.peerList.appendChild(item);
+        });
+    }
+
+    if (acceptors.length > 0) {
+        const label = document.createElement('div');
+        label.className = 'peer-section-label';
+        label.textContent = 'Acceptors';
+        elements.peerList.appendChild(label);
+
+        acceptors.forEach(a => {
+            const item = document.createElement('div');
+            item.className = 'peer-item';
+            item.innerHTML = `
+                <div class="peer-item-info">
+                    <span class="peer-item-id" title="${escapeHtml(a.id)}">${escapeHtml(shortId(a.id))}</span>
+                </div>
+                <button class="peer-item-remove" data-action="remove-acceptor" data-id="${escapeHtml(a.id)}" title="Remove acceptor">✕</button>
+            `;
+            elements.peerList.appendChild(item);
         });
     }
 }
 
-async function addDocAcceptor(addr) {
+async function fetchPeers() {
+    if (!state.currentDocument) return;
+    try {
+        const peers = await invoke('list_peers', {
+            groupId: state.currentDocument.group_id,
+        });
+        renderPeerList(peers);
+    } catch (error) {
+        console.error('Failed to fetch peers:', error);
+    }
+}
+
+async function addPeer(input) {
     if (!state.currentDocument) {
         showToast('No document open', 'error');
         return;
     }
-    
     try {
-        await invoke('add_acceptor', { 
+        await invoke('add_peer', {
             groupId: state.currentDocument.group_id,
-            addrB58: addr 
+            inputB58: input,
         });
-        // The acceptor list will be updated via the acceptor-added event
-        showToast('Acceptor added!', 'success');
+        showToast('Peer added!', 'success');
+        await fetchPeers();
     } catch (error) {
-        console.error('Failed to add acceptor:', error);
-        showToast(`Failed to add acceptor: ${error}`, 'error');
+        console.error('Failed to add peer:', error);
+        showToast(`Failed to add peer: ${error}`, 'error');
     }
 }
 
-async function fetchDocAcceptors() {
+async function removeMember(memberIndex) {
     if (!state.currentDocument) return;
-    
     try {
-        const acceptors = await invoke('list_acceptors', {
-            groupId: state.currentDocument.group_id
+        await invoke('remove_member', {
+            groupId: state.currentDocument.group_id,
+            memberIndex: memberIndex,
         });
-        state.docAcceptors = acceptors;
-        renderDocAcceptorList();
+        showToast('Member removed', 'success');
+        await fetchPeers();
     } catch (error) {
-        console.error('Failed to fetch acceptors:', error);
+        console.error('Failed to remove member:', error);
+        showToast(`Failed to remove member: ${error}`, 'error');
+    }
+}
+
+async function removeAcceptor(acceptorIdB58) {
+    if (!state.currentDocument) return;
+    try {
+        await invoke('remove_acceptor', {
+            groupId: state.currentDocument.group_id,
+            acceptorIdB58: acceptorIdB58,
+        });
+        showToast('Acceptor removed', 'success');
+        await fetchPeers();
+    } catch (error) {
+        console.error('Failed to remove acceptor:', error);
+        showToast(`Failed to remove acceptor: ${error}`, 'error');
     }
 }
 
@@ -274,7 +323,6 @@ async function startWelcomeListener() {
             lastText = doc.text;
             
             showEditor();
-            await fetchDocAcceptors();
             updateSyncStatus('synced');
             showToast('Joined document!', 'success');
             
@@ -307,7 +355,6 @@ async function joinDocumentWithWelcome(welcomeBytes) {
         lastText = doc.text;
         
         showEditor();
-        await fetchDocAcceptors();
         updateSyncStatus('synced');
         showToast('Joined document!', 'success');
         
@@ -335,7 +382,6 @@ async function createDocument() {
         lastText = doc.text;
         
         showEditor();
-        await fetchDocAcceptors();
         updateSyncStatus('synced');
         showToast('Document created!', 'success');
         
@@ -495,76 +541,46 @@ function setupEventListeners() {
         }
     });
     
-    // Add member button
-    elements.btnAddMember.addEventListener('click', () => {
+    // Peers modal
+    elements.btnPeers.addEventListener('click', () => {
         if (!state.currentDocument) {
             showToast('No document open', 'error');
             return;
         }
-        elements.inviteKp.value = '';
-        showModal(elements.inviteModal);
+        elements.peerInput.value = '';
+        fetchPeers();
+        showModal(elements.peersModal);
     });
-    
-    // Invite modal (add member)
-    elements.btnInviteCancel.addEventListener('click', () => hideModal(elements.inviteModal));
-    elements.inviteModalClose.addEventListener('click', () => hideModal(elements.inviteModal));
-    elements.inviteModal.querySelector('.modal-backdrop').addEventListener('click', () => hideModal(elements.inviteModal));
-    
-    elements.btnInviteConfirm.addEventListener('click', async () => {
-        const inviteCode = elements.inviteKp.value.trim();
-        if (!inviteCode) {
-            showToast('Please enter an invite code', 'error');
+
+    const closePeersModal = () => hideModal(elements.peersModal);
+    elements.btnPeersDone.addEventListener('click', closePeersModal);
+    elements.peersModalClose.addEventListener('click', closePeersModal);
+    elements.peersModal.querySelector('.modal-backdrop').addEventListener('click', closePeersModal);
+
+    elements.btnAddPeer.addEventListener('click', async () => {
+        const input = elements.peerInput.value.trim();
+        if (!input) {
+            showToast('Please paste an invite code or acceptor address', 'error');
             return;
         }
-        
-        if (!state.currentDocument) {
-            showToast('No document open', 'error');
-            return;
-        }
-        
-        try {
-            await invoke('add_member', {
-                groupId: state.currentDocument.group_id,
-                keyPackageB58: inviteCode,
-            });
-            hideModal(elements.inviteModal);
-            showToast('Member added! Share the welcome message with them.', 'success');
-            // TODO: Show the welcome message to copy
-        } catch (error) {
-            console.error('Failed to add member:', error);
-            showToast(`Failed to add member: ${error}`, 'error');
+        await addPeer(input);
+        elements.peerInput.value = '';
+    });
+
+    // Delegate remove clicks inside the peer list
+    elements.peerList.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-action]');
+        if (!btn) return;
+        const action = btn.dataset.action;
+        if (action === 'remove-member') {
+            removeMember(parseInt(btn.dataset.index, 10));
+        } else if (action === 'remove-acceptor') {
+            removeAcceptor(btn.dataset.id);
         }
     });
-    
+
     // Editor input
     elements.editor.addEventListener('input', handleEditorInput);
-    
-    // Document acceptor modal
-    elements.btnDocAcceptors.addEventListener('click', () => {
-        if (!state.currentDocument) {
-            showToast('No document open', 'error');
-            return;
-        }
-        renderDocAcceptorList();
-        showModal(elements.acceptorModal);
-    });
-    
-    const closeDocAcceptorModal = () => hideModal(elements.acceptorModal);
-    elements.btnAcceptorDone.addEventListener('click', closeDocAcceptorModal);
-    elements.acceptorModalClose.addEventListener('click', closeDocAcceptorModal);
-    elements.acceptorModal.querySelector('.modal-backdrop').addEventListener('click', closeDocAcceptorModal);
-    
-    elements.btnAddAcceptorConfirm.addEventListener('click', async () => {
-        const addr = elements.acceptorAddr.value.trim();
-        
-        if (!addr) {
-            showToast('Please enter the acceptor address', 'error');
-            return;
-        }
-        
-        await addDocAcceptor(addr);
-        elements.acceptorAddr.value = '';
-    });
 
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
@@ -577,7 +593,7 @@ function setupEventListeners() {
         // Escape = Close modals
         if (e.key === 'Escape') {
             hideModal(elements.joinModal);
-            hideModal(elements.inviteModal);
+            hideModal(elements.peersModal);
         }
     });
 }
@@ -614,13 +630,13 @@ async function setupTauriEvents() {
         }
     });
     
-    // Listen for acceptor list changes
+    // Refresh the peers modal if it's open when acceptors change
     await listen('acceptors-updated', (event) => {
-        const { group_id, acceptors } = event.payload;
-        
+        const { group_id } = event.payload;
         if (state.currentDocument && state.currentDocument.group_id === group_id) {
-            state.docAcceptors = acceptors;
-            renderDocAcceptorList();
+            if (!elements.peersModal.classList.contains('hidden')) {
+                fetchPeers();
+            }
         }
     });
     

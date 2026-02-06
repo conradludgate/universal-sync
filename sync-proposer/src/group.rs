@@ -195,6 +195,17 @@ pub enum GroupEvent {
     Unknown,
 }
 
+/// Information about a single group member.
+#[derive(Debug, Clone)]
+pub struct MemberInfo {
+    /// MLS roster index (used for `remove_member`).
+    pub index: u32,
+    /// The raw credential identity bytes (e.g. the bytes passed to `BasicCredential::new`).
+    pub identity: Vec<u8>,
+    /// Whether this member is the local node.
+    pub is_self: bool,
+}
+
 /// Current state of the group
 #[derive(Debug, Clone)]
 pub struct GroupContext {
@@ -204,6 +215,8 @@ pub struct GroupContext {
     pub epoch: Epoch,
     /// Number of members in the group
     pub member_count: usize,
+    /// Detailed information about each member.
+    pub members: Vec<MemberInfo>,
     /// Current set of acceptor IDs
     pub acceptors: Vec<AcceptorId>,
     /// The confirmed transcript hash for this epoch
@@ -1176,10 +1189,30 @@ where
     /// Get the current group context
     fn get_context(&self) -> GroupContext {
         let mls_context = self.learner.group().context();
+        let my_index = self.learner.group().current_member_index();
+        let members = self
+            .learner
+            .group()
+            .roster()
+            .members()
+            .iter()
+            .map(|m| MemberInfo {
+                index: m.index,
+                identity: m
+                    .signing_identity
+                    .credential
+                    .as_basic()
+                    .map(|b| b.identifier.clone())
+                    .unwrap_or_default(),
+                is_self: m.index == my_index,
+            })
+            .collect::<Vec<_>>();
+        let member_count = members.len();
         GroupContext {
             group_id: self.group_id,
             epoch: self.learner.mls_epoch(),
-            member_count: self.learner.group().roster().members().len(),
+            member_count,
+            members,
             acceptors: self.learner.acceptor_ids().collect(),
             confirmed_transcript_hash: mls_context.confirmed_transcript_hash.to_vec(),
         }

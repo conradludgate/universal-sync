@@ -48,6 +48,20 @@ pub struct DocumentInfo {
     pub member_count: usize,
 }
 
+/// A member or acceptor listed in the peers dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum PeerEntry {
+    Member {
+        index: u32,
+        identity: String,
+        is_self: bool,
+    },
+    Acceptor {
+        id: String,
+    },
+}
+
 /// Payload emitted to the frontend when a document is updated by a remote peer.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentUpdatedPayload {
@@ -131,6 +145,25 @@ pub enum DocRequest {
     /// List the group's acceptors.
     ListAcceptors {
         reply: oneshot::Sender<Result<Vec<String>, String>>,
+    },
+    /// List all peers (members + acceptors).
+    ListPeers {
+        reply: oneshot::Sender<Result<Vec<PeerEntry>, String>>,
+    },
+    /// Add a peer: auto-detect KeyPackage (member) vs EndpointAddr (acceptor).
+    AddPeer {
+        input_b58: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Remove a member by roster index.
+    RemoveMember {
+        member_index: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Remove an acceptor by its ID (base58).
+    RemoveAcceptor {
+        acceptor_id_b58: String,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     /// Shut down the document actor.
     #[allow(dead_code)]

@@ -16,7 +16,7 @@ use universal_sync_proposer::Group;
 use universal_sync_testing::YrsCrdt;
 use yrs::{GetString, Text, Transact};
 
-use crate::types::{Delta, DocRequest, DocumentUpdatedPayload, EventEmitter};
+use crate::types::{Delta, DocRequest, DocumentUpdatedPayload, EventEmitter, PeerEntry};
 
 /// Actor that manages a single open document / MLS group.
 pub struct DocumentActor<C, CS, E>
@@ -102,6 +102,28 @@ where
             }
             DocRequest::ListAcceptors { reply } => {
                 let result = self.list_acceptors().await;
+                let _ = reply.send(result);
+            }
+            DocRequest::ListPeers { reply } => {
+                let result = self.list_peers().await;
+                let _ = reply.send(result);
+            }
+            DocRequest::AddPeer { input_b58, reply } => {
+                let result = self.add_peer(&input_b58).await;
+                let _ = reply.send(result);
+            }
+            DocRequest::RemoveMember {
+                member_index,
+                reply,
+            } => {
+                let result = self.remove_member(member_index).await;
+                let _ = reply.send(result);
+            }
+            DocRequest::RemoveAcceptor {
+                acceptor_id_b58,
+                reply,
+            } => {
+                let result = self.remove_acceptor(&acceptor_id_b58).await;
                 let _ = reply.send(result);
             }
             DocRequest::Shutdown => return true,
@@ -220,6 +242,72 @@ where
             .iter()
             .map(|a| bs58::encode(a.as_bytes()).into_string())
             .collect())
+    }
+
+    async fn list_peers(&mut self) -> Result<Vec<PeerEntry>, String> {
+        let ctx = self
+            .group
+            .context()
+            .await
+            .map_err(|e| format!("failed to get context: {e:?}"))?;
+
+        let mut peers = Vec::new();
+        for m in &ctx.members {
+            let identity = String::from_utf8(m.identity.clone())
+                .unwrap_or_else(|_| bs58::encode(&m.identity).into_string());
+            peers.push(PeerEntry::Member {
+                index: m.index,
+                identity,
+                is_self: m.is_self,
+            });
+        }
+        for a in &ctx.acceptors {
+            peers.push(PeerEntry::Acceptor {
+                id: bs58::encode(a.as_bytes()).into_string(),
+            });
+        }
+        Ok(peers)
+    }
+
+    async fn add_peer(&mut self, input_b58: &str) -> Result<(), String> {
+        let bytes = bs58::decode(input_b58)
+            .into_vec()
+            .map_err(|e| format!("invalid base58: {e}"))?;
+
+        // Try parsing as a KeyPackage first (add member)
+        if let Ok(msg) = MlsMessage::from_bytes(&bytes) {
+            if msg.as_key_package().is_some() {
+                return self.add_member(input_b58).await;
+            }
+        }
+
+        // Otherwise try as an EndpointAddr (add acceptor)
+        if postcard::from_bytes::<iroh::EndpointAddr>(&bytes).is_ok() {
+            return self.add_acceptor(input_b58).await;
+        }
+
+        Err("input is neither a valid KeyPackage nor an EndpointAddr".to_string())
+    }
+
+    async fn remove_member(&mut self, member_index: u32) -> Result<(), String> {
+        self.group
+            .remove_member(member_index)
+            .await
+            .map_err(|e| format!("failed to remove member: {e:?}"))
+    }
+
+    async fn remove_acceptor(&mut self, acceptor_id_b58: &str) -> Result<(), String> {
+        let bytes = bs58::decode(acceptor_id_b58)
+            .into_vec()
+            .map_err(|e| format!("invalid base58: {e}"))?;
+        let acceptor_id =
+            universal_sync_core::AcceptorId::from_bytes(bytes.try_into().map_err(|_| {
+                "acceptor ID must be 32 bytes".to_string()
+            })?);
+        self.group
+            .remove_acceptor(acceptor_id)
+            .await
+            .map_err(|e| format!("failed to remove acceptor: {e:?}"))
     }
 
     fn emit_text_update(&self) {

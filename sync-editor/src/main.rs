@@ -68,6 +68,10 @@ fn main() {
             commands::add_member,
             commands::add_acceptor,
             commands::list_acceptors,
+            commands::list_peers,
+            commands::add_peer,
+            commands::remove_member,
+            commands::remove_acceptor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
