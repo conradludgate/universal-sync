@@ -270,6 +270,7 @@ async function startWelcomeListener() {
             elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
             elements.docId.title = doc.group_id;
             elements.editor.value = doc.text;
+            lastSentText = doc.text;
             lastText = doc.text;
             
             showEditor();
@@ -302,6 +303,7 @@ async function joinDocumentWithWelcome(welcomeBytes) {
         elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
         elements.docId.title = doc.group_id;
         elements.editor.value = doc.text;
+        lastSentText = doc.text;
         lastText = doc.text;
         
         showEditor();
@@ -329,6 +331,7 @@ async function createDocument() {
         elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
         elements.docId.title = doc.group_id;
         elements.editor.value = doc.text;
+        lastSentText = doc.text;
         lastText = doc.text;
         
         showEditor();
@@ -367,36 +370,39 @@ async function refreshText() {
 // Text Editing
 // ============================================================================
 
+// `lastSentText` tracks the text that the backend CRDT is known to have.
+// We only update it after a successful send or when a remote update arrives.
+let lastSentText = '';
 let lastText = '';
 let debounceTimer = null;
 
 async function handleEditorInput() {
-    const newText = elements.editor.value;
-    
     if (!state.currentDocument) return;
-    
-    // Find the diff between old and new text
-    // This is a simple implementation - a real editor would use OT/CRDT-aware diffing
-    const delta = computeDelta(lastText, newText);
-    
-    if (delta) {
-        // Debounce rapid changes
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(async () => {
-            try {
-                await invoke('apply_delta', {
-                    groupId: state.currentDocument.group_id,
-                    delta: delta,
-                });
-                updateSyncStatus('synced');
-            } catch (error) {
-                console.error('Failed to apply delta:', error);
-                updateSyncStatus('error');
-            }
-        }, 50);
-    }
-    
-    lastText = newText;
+
+    lastText = elements.editor.value;
+
+    // Debounce rapid changes.  When the timer fires we compute the
+    // delta against `lastSentText` (the last state the backend knows
+    // about), so the diff captures ALL intermediate keystrokes — not
+    // just the most recent one.
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(async () => {
+        const currentText = elements.editor.value;
+        const delta = computeDelta(lastSentText, currentText);
+        if (!delta) return;
+
+        try {
+            await invoke('apply_delta', {
+                groupId: state.currentDocument.group_id,
+                delta: delta,
+            });
+            lastSentText = currentText;
+            updateSyncStatus('synced');
+        } catch (error) {
+            console.error('Failed to apply delta:', error);
+            updateSyncStatus('error');
+        }
+    }, 50);
 }
 
 function computeDelta(oldText, newText) {
@@ -585,6 +591,10 @@ async function setupTauriEvents() {
         const { group_id, text } = event.payload;
         
         if (state.currentDocument && state.currentDocument.group_id === group_id) {
+            // The backend CRDT now contains `text`, so update our
+            // baseline so the next delta is computed against it.
+            lastSentText = text;
+
             // Skip no-op updates (e.g. echo of own edits)
             if (text === lastText) return;
             
