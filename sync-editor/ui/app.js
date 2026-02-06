@@ -1,88 +1,95 @@
 /**
- * Sync Editor - Frontend application
- * 
- * A collaborative text editor using Tauri + universal-sync
+ * Sync Editor — Frontend application
+ *
+ * Sidebar-driven collaborative text editor using Tauri + universal-sync.
  */
 
-// Check if we're running in Tauri
+// ============================================================================
+// Tauri bridge
+// ============================================================================
+
 const isTauri = '__TAURI__' in window;
 
-// Tauri API bridge (or mock for development)
-const invoke = isTauri 
-    ? window.__TAURI__.core.invoke 
+const invoke = isTauri
+    ? window.__TAURI__.core.invoke
     : async (cmd, args) => {
         console.log(`[Mock] invoke: ${cmd}`, args);
-        // Mock responses for development
         if (cmd === 'create_document') {
             return { group_id: 'mock-' + Date.now(), text: '', member_count: 1 };
         }
-        if (cmd === 'get_document_text') {
-            return 'Mock document text';
-        }
+        if (cmd === 'get_document_text') return '';
         return null;
     };
 
+// ============================================================================
 // State
+// ============================================================================
+
 const state = {
+    /** @type {{ group_id: string, text: string }|null} */
     currentDocument: null,
-    isConnected: false,
-    pendingChanges: [],
+    /** @type {Map<string, { group_id: string, text: string }>} */
+    documents: new Map(),
+    sidebarOpen: true,
 };
 
-// DOM Elements
-const elements = {
-    emptyState: document.getElementById('empty-state'),
-    editorContainer: document.getElementById('editor-container'),
-    editor: document.getElementById('editor'),
-    docId: document.getElementById('doc-id'),
-    syncStatus: document.getElementById('sync-status'),
-    collaborators: document.getElementById('collaborators'),
-    toastContainer: document.getElementById('toast-container'),
-    
-    // Group state display
-    groupState: document.getElementById('group-state'),
-    groupEpoch: document.getElementById('group-epoch'),
-    groupHash: document.getElementById('group-hash'),
-    groupMembers: document.getElementById('group-members'),
-    btnUpdateKeys: document.getElementById('btn-update-keys'),
-    
-    // Buttons
+// ============================================================================
+// DOM references
+// ============================================================================
+
+const el = {
+    // Layout
+    sidebar: document.getElementById('sidebar'),
+    btnToggleSidebar: document.getElementById('btn-toggle-sidebar'),
+
+    // Doc list
+    docList: document.getElementById('doc-list'),
+    docListEmpty: document.getElementById('doc-list-empty'),
     btnNewDoc: document.getElementById('btn-new-doc'),
-    btnNewDocEmpty: document.getElementById('btn-new-doc-empty'),
-    btnJoinDoc: document.getElementById('btn-join-doc'),
-    btnCopyId: document.getElementById('btn-copy-id'),
-    btnPeers: document.getElementById('btn-peers'),
-    
-    // Join modal
-    joinModal: document.getElementById('join-modal'),
+
+    // Join inline (sidebar)
+    joinIdle: document.getElementById('join-idle'),
+    joinActive: document.getElementById('join-active'),
+    btnJoinStart: document.getElementById('btn-join-start'),
     myInviteCode: document.getElementById('my-invite-code'),
     btnCopyInviteCode: document.getElementById('btn-copy-invite-code'),
     joinStatus: document.getElementById('join-status'),
     btnJoinCancel: document.getElementById('btn-join-cancel'),
-    joinModalClose: document.getElementById('join-modal-close'),
-    
-    // Peers modal (unified members + acceptors)
-    peersModal: document.getElementById('peers-modal'),
+
+    // Editor
+    emptyState: document.getElementById('empty-state'),
+    editorContainer: document.getElementById('editor-container'),
+    editor: document.getElementById('editor'),
+    docId: document.getElementById('doc-id'),
+    btnCopyId: document.getElementById('btn-copy-id'),
+    syncStatus: document.getElementById('sync-status'),
+
+    // Share modal
+    btnShare: document.getElementById('btn-share'),
+    shareModal: document.getElementById('share-modal'),
+    shareModalClose: document.getElementById('share-modal-close'),
+    btnShareDone: document.getElementById('btn-share-done'),
+    groupEpoch: document.getElementById('group-epoch'),
+    groupHash: document.getElementById('group-hash'),
+    groupMembers: document.getElementById('group-members'),
+    btnUpdateKeys: document.getElementById('btn-update-keys'),
     peerList: document.getElementById('peer-list'),
     peerEmpty: document.getElementById('peer-empty'),
     peerInput: document.getElementById('peer-input'),
     btnAddPeer: document.getElementById('btn-add-peer'),
-    btnPeersDone: document.getElementById('btn-peers-done'),
-    peersModalClose: document.getElementById('peers-modal-close'),
+
+    toastContainer: document.getElementById('toast-container'),
 };
 
 // ============================================================================
-// Toast Notifications
+// Toast
 // ============================================================================
 
 function showToast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
     toast.textContent = message;
-    
-    elements.toastContainer.appendChild(toast);
-    
-    // Auto-remove after 3 seconds
+    el.toastContainer.appendChild(toast);
     setTimeout(() => {
         toast.classList.add('leaving');
         setTimeout(() => toast.remove(), 200);
@@ -90,53 +97,324 @@ function showToast(message, type = 'info') {
 }
 
 // ============================================================================
-// Modal Management
+// Modal helpers
 // ============================================================================
 
-function showModal(modal) {
-    modal.classList.remove('hidden');
-}
+function showModal(m) { m.classList.remove('hidden'); }
+function hideModal(m) { m.classList.add('hidden'); }
 
-function hideModal(modal) {
-    modal.classList.add('hidden');
+// ============================================================================
+// Sidebar toggle
+// ============================================================================
+
+function toggleSidebar() {
+    state.sidebarOpen = !state.sidebarOpen;
+    el.sidebar.classList.toggle('collapsed', !state.sidebarOpen);
 }
 
 // ============================================================================
-// Editor Management
+// Document list (sidebar)
+// ============================================================================
+
+function renderDocList() {
+    // Remove old items
+    el.docList.querySelectorAll('.doc-item').forEach(e => e.remove());
+
+    if (state.documents.size === 0) {
+        el.docListEmpty.classList.remove('hidden');
+        return;
+    }
+    el.docListEmpty.classList.add('hidden');
+
+    for (const [gid, doc] of state.documents) {
+        const item = document.createElement('div');
+        item.className = 'doc-item';
+        if (state.currentDocument && state.currentDocument.group_id === gid) {
+            item.classList.add('active');
+        }
+        const label = gid.length > 12 ? gid.slice(0, 6) + '…' + gid.slice(-6) : gid;
+        item.innerHTML = `<span class="doc-item-label" title="${escapeHtml(gid)}">${escapeHtml(label)}</span>`;
+        item.addEventListener('click', () => switchToDocument(gid));
+        el.docList.appendChild(item);
+    }
+}
+
+function switchToDocument(gid) {
+    const doc = state.documents.get(gid);
+    if (!doc) return;
+
+    // Save current editor text back into the current doc state
+    if (state.currentDocument) {
+        state.currentDocument.text = el.editor.value;
+    }
+
+    state.currentDocument = doc;
+    el.docId.textContent = gid.length > 16 ? gid.slice(0, 8) + '…' + gid.slice(-8) : gid;
+    el.docId.title = gid;
+    el.editor.value = doc.text;
+    lastSentText = doc.text;
+    lastText = doc.text;
+
+    showEditor();
+    renderDocList();
+    fetchGroupState();
+}
+
+// ============================================================================
+// Editor management
 // ============================================================================
 
 function showEditor() {
-    elements.emptyState.classList.add('hidden');
-    elements.editorContainer.classList.remove('hidden');
-    elements.editor.focus();
-}
-
-function hideEditor() {
-    elements.editorContainer.classList.add('hidden');
-    elements.emptyState.classList.remove('hidden');
+    el.emptyState.classList.add('hidden');
+    el.editorContainer.classList.remove('hidden');
+    el.editor.focus();
 }
 
 function updateSyncStatus(status) {
-    const indicator = elements.syncStatus.querySelector('.sync-indicator');
-    
+    const indicator = el.syncStatus.querySelector('.sync-indicator');
     switch (status) {
         case 'synced':
             indicator.className = 'sync-indicator synced';
-            elements.syncStatus.lastChild.textContent = 'Synced';
+            el.syncStatus.lastChild.textContent = 'Synced';
             break;
         case 'syncing':
             indicator.className = 'sync-indicator syncing';
-            elements.syncStatus.lastChild.textContent = 'Syncing...';
+            el.syncStatus.lastChild.textContent = 'Syncing…';
             break;
         case 'error':
             indicator.className = 'sync-indicator error';
-            elements.syncStatus.lastChild.textContent = 'Error';
+            el.syncStatus.lastChild.textContent = 'Error';
             break;
     }
 }
 
 // ============================================================================
-// Peer Management (members + acceptors)
+// Document operations
+// ============================================================================
+
+async function createDocument() {
+    try {
+        updateSyncStatus('syncing');
+        const doc = await invoke('create_document');
+
+        state.documents.set(doc.group_id, doc);
+        state.currentDocument = doc;
+
+        el.docId.textContent = doc.group_id.slice(0, 8) + '…' + doc.group_id.slice(-8);
+        el.docId.title = doc.group_id;
+        el.editor.value = doc.text;
+        lastSentText = doc.text;
+        lastText = doc.text;
+
+        showEditor();
+        updateSyncStatus('synced');
+        renderDocList();
+        fetchGroupState();
+        showToast('Document created!', 'success');
+    } catch (error) {
+        console.error('Failed to create document:', error);
+        showToast(`Failed to create document: ${error}`, 'error');
+        updateSyncStatus('error');
+    }
+}
+
+function openDocument(doc) {
+    state.documents.set(doc.group_id, doc);
+    state.currentDocument = doc;
+
+    el.docId.textContent = doc.group_id.slice(0, 8) + '…' + doc.group_id.slice(-8);
+    el.docId.title = doc.group_id;
+    el.editor.value = doc.text;
+    lastSentText = doc.text;
+    lastText = doc.text;
+
+    showEditor();
+    updateSyncStatus('synced');
+    renderDocList();
+    fetchGroupState();
+}
+
+// ============================================================================
+// Text editing
+// ============================================================================
+
+let lastSentText = '';
+let lastText = '';
+let debounceTimer = null;
+
+async function handleEditorInput() {
+    if (!state.currentDocument) return;
+    lastText = el.editor.value;
+
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(async () => {
+        const currentText = el.editor.value;
+        const delta = computeDelta(lastSentText, currentText);
+        if (!delta) return;
+
+        lastSentText = currentText;
+
+        try {
+            await invoke('apply_delta', {
+                groupId: state.currentDocument.group_id,
+                delta,
+            });
+            updateSyncStatus('synced');
+        } catch (error) {
+            console.error('Failed to apply delta:', error);
+            updateSyncStatus('error');
+        }
+    }, 50);
+}
+
+function computeDelta(oldText, newText) {
+    let prefixLen = 0;
+    while (prefixLen < oldText.length &&
+           prefixLen < newText.length &&
+           oldText[prefixLen] === newText[prefixLen]) {
+        prefixLen++;
+    }
+
+    let oldSuffixStart = oldText.length;
+    let newSuffixStart = newText.length;
+    while (oldSuffixStart > prefixLen &&
+           newSuffixStart > prefixLen &&
+           oldText[oldSuffixStart - 1] === newText[newSuffixStart - 1]) {
+        oldSuffixStart--;
+        newSuffixStart--;
+    }
+
+    const deleteLen = oldSuffixStart - prefixLen;
+    const insertText = newText.slice(prefixLen, newSuffixStart);
+
+    if (deleteLen === 0 && insertText.length === 0) return null;
+    if (deleteLen > 0 && insertText.length > 0) {
+        return { type: 'Replace', position: prefixLen, length: deleteLen, text: insertText };
+    }
+    if (deleteLen > 0) {
+        return { type: 'Delete', position: prefixLen, length: deleteLen };
+    }
+    if (insertText.length > 0) {
+        return { type: 'Insert', position: prefixLen, text: insertText };
+    }
+    return null;
+}
+
+// ============================================================================
+// Join flow (sidebar inline)
+// ============================================================================
+
+let welcomeListenerActive = false;
+
+async function startJoinFlow() {
+    el.joinIdle.classList.add('hidden');
+    el.joinActive.classList.remove('hidden');
+    el.myInviteCode.value = 'Generating…';
+
+    try {
+        const code = await invoke('get_key_package');
+        el.myInviteCode.value = code;
+
+        el.joinStatus.innerHTML = `
+            <span class="join-status-icon">⏳</span>
+            <span class="join-status-text">Waiting to be added…</span>
+        `;
+        el.joinStatus.classList.remove('success');
+
+        startWelcomeListener();
+    } catch (error) {
+        el.myInviteCode.value = 'Error';
+        showToast('Failed to generate invite code', 'error');
+    }
+}
+
+async function startWelcomeListener() {
+    if (welcomeListenerActive) return;
+    welcomeListenerActive = true;
+
+    try {
+        const doc = await invoke('recv_welcome');
+        if (doc && welcomeListenerActive) {
+            el.joinStatus.innerHTML = `
+                <span class="join-status-icon">✓</span>
+                <span class="join-status-text">Joined!</span>
+            `;
+            el.joinStatus.classList.add('success');
+
+            openDocument(doc);
+            showToast('Joined document!', 'success');
+
+            // Reset join UI after a moment
+            setTimeout(cancelJoinFlow, 1500);
+        }
+    } catch (error) {
+        if (welcomeListenerActive) {
+            console.error('Welcome listener error:', error);
+            showToast(`Failed to join: ${error}`, 'error');
+        }
+    } finally {
+        welcomeListenerActive = false;
+    }
+}
+
+function cancelJoinFlow() {
+    welcomeListenerActive = false;
+    el.joinActive.classList.add('hidden');
+    el.joinIdle.classList.remove('hidden');
+}
+
+// ============================================================================
+// Group state (inside Share modal)
+// ============================================================================
+
+function updateGroupStateDisplay(payload) {
+    el.groupEpoch.textContent = payload.epoch;
+    const shortHash = payload.transcript_hash.slice(0, 16) + '…';
+    el.groupHash.textContent = shortHash;
+    el.groupHash.title = `${payload.transcript_hash}\n(click to copy)`;
+    el.groupHash.dataset.fullHash = payload.transcript_hash;
+    el.groupMembers.textContent = payload.member_count;
+}
+
+function resetGroupStateDisplay() {
+    el.groupEpoch.textContent = '—';
+    el.groupHash.textContent = '—';
+    el.groupHash.title = '';
+    el.groupMembers.textContent = '—';
+}
+
+async function fetchGroupState() {
+    if (!state.currentDocument) return;
+    try {
+        const gs = await invoke('get_group_state', {
+            groupId: state.currentDocument.group_id,
+        });
+        updateGroupStateDisplay(gs);
+    } catch (error) {
+        console.error('Failed to fetch group state:', error);
+    }
+}
+
+async function updateKeys() {
+    if (!state.currentDocument) return;
+    try {
+        el.btnUpdateKeys.disabled = true;
+        el.btnUpdateKeys.textContent = '⏳ Updating…';
+        await invoke('update_keys', {
+            groupId: state.currentDocument.group_id,
+        });
+        showToast('Keys updated! Epoch advanced.', 'success');
+    } catch (error) {
+        console.error('Failed to update keys:', error);
+        showToast(`Failed to update keys: ${error}`, 'error');
+    } finally {
+        el.btnUpdateKeys.disabled = false;
+        el.btnUpdateKeys.innerHTML = '🔑 Update Keys';
+    }
+}
+
+// ============================================================================
+// Peers (inside Share modal)
 // ============================================================================
 
 function escapeHtml(text) {
@@ -150,14 +428,13 @@ function shortId(id) {
 }
 
 function renderPeerList(peers) {
-    // Remove existing items (keep the empty placeholder)
-    elements.peerList.querySelectorAll('.peer-item, .peer-section-label').forEach(el => el.remove());
+    el.peerList.querySelectorAll('.peer-item, .peer-section-label').forEach(e => e.remove());
 
     if (peers.length === 0) {
-        elements.peerEmpty.classList.remove('hidden');
+        el.peerEmpty.classList.remove('hidden');
         return;
     }
-    elements.peerEmpty.classList.add('hidden');
+    el.peerEmpty.classList.add('hidden');
 
     const members = peers.filter(p => p.kind === 'Member');
     const acceptors = peers.filter(p => p.kind === 'Acceptor');
@@ -166,7 +443,7 @@ function renderPeerList(peers) {
         const label = document.createElement('div');
         label.className = 'peer-section-label';
         label.textContent = 'Members';
-        elements.peerList.appendChild(label);
+        el.peerList.appendChild(label);
 
         members.forEach(m => {
             const item = document.createElement('div');
@@ -176,9 +453,9 @@ function renderPeerList(peers) {
                 <div class="peer-item-info">
                     <span class="peer-item-id" title="${escapeHtml(m.identity)}">${escapeHtml(shortId(m.identity))}${selfTag}</span>
                 </div>
-                ${!m.is_self ? `<button class="peer-item-remove" data-action="remove-member" data-index="${m.index}" title="Remove member">✕</button>` : ''}
+                ${!m.is_self ? `<button class="peer-item-remove" data-action="remove-member" data-index="${m.index}" title="Remove">✕</button>` : ''}
             `;
-            elements.peerList.appendChild(item);
+            el.peerList.appendChild(item);
         });
     }
 
@@ -186,7 +463,7 @@ function renderPeerList(peers) {
         const label = document.createElement('div');
         label.className = 'peer-section-label';
         label.textContent = 'Acceptors';
-        elements.peerList.appendChild(label);
+        el.peerList.appendChild(label);
 
         acceptors.forEach(a => {
             const item = document.createElement('div');
@@ -195,9 +472,9 @@ function renderPeerList(peers) {
                 <div class="peer-item-info">
                     <span class="peer-item-id" title="${escapeHtml(a.id)}">${escapeHtml(shortId(a.id))}</span>
                 </div>
-                <button class="peer-item-remove" data-action="remove-acceptor" data-id="${escapeHtml(a.id)}" title="Remove acceptor">✕</button>
+                <button class="peer-item-remove" data-action="remove-acceptor" data-id="${escapeHtml(a.id)}" title="Remove">✕</button>
             `;
-            elements.peerList.appendChild(item);
+            el.peerList.appendChild(item);
         });
     }
 }
@@ -215,10 +492,7 @@ async function fetchPeers() {
 }
 
 async function addPeer(input) {
-    if (!state.currentDocument) {
-        showToast('No document open', 'error');
-        return;
-    }
+    if (!state.currentDocument) return;
     try {
         await invoke('add_peer', {
             groupId: state.currentDocument.group_id,
@@ -232,12 +506,12 @@ async function addPeer(input) {
     }
 }
 
-async function removeMember(memberIndex) {
+async function removeMember(idx) {
     if (!state.currentDocument) return;
     try {
         await invoke('remove_member', {
             groupId: state.currentDocument.group_id,
-            memberIndex: memberIndex,
+            memberIndex: idx,
         });
         showToast('Member removed', 'success');
         await fetchPeers();
@@ -247,12 +521,12 @@ async function removeMember(memberIndex) {
     }
 }
 
-async function removeAcceptor(acceptorIdB58) {
+async function removeAcceptor(id) {
     if (!state.currentDocument) return;
     try {
         await invoke('remove_acceptor', {
             groupId: state.currentDocument.group_id,
-            acceptorIdB58: acceptorIdB58,
+            acceptorIdB58: id,
         });
         showToast('Acceptor removed', 'success');
         await fetchPeers();
@@ -263,492 +537,177 @@ async function removeAcceptor(acceptorIdB58) {
 }
 
 // ============================================================================
-// Group State (epoch, transcript hash, member count)
-// ============================================================================
-
-function updateGroupStateDisplay(payload) {
-    elements.groupEpoch.textContent = payload.epoch;
-    elements.groupHash.textContent = payload.transcript_hash.slice(0, 16) + '…';
-    elements.groupHash.title = `Transcript hash: ${payload.transcript_hash}\n(click to copy)`;
-    elements.groupHash.dataset.fullHash = payload.transcript_hash;
-    elements.groupMembers.textContent = payload.member_count;
-}
-
-function resetGroupStateDisplay() {
-    elements.groupEpoch.textContent = '—';
-    elements.groupHash.textContent = '—';
-    elements.groupHash.title = 'Transcript hash';
-    elements.groupMembers.textContent = '—';
-}
-
-async function fetchGroupState() {
-    if (!state.currentDocument) return;
-    try {
-        const gs = await invoke('get_group_state', {
-            groupId: state.currentDocument.group_id,
-        });
-        updateGroupStateDisplay(gs);
-    } catch (error) {
-        console.error('Failed to fetch group state:', error);
-    }
-}
-
-async function updateKeys() {
-    if (!state.currentDocument) {
-        showToast('No document open', 'error');
-        return;
-    }
-    try {
-        elements.btnUpdateKeys.disabled = true;
-        elements.btnUpdateKeys.textContent = '⏳ Updating…';
-        await invoke('update_keys', {
-            groupId: state.currentDocument.group_id,
-        });
-        showToast('Keys updated! Epoch advanced.', 'success');
-    } catch (error) {
-        console.error('Failed to update keys:', error);
-        showToast(`Failed to update keys: ${error}`, 'error');
-    } finally {
-        elements.btnUpdateKeys.disabled = false;
-        elements.btnUpdateKeys.innerHTML = '🔑 Update Keys';
-    }
-}
-
-// ============================================================================
-// Invite Code (Key Package)
-// ============================================================================
-
-async function generateInviteCode() {
-    try {
-        const keyPackage = await invoke('get_key_package');
-        return keyPackage;
-    } catch (error) {
-        console.error('Failed to generate invite code:', error);
-        throw error;
-    }
-}
-
-async function showJoinModal() {
-    showModal(elements.joinModal);
-    elements.myInviteCode.value = 'Generating...';
-    elements.joinStatus.classList.add('hidden');
-    
-    try {
-        const inviteCode = await generateInviteCode();
-        elements.myInviteCode.value = inviteCode;
-        
-        // Show waiting status
-        elements.joinStatus.classList.remove('hidden');
-        elements.joinStatus.innerHTML = `
-            <span class="join-status-icon">⏳</span>
-            <span class="join-status-text">Waiting to be added...</span>
-        `;
-        
-        // Start listening for welcome message
-        startWelcomeListener();
-        
-    } catch (error) {
-        elements.myInviteCode.value = 'Error generating invite code';
-        showToast('Failed to generate invite code', 'error');
-    }
-}
-
-// Welcome listener state
-let welcomeListenerActive = false;
-
-async function startWelcomeListener() {
-    if (welcomeListenerActive) return;
-    welcomeListenerActive = true;
-    
-    try {
-        // recv_welcome blocks until a welcome arrives, then auto-joins
-        // and returns DocumentInfo directly.
-        const doc = await invoke('recv_welcome');
-        
-        if (doc && welcomeListenerActive) {
-            elements.joinStatus.innerHTML = `
-                <span class="join-status-icon">✓</span>
-                <span class="join-status-text">Joined!</span>
-            `;
-            elements.joinStatus.classList.add('success');
-            
-            // Apply the returned document info
-            state.currentDocument = doc;
-            elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
-            elements.docId.title = doc.group_id;
-            elements.editor.value = doc.text;
-            lastSentText = doc.text;
-            lastText = doc.text;
-            
-            showEditor();
-            updateSyncStatus('synced');
-            fetchGroupState();
-            showToast('Joined document!', 'success');
-            
-            hideModal(elements.joinModal);
-        }
-    } catch (error) {
-        if (welcomeListenerActive) {
-            console.error('Welcome listener error:', error);
-            showToast(`Failed to join: ${error}`, 'error');
-        }
-    } finally {
-        welcomeListenerActive = false;
-    }
-}
-
-function stopWelcomeListener() {
-    welcomeListenerActive = false;
-}
-
-async function joinDocumentWithWelcome(welcomeBytes) {
-    try {
-        updateSyncStatus('syncing');
-        const doc = await invoke('join_document_bytes', { welcome: welcomeBytes });
-        
-        state.currentDocument = doc;
-        elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
-        elements.docId.title = doc.group_id;
-        elements.editor.value = doc.text;
-        lastSentText = doc.text;
-        lastText = doc.text;
-        
-        showEditor();
-        updateSyncStatus('synced');
-        fetchGroupState();
-        showToast('Joined document!', 'success');
-        
-    } catch (error) {
-        console.error('Failed to join document:', error);
-        showToast(`Failed to join: ${error}`, 'error');
-        updateSyncStatus('error');
-    }
-}
-
-// ============================================================================
-// Document Operations
-// ============================================================================
-
-async function createDocument() {
-    try {
-        updateSyncStatus('syncing');
-        const doc = await invoke('create_document');
-        
-        state.currentDocument = doc;
-        elements.docId.textContent = doc.group_id.slice(0, 12) + '...';
-        elements.docId.title = doc.group_id;
-        elements.editor.value = doc.text;
-        lastSentText = doc.text;
-        lastText = doc.text;
-        
-        showEditor();
-        updateSyncStatus('synced');
-        fetchGroupState();
-        showToast('Document created!', 'success');
-        
-    } catch (error) {
-        console.error('Failed to create document:', error);
-        showToast(`Failed to create document: ${error}`, 'error');
-        updateSyncStatus('error');
-    }
-}
-
-
-async function refreshText() {
-    if (!state.currentDocument) return;
-    
-    try {
-        const text = await invoke('get_document_text', { 
-            groupId: state.currentDocument.group_id 
-        });
-        
-        // Preserve cursor position if possible
-        const cursorPos = elements.editor.selectionStart;
-        elements.editor.value = text;
-        elements.editor.selectionStart = Math.min(cursorPos, text.length);
-        elements.editor.selectionEnd = elements.editor.selectionStart;
-        
-    } catch (error) {
-        console.error('Failed to refresh text:', error);
-    }
-}
-
-// ============================================================================
-// Text Editing
-// ============================================================================
-
-// `lastSentText` tracks the text we have already computed a delta for.
-// Updated *before* the async send so that overlapping debounce callbacks
-// always diff against the most recently captured state.
-let lastSentText = '';
-let lastText = '';
-let debounceTimer = null;
-
-async function handleEditorInput() {
-    if (!state.currentDocument) return;
-
-    lastText = elements.editor.value;
-
-    // Debounce rapid changes.  When the timer fires we compute the
-    // delta against `lastSentText` (the last state we sent / accounted
-    // for), so the diff captures ALL intermediate keystrokes.
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(async () => {
-        const currentText = elements.editor.value;
-        const delta = computeDelta(lastSentText, currentText);
-        if (!delta) return;
-
-        // Update baseline BEFORE the async call.  This ensures that if
-        // the user keeps editing while `invoke` is in flight, the next
-        // debounced delta will diff against `currentText` — not the old
-        // baseline — so no changes are silently dropped.
-        lastSentText = currentText;
-
-        try {
-            await invoke('apply_delta', {
-                groupId: state.currentDocument.group_id,
-                delta: delta,
-            });
-            updateSyncStatus('synced');
-        } catch (error) {
-            console.error('Failed to apply delta:', error);
-            updateSyncStatus('error');
-        }
-    }, 50);
-}
-
-function computeDelta(oldText, newText) {
-    // Find common prefix
-    let prefixLen = 0;
-    while (prefixLen < oldText.length && 
-           prefixLen < newText.length && 
-           oldText[prefixLen] === newText[prefixLen]) {
-        prefixLen++;
-    }
-    
-    // Find common suffix
-    let oldSuffixStart = oldText.length;
-    let newSuffixStart = newText.length;
-    while (oldSuffixStart > prefixLen && 
-           newSuffixStart > prefixLen && 
-           oldText[oldSuffixStart - 1] === newText[newSuffixStart - 1]) {
-        oldSuffixStart--;
-        newSuffixStart--;
-    }
-    
-    const deleteLen = oldSuffixStart - prefixLen;
-    const insertText = newText.slice(prefixLen, newSuffixStart);
-    
-    if (deleteLen === 0 && insertText.length === 0) {
-        return null; // No change
-    }
-    
-    if (deleteLen > 0 && insertText.length > 0) {
-        return { type: 'Replace', position: prefixLen, length: deleteLen, text: insertText };
-    } else if (deleteLen > 0) {
-        return { type: 'Delete', position: prefixLen, length: deleteLen };
-    } else if (insertText.length > 0) {
-        return { type: 'Insert', position: prefixLen, text: insertText };
-    }
-    
-    return null;
-}
-
-// ============================================================================
-// Event Listeners
+// Event listeners
 // ============================================================================
 
 function setupEventListeners() {
-    // New document buttons
-    elements.btnNewDoc.addEventListener('click', createDocument);
-    elements.btnNewDocEmpty.addEventListener('click', createDocument);
-    
-    // Join document
-    elements.btnJoinDoc.addEventListener('click', () => showJoinModal());
-    
-    const closeJoinModal = () => {
-        stopWelcomeListener();
-        hideModal(elements.joinModal);
-    };
-    elements.btnJoinCancel.addEventListener('click', closeJoinModal);
-    elements.joinModalClose.addEventListener('click', closeJoinModal);
-    elements.joinModal.querySelector('.modal-backdrop').addEventListener('click', closeJoinModal);
-    
-    // Copy invite code
-    elements.btnCopyInviteCode.addEventListener('click', async () => {
-        const inviteCode = elements.myInviteCode.value;
-        if (!inviteCode || inviteCode === 'Generating...' || inviteCode.startsWith('Error')) {
-            showToast('No invite code to copy', 'error');
-            return;
-        }
-        
+    // Sidebar toggle
+    el.btnToggleSidebar.addEventListener('click', toggleSidebar);
+
+    // New document
+    el.btnNewDoc.addEventListener('click', createDocument);
+
+    // Join flow
+    el.btnJoinStart.addEventListener('click', startJoinFlow);
+    el.btnJoinCancel.addEventListener('click', cancelJoinFlow);
+    el.btnCopyInviteCode.addEventListener('click', async () => {
+        const code = el.myInviteCode.value;
+        if (!code || code === 'Generating…' || code === 'Error') return;
         try {
-            await navigator.clipboard.writeText(inviteCode);
+            await navigator.clipboard.writeText(code);
             showToast('Invite code copied!', 'success');
-        } catch (error) {
+        } catch (_) {
             showToast('Failed to copy', 'error');
-        }
-    });
-    
-    // Copy document ID
-    elements.btnCopyId.addEventListener('click', async () => {
-        if (!state.currentDocument) return;
-        
-        try {
-            await navigator.clipboard.writeText(state.currentDocument.group_id);
-            showToast('Copied document ID!', 'success');
-        } catch (error) {
-            showToast('Failed to copy', 'error');
-        }
-    });
-    
-    // Update Keys button
-    elements.btnUpdateKeys.addEventListener('click', updateKeys);
-    
-    // Copy transcript hash on click
-    elements.groupHash.addEventListener('click', async () => {
-        const hash = elements.groupHash.dataset.fullHash;
-        if (!hash) return;
-        try {
-            await navigator.clipboard.writeText(hash);
-            showToast('Transcript hash copied!', 'success');
-        } catch (error) {
-            showToast('Failed to copy hash', 'error');
         }
     });
 
-    // Peers modal
-    elements.btnPeers.addEventListener('click', () => {
+    // Copy document ID
+    el.btnCopyId.addEventListener('click', async () => {
+        if (!state.currentDocument) return;
+        try {
+            await navigator.clipboard.writeText(state.currentDocument.group_id);
+            showToast('Document ID copied!', 'success');
+        } catch (_) {
+            showToast('Failed to copy', 'error');
+        }
+    });
+
+    // Share modal
+    el.btnShare.addEventListener('click', () => {
         if (!state.currentDocument) {
             showToast('No document open', 'error');
             return;
         }
-        elements.peerInput.value = '';
+        el.peerInput.value = '';
         fetchPeers();
-        showModal(elements.peersModal);
+        fetchGroupState();
+        showModal(el.shareModal);
     });
 
-    const closePeersModal = () => hideModal(elements.peersModal);
-    elements.btnPeersDone.addEventListener('click', closePeersModal);
-    elements.peersModalClose.addEventListener('click', closePeersModal);
-    elements.peersModal.querySelector('.modal-backdrop').addEventListener('click', closePeersModal);
+    const closeShareModal = () => hideModal(el.shareModal);
+    el.btnShareDone.addEventListener('click', closeShareModal);
+    el.shareModalClose.addEventListener('click', closeShareModal);
+    el.shareModal.querySelector('.modal-backdrop').addEventListener('click', closeShareModal);
 
-    elements.btnAddPeer.addEventListener('click', async () => {
-        const input = elements.peerInput.value.trim();
+    // Update keys
+    el.btnUpdateKeys.addEventListener('click', updateKeys);
+
+    // Copy transcript hash
+    el.groupHash.addEventListener('click', async () => {
+        const hash = el.groupHash.dataset.fullHash;
+        if (!hash) return;
+        try {
+            await navigator.clipboard.writeText(hash);
+            showToast('Transcript hash copied!', 'success');
+        } catch (_) {
+            showToast('Failed to copy', 'error');
+        }
+    });
+
+    // Add peer
+    el.btnAddPeer.addEventListener('click', async () => {
+        const input = el.peerInput.value.trim();
         if (!input) {
-            showToast('Please paste an invite code or acceptor address', 'error');
+            showToast('Paste an invite code or acceptor address', 'error');
             return;
         }
         await addPeer(input);
-        elements.peerInput.value = '';
+        el.peerInput.value = '';
     });
 
-    // Delegate remove clicks inside the peer list
-    elements.peerList.addEventListener('click', (e) => {
+    // Remove peer delegation
+    el.peerList.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-action]');
         if (!btn) return;
-        const action = btn.dataset.action;
-        if (action === 'remove-member') {
+        if (btn.dataset.action === 'remove-member') {
             removeMember(parseInt(btn.dataset.index, 10));
-        } else if (action === 'remove-acceptor') {
+        } else if (btn.dataset.action === 'remove-acceptor') {
             removeAcceptor(btn.dataset.id);
         }
     });
 
     // Editor input
-    elements.editor.addEventListener('input', handleEditorInput);
+    el.editor.addEventListener('input', handleEditorInput);
 
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
-        // Cmd/Ctrl + N = New document
         if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
             e.preventDefault();
             createDocument();
         }
-        
-        // Escape = Close modals
         if (e.key === 'Escape') {
-            hideModal(elements.joinModal);
-            hideModal(elements.peersModal);
+            hideModal(el.shareModal);
+        }
+        if ((e.metaKey || e.ctrlKey) && e.key === 'b') {
+            e.preventDefault();
+            toggleSidebar();
         }
     });
 }
 
 // ============================================================================
-// Tauri Event Listeners
+// Tauri event listeners
 // ============================================================================
 
 async function setupTauriEvents() {
     if (!isTauri) return;
-    
     const { listen } = window.__TAURI__.event;
-    
-    // Listen for document updates from other clients
+
     await listen('document-updated', (event) => {
         const { group_id, text } = event.payload;
-        
-        if (state.currentDocument && state.currentDocument.group_id === group_id) {
-            // The backend CRDT now contains `text`, so update our
-            // baseline so the next delta is computed against it.
-            lastSentText = text;
 
-            // Skip no-op updates (e.g. echo of own edits)
+        // Update stored doc
+        const doc = state.documents.get(group_id);
+        if (doc) doc.text = text;
+
+        if (state.currentDocument && state.currentDocument.group_id === group_id) {
+            lastSentText = text;
             if (text === lastText) return;
-            
-            // Update the editor if it's the current document
-            const cursorPos = elements.editor.selectionStart;
-            elements.editor.value = text;
-            elements.editor.selectionStart = Math.min(cursorPos, text.length);
-            elements.editor.selectionEnd = elements.editor.selectionStart;
+
+            const cursorPos = el.editor.selectionStart;
+            el.editor.value = text;
+            el.editor.selectionStart = Math.min(cursorPos, text.length);
+            el.editor.selectionEnd = el.editor.selectionStart;
             lastText = text;
-            
             updateSyncStatus('synced');
         }
     });
-    
-    // Listen for group state changes (epoch, membership, etc.)
+
     await listen('group-state-changed', (event) => {
         const payload = event.payload;
         if (state.currentDocument && state.currentDocument.group_id === payload.group_id) {
             updateGroupStateDisplay(payload);
-            // Also refresh the peers modal if it's currently open
-            if (!elements.peersModal.classList.contains('hidden')) {
+            if (!el.shareModal.classList.contains('hidden')) {
                 fetchPeers();
             }
         }
     });
 
-    // Refresh the peers modal if it's open when acceptors change
     await listen('acceptors-updated', (event) => {
         const { group_id } = event.payload;
         if (state.currentDocument && state.currentDocument.group_id === group_id) {
-            if (!elements.peersModal.classList.contains('hidden')) {
+            if (!el.shareModal.classList.contains('hidden')) {
                 fetchPeers();
             }
         }
     });
-    
-    // Listen for connection status changes
+
     await listen('connection-status', (event) => {
-        state.isConnected = event.payload.connected;
-        updateSyncStatus(state.isConnected ? 'synced' : 'error');
+        updateSyncStatus(event.payload.connected ? 'synced' : 'error');
     });
 }
 
 // ============================================================================
-// Initialization
+// Init
 // ============================================================================
 
 async function init() {
     setupEventListeners();
-    
     try {
         await setupTauriEvents();
     } catch (e) {
-        // Non-fatal - real-time sync events won't work
         console.warn('Tauri events not available:', e.message || e);
     }
 }
 
-// Start the app
 init();

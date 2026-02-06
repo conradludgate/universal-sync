@@ -11,145 +11,130 @@
 </head>
 <body>
     <div class="app">
+        <!-- Compact header -->
         <header class="header">
-            <div class="logo">
-                <span class="logo-icon">⚡</span>
-                <span class="logo-text">sync<span class="logo-accent">editor</span></span>
+            <div class="header-left">
+                <button id="btn-toggle-sidebar" class="btn-icon-only" title="Toggle sidebar">☰</button>
+                <span class="logo">⚡ sync<span class="logo-accent">editor</span></span>
             </div>
-            <div class="header-actions">
-                <button id="btn-new-doc" class="btn btn-primary">
-                    <span class="btn-icon">+</span>
-                    New Document
-                </button>
-                <button id="btn-join-doc" class="btn btn-secondary">
-                    Join
-                </button>
+            <div class="header-right">
+                <div class="sync-status" id="sync-status">
+                    <span class="sync-indicator synced"></span>
+                    Synced
+                </div>
             </div>
         </header>
 
-        <main class="main">
-            <!-- Empty state -->
-            <div id="empty-state" class="empty-state">
-                <div class="empty-state-content">
-                    <div class="empty-state-icon">📝</div>
-                    <h2>No document open</h2>
-                    <p>Create a new document or join an existing one to start collaborating.</p>
-                    <div class="empty-state-actions">
-                        <button id="btn-new-doc-empty" class="btn btn-primary btn-lg">
-                            Create New Document
-                        </button>
+        <div class="app-body">
+            <!-- Collapsible sidebar -->
+            <aside class="sidebar" id="sidebar">
+                <!-- Documents section -->
+                <div class="sidebar-section">
+                    <div class="sidebar-section-header">
+                        <span class="sidebar-section-title">Documents</span>
                     </div>
+                    <div class="doc-list" id="doc-list">
+                        <div class="doc-list-empty" id="doc-list-empty">No documents</div>
+                    </div>
+                    <button id="btn-new-doc" class="btn btn-primary btn-block">+ New Document</button>
                 </div>
-            </div>
 
-            <!-- Editor (hidden by default) -->
-            <div id="editor-container" class="editor-container hidden">
-                <div class="editor-toolbar">
-                    <div class="doc-info">
-                        <span class="doc-id" id="doc-id">Document ID</span>
-                        <button id="btn-copy-id" class="btn btn-icon" title="Copy document ID">
-                            📋
-                        </button>
+                <!-- Join section -->
+                <div class="sidebar-section">
+                    <div class="sidebar-section-header">
+                        <span class="sidebar-section-title">Join</span>
                     </div>
-                    <div class="toolbar-center">
-                        <div class="group-state" id="group-state">
-                            <span class="group-state-item" title="MLS epoch">
-                                <span class="group-state-label">epoch</span>
-                                <span class="group-state-value" id="group-epoch">—</span>
-                            </span>
-                            <span class="group-state-sep">·</span>
-                            <span class="group-state-item" title="Transcript hash (click to copy)">
-                                <span class="group-state-label">hash</span>
-                                <span class="group-state-value group-state-hash" id="group-hash">—</span>
-                            </span>
-                            <span class="group-state-sep">·</span>
-                            <span class="group-state-item">
-                                <span class="group-state-label">members</span>
-                                <span class="group-state-value" id="group-members">—</span>
-                            </span>
+                    <div class="join-inline" id="join-inline">
+                        <div class="join-idle" id="join-idle">
+                            <button id="btn-join-start" class="btn btn-secondary btn-block">Generate Invite Code</button>
                         </div>
-                        <button id="btn-update-keys" class="btn btn-secondary btn-sm" title="Advance epoch / rotate keys">
-                            🔑 Update Keys
-                        </button>
-                        <button id="btn-peers" class="btn btn-secondary btn-sm" title="Manage members and acceptors">
-                            👥 Peers
-                        </button>
-                    </div>
-                    <div class="toolbar-right">
-                        <div class="sync-status" id="sync-status">
-                            <span class="sync-indicator synced"></span>
-                            Synced
+                        <div class="join-active hidden" id="join-active">
+                            <div class="invite-code-box">
+                                <textarea
+                                    id="my-invite-code"
+                                    class="input-textarea invite-code"
+                                    readonly
+                                    rows="3"
+                                    placeholder="Generating..."
+                                ></textarea>
+                                <button id="btn-copy-invite-code" class="btn-icon-only" title="Copy invite code">📋</button>
+                            </div>
+                            <div id="join-status" class="join-status">
+                                <span class="join-status-icon">⏳</span>
+                                <span class="join-status-text">Waiting to be added…</span>
+                            </div>
+                            <button id="btn-join-cancel" class="btn btn-secondary btn-block btn-sm">Cancel</button>
                         </div>
                     </div>
                 </div>
-                <div class="editor-wrapper">
-                    <textarea 
-                        id="editor" 
-                        class="editor" 
-                        placeholder="Start typing..."
-                        spellcheck="false"
-                    ></textarea>
-                    <div class="editor-overlay" id="editor-overlay">
-                        <div class="cursor remote" id="remote-cursor" style="display: none;">
-                            <div class="cursor-caret"></div>
-                            <div class="cursor-label">Guest</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
+            </aside>
 
-        <!-- Join Modal -->
-        <div id="join-modal" class="modal hidden">
-            <div class="modal-backdrop"></div>
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h3>Join Document</h3>
-                    <button class="modal-close" id="join-modal-close">&times;</button>
+            <!-- Main content -->
+            <main class="main">
+                <!-- Empty state (no document open) -->
+                <div id="empty-state" class="empty-state">
+                    <div class="empty-state-content">
+                        <div class="empty-state-icon">📝</div>
+                        <h2>No document open</h2>
+                        <p>Create a new document or join an existing one.</p>
+                    </div>
                 </div>
-                <div class="modal-body">
-                    <p class="modal-intro">Share your invite code with a document member. Once they add you, you'll automatically join.</p>
-                    
-                    <label>
-                        <span>Your Invite Code</span>
-                    </label>
-                    <div class="invite-code-box">
-                        <textarea 
-                            id="my-invite-code" 
-                            class="input-textarea invite-code" 
-                            readonly
-                            rows="3"
-                            placeholder="Generating..."
+
+                <!-- Editor (hidden by default) -->
+                <div id="editor-container" class="editor-container hidden">
+                    <div class="editor-toolbar">
+                        <div class="doc-info">
+                            <span class="doc-id" id="doc-id">Document</span>
+                            <button id="btn-copy-id" class="btn-icon-only" title="Copy document ID">📋</button>
+                        </div>
+                        <div class="toolbar-right">
+                            <button id="btn-share" class="btn btn-secondary btn-sm">🔗 Share</button>
+                        </div>
+                    </div>
+                    <div class="editor-wrapper">
+                        <textarea
+                            id="editor"
+                            class="editor"
+                            placeholder="Start typing..."
+                            spellcheck="false"
                         ></textarea>
-                        <button id="btn-copy-invite-code" class="btn btn-secondary btn-sm">
-                            📋 Copy
-                        </button>
-                    </div>
-                    
-                    <div id="join-status" class="join-status hidden">
-                        <span class="join-status-icon">⏳</span>
-                        <span class="join-status-text">Waiting to be added...</span>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button id="btn-join-cancel" class="btn btn-secondary">Cancel</button>
-                </div>
-            </div>
+            </main>
         </div>
 
-        <!-- Peers Modal (members + acceptors) -->
-        <div id="peers-modal" class="modal hidden">
+        <!-- Share Modal (peers + group state + update keys) -->
+        <div id="share-modal" class="modal hidden">
             <div class="modal-backdrop"></div>
             <div class="modal-content">
                 <div class="modal-header">
-                    <h3>Peers</h3>
-                    <button class="modal-close" id="peers-modal-close">&times;</button>
+                    <h3>Share</h3>
+                    <button class="modal-close" id="share-modal-close">&times;</button>
                 </div>
                 <div class="modal-body">
+                    <!-- Group state info -->
+                    <div class="group-info-card" id="group-info-card">
+                        <div class="group-info-row">
+                            <span class="group-info-label">Epoch</span>
+                            <span class="group-info-value" id="group-epoch">—</span>
+                        </div>
+                        <div class="group-info-row">
+                            <span class="group-info-label">Transcript</span>
+                            <span class="group-info-value group-info-hash" id="group-hash" title="Click to copy">—</span>
+                        </div>
+                        <div class="group-info-row">
+                            <span class="group-info-label">Members</span>
+                            <span class="group-info-value" id="group-members">—</span>
+                        </div>
+                        <button id="btn-update-keys" class="btn btn-secondary btn-sm btn-block">🔑 Update Keys</button>
+                    </div>
+
+                    <!-- Peer list -->
                     <div class="peer-list" id="peer-list">
                         <div class="peer-empty" id="peer-empty">No peers</div>
                     </div>
 
+                    <!-- Add peer -->
                     <div class="peer-add-form">
                         <label>
                             <span>Add Peer</span>
@@ -162,14 +147,12 @@
                                 placeholder="Paste invite code or acceptor address..."
                                 rows="3"
                             ></textarea>
-                            <button id="btn-add-peer" class="btn btn-primary btn-sm">
-                                Add
-                            </button>
+                            <button id="btn-add-peer" class="btn btn-primary btn-sm">Add</button>
                         </div>
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button id="btn-peers-done" class="btn btn-primary">Done</button>
+                    <button id="btn-share-done" class="btn btn-primary">Done</button>
                 </div>
             </div>
         </div>

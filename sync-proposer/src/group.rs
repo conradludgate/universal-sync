@@ -191,6 +191,11 @@ pub enum GroupEvent {
     ExternalInit,
     /// Group context extensions were updated (not acceptor add/remove)
     ExtensionsUpdated,
+    /// The epoch advanced (always emitted on any successful commit)
+    EpochAdvanced {
+        /// The new epoch number
+        epoch: u64,
+    },
     /// Unknown or custom proposal type
     Unknown,
 }
@@ -2043,6 +2048,10 @@ where
             for event in events {
                 let _ = self.event_tx.send(event);
             }
+            // Always emit EpochAdvanced so listeners know the epoch changed
+            let _ = self.event_tx.send(GroupEvent::EpochAdvanced {
+                epoch: self.learner.mls_epoch().0,
+            });
 
             // Register and spawn actors for newly added acceptors
             for (acceptor_id, addr) in new_acceptors {
