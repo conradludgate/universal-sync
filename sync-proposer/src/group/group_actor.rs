@@ -63,6 +63,10 @@ where
     /// Used by the compaction executor to merge updates without re-fetching
     /// from acceptors.
     update_buffer: Vec<Vec<u8>>,
+    /// The last compacted full snapshot (plaintext). Kept so we can re-encrypt
+    /// and send it at the current epoch when a new member joins after the
+    /// original compacted message was encrypted at an older epoch.
+    last_compacted_snapshot: Option<Vec<u8>>,
 }
 
 struct ActiveProposal {
@@ -91,6 +95,7 @@ struct WelcomeToSend {
 
 /// Tracks an active compaction claim at a given level.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ActiveCompactionClaim {
     /// Who claimed the compaction.
     claimer: MemberFingerprint,
@@ -104,15 +109,6 @@ struct ActiveCompactionClaim {
     is_ours: bool,
 }
 
-/// A compaction that we've claimed and need to execute.
-#[derive(Debug, Clone)]
-struct PendingCompaction {
-    /// The level to compact into.
-    level: u8,
-    /// The watermark (state vector) up to which we're compacting.
-    watermark: StateVector,
-}
-
 /// Tracks compaction state for the group.
 #[derive(Debug, Default)]
 struct CompactionState {
@@ -122,8 +118,8 @@ struct CompactionState {
     l0_count_since_compaction: u64,
     /// The watermark that was last compacted (messages at or below this are compacted).
     last_compacted_watermark: StateVector,
-    /// Compactions we've claimed and need to execute.
-    pending_executions: Vec<PendingCompaction>,
+    /// Force immediate compaction on next check (e.g. after adding a member).
+    force_compaction: bool,
 }
 
 impl CompactionState {
@@ -152,9 +148,11 @@ impl CompactionState {
 const MAX_PROPOSAL_RETRIES: u32 = 3;
 const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Default deadline for compaction claims (seconds from now).
+// Deadline for optimistic compaction claims (kept for future use)
+#[allow(dead_code)]
 const COMPACTION_DEADLINE_SECS: u64 = 120;
 /// How often to check whether compaction should be triggered (seconds).
-const COMPACTION_CHECK_INTERVAL_SECS: u64 = 10;
+const COMPACTION_CHECK_INTERVAL_SECS: u64 = 2;
 
 impl<C, CS> GroupActor<C, CS>
 where
@@ -206,6 +204,7 @@ where
             compaction_config,
             crdt_factory,
             update_buffer: Vec::new(),
+            last_compacted_snapshot: None,
         }
     }
 
@@ -247,9 +246,7 @@ where
                 }
             }
 
-            // After processing any event, check for pending compaction executions
-            // (outside select! to avoid recursive async issues)
-            self.execute_pending_compactions().await;
+            // (compaction execution now happens inline in maybe_trigger_compaction)
         }
 
         for (_, handle) in self.acceptor_handles.drain() {
@@ -365,10 +362,9 @@ where
             GroupRequest::AddMember {
                 key_package,
                 member_addr,
-                crdt_snapshot,
                 reply,
             } => {
-                self.handle_add_member(*key_package, member_addr, crdt_snapshot, reply)
+                self.handle_add_member(*key_package, member_addr, reply)
                     .await;
             }
             GroupRequest::RemoveMember {
@@ -432,7 +428,6 @@ where
         &mut self,
         key_package: MlsMessage,
         member_addr: EndpointAddr,
-        crdt_snapshot: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         let acceptor_count = self.learner.acceptor_ids().len();
@@ -446,7 +441,6 @@ where
         let result = blocking(|| {
             let group_info_ext = welcome_group_info_extensions(
                 self.learner.acceptors().values().cloned(),
-                crdt_snapshot,
             );
 
             let commit_output = self
@@ -1226,6 +1220,24 @@ where
             let event = match &proposal_info.proposal {
                 MlsProposal::Add(add_proposal) => {
                     let _ = add_proposal;
+                    // When a new member joins, force immediate compaction
+                    // so the new member can catch up via backfill.
+                    // This triggers when we have either pending updates OR
+                    // a previously compacted snapshot that needs to be
+                    // re-encrypted at the current epoch.
+                    if !self.update_buffer.is_empty()
+                        || self.last_compacted_snapshot.is_some()
+                    {
+                        let max_level = self.compaction_config.levels.saturating_sub(1);
+                        if max_level > 0
+                            && !self.compaction_state.has_active_claim(max_level)
+                        {
+                            tracing::info!(
+                                "new member added, forcing compaction for catch-up"
+                            );
+                            self.compaction_state.force_compaction = true;
+                        }
+                    }
                     GroupEvent::MemberAdded { index: 0 }
                 }
                 MlsProposal::Remove(remove_proposal) => GroupEvent::MemberRemoved {
@@ -1276,16 +1288,6 @@ where
                         self.compaction_state
                             .active_claims
                             .insert(claim.level, active_claim);
-
-                        // If this is our claim, schedule compaction execution
-                        if is_ours {
-                            self.compaction_state.pending_executions.push(
-                                PendingCompaction {
-                                    level: claim.level,
-                                    watermark: claim.watermark,
-                                },
-                            );
-                        }
 
                         GroupEvent::CompactionClaimed {
                             level: claim.level,
@@ -1436,8 +1438,14 @@ where
     // ---- Compaction coordination ----
 
     /// Check whether compaction should be triggered based on L0 count and
-    /// config thresholds. If conditions are met, build and submit a
-    /// CompactionClaim commit through Paxos.
+    /// config thresholds. If conditions are met, perform compaction directly:
+    /// encrypt the compacted snapshot at the CURRENT epoch (so all current
+    /// members can decrypt it), send it to acceptors, then submit a
+    /// CompactionComplete commit through Paxos.
+    ///
+    /// Note: The compacted message is encrypted BEFORE the CompactionComplete
+    /// commit, which is critical for passive learners (e.g. newly added members
+    /// who haven't yet received the commit that advances the epoch).
     async fn maybe_trigger_compaction(&mut self) {
         // Don't trigger compaction if we already have an active proposal
         if self.active_proposal.is_some() {
@@ -1451,6 +1459,22 @@ where
 
         // Prune expired claims so we can re-claim if needed
         self.compaction_state.prune_expired_claims();
+
+        // Check for forced compaction (e.g. after adding a new member)
+        if self.compaction_state.force_compaction {
+            self.compaction_state.force_compaction = false;
+
+            // Force an L(max) compaction for new member catch-up
+            let max_level = self.compaction_config.levels.saturating_sub(1);
+            if max_level > 0 && !self.compaction_state.has_active_claim(max_level) {
+                tracing::info!(
+                    level = max_level,
+                    "forced compaction for new member catch-up"
+                );
+                self.perform_compaction(max_level).await;
+                return;
+            }
+        }
 
         // Check each level's threshold (from lowest to highest)
         // thresholds[0] is the threshold for L0 → L1 compaction, etc.
@@ -1475,59 +1499,67 @@ where
                 level,
                 l0_count,
                 threshold,
-                "triggering compaction claim"
+                "triggering compaction"
             );
 
-            self.submit_compaction_claim(level).await;
+            self.perform_compaction(level).await;
 
             // Only trigger one level at a time
             break;
         }
     }
 
-    /// Execute all pending compactions that we've claimed.
-    async fn execute_pending_compactions(&mut self) {
-        let pending = std::mem::take(&mut self.compaction_state.pending_executions);
-
-        for compaction in pending {
-            self.execute_compaction(compaction).await;
-        }
-    }
-
-    /// Execute a single compaction: merge buffered updates, encrypt the result,
-    /// send to acceptors at the appropriate replication level, and submit
-    /// a CompactionComplete commit.
-    async fn execute_compaction(&mut self, compaction: PendingCompaction) {
-        if self.update_buffer.is_empty() {
-            tracing::debug!(level = compaction.level, "no updates to compact, skipping");
+    /// Perform a compaction at the given level: merge buffered updates into a
+    /// single snapshot, encrypt and send it at the CURRENT epoch, then submit
+    /// a CompactionComplete commit through Paxos.
+    async fn perform_compaction(&mut self, level: u8) {
+        if self.update_buffer.is_empty() && self.last_compacted_snapshot.is_none() {
+            tracing::debug!(level, "no updates or snapshot to compact, skipping");
             return;
         }
 
-        tracing::info!(
-            level = compaction.level,
-            update_count = self.update_buffer.len(),
-            "executing compaction"
-        );
+        let watermark = self.state_vector.clone();
 
-        // Merge all buffered updates into a single snapshot
-        let update_refs: Vec<&[u8]> = self.update_buffer.iter().map(|v| v.as_slice()).collect();
-        let compacted = match self.crdt_factory.compact(None, &update_refs) {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                tracing::warn!(?e, level = compaction.level, "compaction merge failed");
-                return;
+        // If there are new updates, merge them with the existing snapshot.
+        // If there are no new updates but we have a stored snapshot, re-use it
+        // (this happens when force_compaction triggers for a new member after
+        // the update buffer was already cleared by a previous compaction).
+        let compacted = if self.update_buffer.is_empty() {
+            tracing::info!(
+                level,
+                "re-encrypting existing snapshot for new member catch-up"
+            );
+            self.last_compacted_snapshot.clone().unwrap()
+        } else {
+            tracing::info!(
+                level,
+                update_count = self.update_buffer.len(),
+                has_base_snapshot = self.last_compacted_snapshot.is_some(),
+                "executing compaction"
+            );
+
+            let base = self.last_compacted_snapshot.as_deref();
+            let update_refs: Vec<&[u8]> =
+                self.update_buffer.iter().map(|v| v.as_slice()).collect();
+            match self.crdt_factory.compact(base, &update_refs) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    tracing::warn!(?e, level, "compaction merge failed");
+                    return;
+                }
             }
         };
 
         tracing::info!(
-            level = compaction.level,
-            original_updates = self.update_buffer.len(),
+            level,
             compacted_size = compacted.len(),
             "compaction merge complete"
         );
 
-        // Send the compacted snapshot as an encrypted app message to acceptors.
-        // Use the level-specific replication factor.
+        // IMPORTANT: Encrypt the compacted snapshot at the CURRENT epoch,
+        // before any Paxos commit advances the epoch. This ensures that all
+        // current group members (including passive learners who haven't
+        // received the latest commits) can decrypt it.
         let seq = self.message_seq;
         self.message_seq += 1;
         self.state_vector.insert(self.own_fingerprint, seq);
@@ -1567,7 +1599,7 @@ where
         let replication = self
             .compaction_config
             .replication
-            .get(compaction.level as usize)
+            .get(level as usize)
             .copied()
             .unwrap_or(0);
         let delivery_count = if replication == 0 {
@@ -1580,7 +1612,7 @@ where
             crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
 
         tracing::info!(
-            level = compaction.level,
+            level,
             delivery_count,
             total_acceptors = acceptor_ids.len(),
             "sending compacted message to acceptors"
@@ -1595,9 +1627,19 @@ where
             }
         }
 
-        // Now submit CompactionComplete to tell acceptors to delete old messages
-        self.submit_compaction_complete(compaction.level, compaction.watermark)
-            .await;
+        // Save the compacted snapshot so we can re-encrypt it for future new members.
+        let had_new_updates = !self.update_buffer.is_empty();
+        self.compaction_state.l0_count_since_compaction = 0;
+        self.update_buffer.clear();
+        self.last_compacted_snapshot = Some(compacted);
+
+        // Only submit CompactionComplete when we actually merged new updates.
+        // When re-encrypting an existing snapshot for a new member, there's no
+        // need to advance the epoch or tell acceptors to delete messages.
+        if had_new_updates {
+            self.submit_compaction_complete(level, watermark)
+                .await;
+        }
     }
 
     /// Build and submit a CompactionComplete commit through Paxos consensus.
@@ -1642,6 +1684,9 @@ where
     }
 
     /// Build and submit a CompactionClaim commit through Paxos consensus.
+    /// Currently unused — compaction is performed directly in `perform_compaction`.
+    /// Kept for future optimistic locking support.
+    #[allow(dead_code)]
     async fn submit_compaction_claim(&mut self, level: u8) {
         let watermark = self.state_vector.clone();
         let deadline = std::time::SystemTime::now()

@@ -46,19 +46,19 @@ impl fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
-/// Build GroupInfo extensions for a welcome message (acceptor addresses + CRDT snapshot).
+/// Build GroupInfo extensions for a welcome message (acceptor addresses).
+///
+/// Note: CRDT snapshot is no longer included in the welcome. New members
+/// start with an empty CRDT and catch up via compaction + backfill from
+/// acceptors.
 #[must_use]
 pub(crate) fn welcome_group_info_extensions(
     acceptors: impl IntoIterator<Item = EndpointAddr>,
-    crdt_snapshot: Vec<u8>,
 ) -> mls_rs::ExtensionList {
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
         .set_from(AcceptorsExt::new(acceptors))
         .expect("AcceptorsExt encoding should not fail");
-    extensions
-        .set_from(CrdtSnapshotExt::new(crdt_snapshot))
-        .expect("CrdtSnapshotExt encoding should not fail");
     extensions
 }
 
@@ -73,7 +73,6 @@ where
     AddMember {
         key_package: Box<MlsMessage>,
         member_addr: EndpointAddr,
-        crdt_snapshot: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     },
     RemoveMember {
@@ -315,7 +314,7 @@ where
     where
         CS: Clone,
     {
-        let (learner, group_id, crdt_type_id, crdt_snapshot) = blocking(|| {
+        let (learner, group_id, crdt_type_id, crdt_snapshot_opt) = blocking(|| {
             let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|e| {
                 Report::new(GroupError)
                     .attach(OperationContext::JOINING_GROUP)
@@ -342,18 +341,15 @@ where
                 .map(|ext| ext.0)
                 .unwrap_or_default();
 
-            let crdt_snapshot = info
+            // CrdtSnapshotExt is now optional — new members start with an empty
+            // CRDT and catch up via compaction + backfill from acceptors.
+            let crdt_snapshot_opt = info
                 .group_info_extensions
                 .get_as::<CrdtSnapshotExt>()
                 .map_err(|e| {
                     Report::new(GroupError)
                         .attach(OperationContext::JOINING_GROUP)
                         .attach(format!("failed to read CRDT snapshot extension: {e:?}"))
-                })?
-                .ok_or_else(|| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::JOINING_GROUP)
-                        .attach("missing required CRDT snapshot extension in GroupInfo")
                 })?;
 
             let crdt_type_id = group
@@ -369,7 +365,7 @@ where
 
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
 
-            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id, crdt_snapshot))
+            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id, crdt_snapshot_opt))
         })?;
 
         let crdt_factory = crdt_factories.get(&crdt_type_id).ok_or_else(|| {
@@ -383,12 +379,20 @@ where
         }
 
         let compaction_config = crdt_factory.compaction_config();
-        let crdt = crdt_factory
-            .from_snapshot(crdt_snapshot.snapshot())
-            .map_err(|e| {
-                Report::new(GroupError)
-                    .attach(format!("failed to create CRDT from snapshot: {e:?}"))
-            })?;
+        let crdt = if let Some(snapshot_ext) = crdt_snapshot_opt {
+            crdt_factory
+                .from_snapshot(snapshot_ext.snapshot())
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach(format!("failed to create CRDT from snapshot: {e:?}"))
+                })?
+        } else {
+            // No snapshot in welcome — start with an empty CRDT.
+            // The member will catch up via backfill from acceptors after
+            // the leader triggers a compaction.
+            tracing::info!("joining group without CRDT snapshot, will catch up via backfill");
+            crdt_factory.create()
+        };
 
         Ok(Self::spawn_actors(
             learner,
@@ -443,6 +447,9 @@ where
 
     /// Add a member. Welcome is sent directly via the key package's `MemberAddrExt`.
     /// Blocks until consensus is reached.
+    ///
+    /// The new member starts with an empty CRDT and catches up via compaction
+    /// and backfill from acceptors.
     pub async fn add_member(&mut self, key_package: MlsMessage) -> Result<(), Report<GroupError>> {
         use universal_sync_core::MemberAddrExt;
 
@@ -462,16 +469,11 @@ where
             })?
             .0;
 
-        let crdt_snapshot = self.crdt.snapshot().map_err(|e| {
-            Report::new(GroupError).attach(format!("failed to capture CRDT snapshot: {e:?}"))
-        })?;
-
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::AddMember {
                 key_package: Box::new(key_package),
                 member_addr,
-                crdt_snapshot,
                 reply: reply_tx,
             })
             .await

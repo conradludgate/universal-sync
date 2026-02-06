@@ -106,10 +106,14 @@ impl AcceptorActor {
                     FramedWrite::new(message_send, LengthDelimitedCodec::new());
                 let message_reader = FramedRead::new(message_recv, LengthDelimitedCodec::new());
 
-                let subscribe_request = MessageRequest::Subscribe {
+                // Request a backfill of all historical messages (empty state vector
+                // means "give me everything"). New messages will arrive via the
+                // broadcast subscription which is always active on the server side.
+                let backfill_request = MessageRequest::Backfill {
                     state_vector: Default::default(),
+                    limit: u32::MAX,
                 };
-                if let Ok(request_bytes) = postcard::to_allocvec(&subscribe_request) {
+                if let Ok(request_bytes) = postcard::to_allocvec(&backfill_request) {
                     if message_writer.send(request_bytes.into()).await.is_ok() {
                         Some((message_writer, message_reader))
                     } else {
@@ -177,10 +181,24 @@ impl AcceptorActor {
                     }
                 } => {
                     if let Ok(bytes) = result {
-                        if let Ok(MessageResponse::Message { message, .. }) = postcard::from_bytes::<MessageResponse>(&bytes) {
-                            let _ = self.inbound_tx.send(AcceptorInbound::EncryptedMessage {
-                                msg: message,
-                            }).await;
+                        match postcard::from_bytes::<MessageResponse>(&bytes) {
+                            Ok(MessageResponse::Message { message, .. }) => {
+                                let _ = self.inbound_tx.send(AcceptorInbound::EncryptedMessage {
+                                    msg: message,
+                                }).await;
+                            }
+                            Ok(MessageResponse::BackfillComplete { .. }) => {
+                                // Backfill complete — new messages arrive via broadcast
+                            }
+                            Ok(MessageResponse::Stored) => {
+                                // Acknowledgment for a stored message
+                            }
+                            Ok(MessageResponse::Error(e)) => {
+                                tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "message stream error from acceptor");
+                            }
+                            Err(e) => {
+                                tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to decode message response");
+                            }
                         }
                     } else {
                         message_reader_opt = None;

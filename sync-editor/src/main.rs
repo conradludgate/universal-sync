@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
+    COMPACTION_CLAIM_PROPOSAL_TYPE, COMPACTION_COMPLETE_PROPOSAL_TYPE,
     CRDT_REGISTRATION_EXTENSION_TYPE, CRDT_SNAPSHOT_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
     NoCrdtFactory, PAXOS_ALPN, SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
@@ -103,6 +104,8 @@ async fn setup_coordinator(
         .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
         .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
         .extension_type(CRDT_SNAPSHOT_EXTENSION_TYPE)
+        .custom_proposal_type(COMPACTION_CLAIM_PROPOSAL_TYPE)
+        .custom_proposal_type(COMPACTION_COMPLETE_PROPOSAL_TYPE)
         .build();
 
     info!("MLS client created");

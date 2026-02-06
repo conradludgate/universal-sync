@@ -1243,7 +1243,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Alice writes some text before anyone joins
+    // Alice writes some text before anyone joins and sends the update
     {
         use yrs::{Text, Transact};
         let yrs = alice_group
@@ -1255,27 +1255,43 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
         let mut txn = yrs.doc().transact_mut();
         text.insert(&mut txn, 0, "Initial content");
     }
+    alice_group.send_update().await.expect("alice send initial");
 
-    // Add Bob (advances epoch, snapshot includes "Initial content")
+    // Wait for the update to reach the acceptor
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Add Bob — Bob starts with empty CRDT and catches up via backfill
     let mut bob = test_yrs_group_client("bob", test_endpoint().await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(bob_kp).await.expect("add bob");
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
-    let bob_group = bob.join_group(&welcome).await.expect("bob join");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
 
-    // Bob should have Alice's text from the snapshot
-    {
-        use yrs::{GetString, Transact};
-        let yrs = bob_group.crdt().as_any().downcast_ref::<YrsCrdt>().unwrap();
-        let text = yrs.doc().get_or_insert_text("doc");
-        let txn = yrs.doc().transact();
-        assert_eq!(text.get_string(&txn), "Initial content");
-    }
+    // Bob catches up via backfill (compaction sends snapshot to acceptors)
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Drain and apply pending CRDT updates from the message channel
+            bob_group.sync();
+            let text = {
+                use yrs::{GetString, Transact};
+                let yrs = bob_group.crdt().as_any().downcast_ref::<YrsCrdt>().unwrap();
+                let text_ref = yrs.doc().get_or_insert_text("doc");
+                let txn = yrs.doc().transact();
+                text_ref.get_string(&txn)
+            };
+            if text == "Initial content" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Bob should eventually sync Initial content via backfill");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Add Carol (she joins at a later epoch with a snapshot)
+    // Add Carol — she also catches up via backfill
     let mut carol = test_yrs_group_client("carol", test_endpoint().await);
     let carol_kp = carol.generate_key_package().expect("carol kp");
     alice_group.add_member(carol_kp).await.expect("add carol");
@@ -1283,18 +1299,30 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
     let welcome = carol.recv_welcome().await.expect("carol welcome");
     let mut carol_group = carol.join_group(&welcome).await.expect("carol join");
 
-    // Carol should also have Alice's text from the snapshot
-    {
-        use yrs::{GetString, Transact};
-        let yrs = carol_group
-            .crdt()
-            .as_any()
-            .downcast_ref::<YrsCrdt>()
-            .unwrap();
-        let text = yrs.doc().get_or_insert_text("doc");
-        let txn = yrs.doc().transact();
-        assert_eq!(text.get_string(&txn), "Initial content");
-    }
+    // Carol catches up via backfill
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Drain and apply pending CRDT updates from the message channel
+            carol_group.sync();
+            let text = {
+                use yrs::{GetString, Transact};
+                let yrs = carol_group
+                    .crdt()
+                    .as_any()
+                    .downcast_ref::<YrsCrdt>()
+                    .unwrap();
+                let text_ref = yrs.doc().get_or_insert_text("doc");
+                let txn = yrs.doc().transact();
+                text_ref.get_string(&txn)
+            };
+            if text == "Initial content" {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Carol should eventually sync Initial content via backfill");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

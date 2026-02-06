@@ -478,16 +478,25 @@ async fn coordinator_join_via_welcome() {
         .expect("bob task panicked")
         .expect("bob join");
 
-    // Bob should have Alice's text from the CRDT snapshot
-    assert_eq!(bob_doc_info.text, "Hello from Alice");
-
-    // Verify Bob can read text through his doc actor
+    // Bob starts with an empty CRDT (no snapshot in welcome) and catches up
+    // via compaction + backfill from acceptors.
     let bob_group_id =
         GroupId::from_slice(&bs58::decode(&bob_doc_info.group_id).into_vec().unwrap());
-    let bob_text = send_coord_doc(&bob_tx, bob_group_id, |reply| DocRequest::GetText { reply })
-        .await
-        .expect("bob get text");
-    assert_eq!(bob_text, "Hello from Alice");
+
+    // Wait for Bob to sync up via backfill
+    let mut synced = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let bob_text =
+            send_coord_doc(&bob_tx, bob_group_id, |reply| DocRequest::GetText { reply })
+                .await
+                .expect("bob get text");
+        if bob_text == "Hello from Alice" {
+            synced = true;
+            break;
+        }
+    }
+    assert!(synced, "Bob should eventually sync Alice's text via backfill");
 }
 
 #[tokio::test]
