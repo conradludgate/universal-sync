@@ -27,6 +27,6 @@ pub use client::GroupClient;
 pub use connection::ConnectionManager;
 pub use connector::{ConnectorError, IrohConnection, IrohConnector};
 pub use error::GroupError;
-pub use group::{Group, GroupContext, GroupEvent, ReceivedAppMessage};
+pub use group::{Group, GroupContext, GroupEvent};
 pub use learner::{GroupLearner, LearnerError};
 pub use repl::ReplContext;

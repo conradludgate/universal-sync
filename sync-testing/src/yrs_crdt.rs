@@ -23,13 +23,20 @@ use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 /// manipulating shared data types like Text, Array, Map, etc.
 pub struct YrsCrdt {
     doc: Doc,
+    /// State vector at the time of the last flush (for computing diffs)
+    last_flushed_sv: StateVector,
 }
 
 impl YrsCrdt {
     /// Create a new empty Yrs document.
     #[must_use]
     pub fn new() -> Self {
-        Self { doc: Doc::new() }
+        let doc = Doc::new();
+        let last_flushed_sv = doc.transact().state_vector();
+        Self {
+            doc,
+            last_flushed_sv,
+        }
     }
 
     /// Create a Yrs document with a specific client ID.
@@ -38,8 +45,11 @@ impl YrsCrdt {
     /// In a group, each member should have a unique client ID.
     #[must_use]
     pub fn with_client_id(client_id: u64) -> Self {
+        let doc = Doc::with_client_id(client_id);
+        let last_flushed_sv = doc.transact().state_vector();
         Self {
-            doc: Doc::with_client_id(client_id),
+            doc,
+            last_flushed_sv,
         }
     }
 
@@ -88,6 +98,14 @@ impl Crdt for YrsCrdt {
         "yrs"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn apply(&mut self, operation: &[u8]) -> Result<(), CrdtError> {
         let update = Update::decode_v1(operation)
             .map_err(|e| CrdtError::new(format!("decode error: {e}")))?;
@@ -110,6 +128,18 @@ impl Crdt for YrsCrdt {
         let txn = self.doc.transact();
         // Encode all state as an update from empty state vector
         Ok(txn.encode_state_as_update_v1(&StateVector::default()))
+    }
+
+    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, CrdtError> {
+        let txn = self.doc.transact();
+        let current_sv = txn.state_vector();
+        if current_sv == self.last_flushed_sv {
+            return Ok(None);
+        }
+        let update = txn.encode_diff_v1(&self.last_flushed_sv);
+        drop(txn);
+        self.last_flushed_sv = current_sv;
+        Ok(Some(update))
     }
 }
 
@@ -193,7 +223,7 @@ mod tests {
     #[test]
     fn test_yrs_crdt_basic() {
         let crdt = YrsCrdt::new();
-        assert_eq!(crdt.type_id(), "yrs");
+        assert_eq!(Crdt::type_id(&crdt), "yrs");
 
         // Empty snapshot should work
         let snapshot = crdt.snapshot().unwrap();
@@ -278,15 +308,15 @@ mod tests {
     #[test]
     fn test_yrs_factory() {
         let factory = YrsCrdtFactory::new();
-        assert_eq!(factory.type_id(), "yrs");
+        assert_eq!(CrdtFactory::type_id(&factory), "yrs");
 
         let crdt = factory.create();
-        assert_eq!(crdt.type_id(), "yrs");
+        assert_eq!(Crdt::type_id(&*crdt), "yrs");
 
         // Test from_snapshot
         let snapshot = crdt.snapshot().unwrap();
         let crdt2 = factory.from_snapshot(&snapshot).unwrap();
-        assert_eq!(crdt2.type_id(), "yrs");
+        assert_eq!(Crdt::type_id(&*crdt2), "yrs");
     }
 
     #[test]
@@ -294,7 +324,7 @@ mod tests {
         let factory = YrsCrdtFactory::with_fixed_client_id(42);
 
         let crdt = factory.create();
-        assert_eq!(crdt.type_id(), "yrs");
+        assert_eq!(Crdt::type_id(&*crdt), "yrs");
     }
 
     #[test]

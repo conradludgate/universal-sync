@@ -53,8 +53,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, Crdt, CrdtFactory, CrdtRegistrationExt,
-    EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, MemberId,
-    MessageId, OperationContext, PAXOS_ALPN, WelcomeBundle,
+    CrdtSnapshotExt, EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, Handshake,
+    MemberId, MessageId, OperationContext, PAXOS_ALPN,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -62,7 +62,7 @@ use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
 use crate::connection::ConnectionManager;
 use crate::connector::{ProposalRequest, ProposalResponse};
 use crate::error::GroupError;
-use crate::flows::acceptors_extension;
+use crate::flows::welcome_group_info_extensions;
 use crate::learner::GroupLearner;
 
 // =============================================================================
@@ -83,6 +83,7 @@ where
     AddMember {
         key_package: Box<MlsMessage>,
         member_addr: EndpointAddr,
+        crdt_snapshot: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     },
     /// Remove a member from the group
@@ -94,10 +95,10 @@ where
     UpdateKeys {
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     },
-    /// Send an encrypted application message
+    /// Send an encrypted application message (CRDT update bytes)
     SendMessage {
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<EncryptedAppMessage, Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     },
     /// Add an acceptor to the federation
     AddAcceptor {
@@ -154,19 +155,6 @@ enum AcceptorOutbound {
 // =============================================================================
 // Public Types
 // =============================================================================
-
-/// A decrypted application message received from the group.
-#[derive(Debug, Clone)]
-pub struct ReceivedAppMessage {
-    /// The sender's member index
-    pub sender: MemberId,
-    /// The epoch in which the message was sent
-    pub epoch: Epoch,
-    /// The message index (per-sender, per-epoch)
-    pub index: u32,
-    /// The decrypted application data
-    pub data: Vec<u8>,
-}
 
 /// Events emitted by a Group.
 ///
@@ -244,8 +232,8 @@ where
     /// Channel to send requests to the `GroupActor`
     request_tx: mpsc::Sender<GroupRequest<C, CS>>,
 
-    /// Receiver for decrypted application messages
-    app_message_rx: mpsc::Receiver<ReceivedAppMessage>,
+    /// Receiver for decrypted application messages (raw bytes)
+    app_message_rx: mpsc::Receiver<Vec<u8>>,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<GroupEvent>,
@@ -258,6 +246,9 @@ where
 
     /// Cached group ID (immutable after creation)
     group_id: GroupId,
+
+    /// CRDT for application state synchronization
+    crdt: Box<dyn Crdt>,
 }
 
 impl<C, CS> Drop for Group<C, CS>
@@ -411,7 +402,7 @@ where
     /// * `signer` - The signing secret key
     /// * `cipher_suite` - The cipher suite provider
     /// * `connection_manager` - The connection manager for p2p connections
-    /// * `welcome_bytes` - The Welcome message bytes (raw MLS welcome or `WelcomeBundle`)
+    /// * `welcome_bytes` - The serialized MLS Welcome message bytes
     /// * `crdt_factories` - Map of CRDT type IDs to factories for lookup
     ///
     /// # Errors
@@ -430,17 +421,10 @@ where
     {
         use universal_sync_core::AcceptorsExt;
 
-        // Parse the welcome bundle (handles both raw MLS welcome and WelcomeBundle)
-        let welcome_bundle = WelcomeBundle::from_bytes(welcome_bytes).map_err(|e| {
-            Report::new(GroupError)
-                .attach(OperationContext::JOINING_GROUP)
-                .attach(format!("invalid welcome bundle: {e:?}"))
-        })?;
-
         // Join the group (blocking I/O via storage)
-        let (learner, group_id, crdt_type_id) = blocking(|| {
-            // Parse the MLS Welcome message from the bundle
-            let welcome = MlsMessage::from_bytes(&welcome_bundle.mls_welcome).map_err(|e| {
+        let (learner, group_id, crdt_type_id, crdt_snapshot) = blocking(|| {
+            // Parse the MLS Welcome message
+            let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|e| {
                 Report::new(GroupError)
                     .attach(OperationContext::JOINING_GROUP)
                     .attach(format!("invalid welcome message: {e:?}"))
@@ -469,6 +453,21 @@ where
                 .map(|ext| ext.0)
                 .unwrap_or_default();
 
+            // Read CRDT snapshot from GroupInfo extensions
+            let crdt_snapshot = info
+                .group_info_extensions
+                .get_as::<CrdtSnapshotExt>()
+                .map_err(|e| {
+                    Report::new(GroupError)
+                        .attach(OperationContext::JOINING_GROUP)
+                        .attach(format!("failed to read CRDT snapshot extension: {e:?}"))
+                })?
+                .ok_or_else(|| {
+                    Report::new(GroupError)
+                        .attach(OperationContext::JOINING_GROUP)
+                        .attach("missing required CRDT snapshot extension in GroupInfo")
+                })?;
+
             // Read CRDT type from group context extensions
             let crdt_type_id = group
                 .context()
@@ -484,7 +483,7 @@ where
             // Create the learner
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
 
-            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id))
+            Ok::<_, Report<GroupError>>((learner, group_id, crdt_type_id, crdt_snapshot))
         })?;
 
         // Look up the CRDT factory
@@ -499,17 +498,13 @@ where
             connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
-        // Create CRDT from snapshot if present, otherwise create empty
-        let crdt = if welcome_bundle.has_crdt() {
-            crdt_factory
-                .from_snapshot(&welcome_bundle.crdt_snapshot)
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(format!("failed to create CRDT from snapshot: {e:?}"))
-                })?
-        } else {
-            crdt_factory.create()
-        };
+        // Create CRDT from the snapshot in the GroupInfo extensions
+        let crdt = crdt_factory
+            .from_snapshot(crdt_snapshot.snapshot())
+            .map_err(|e| {
+                Report::new(GroupError)
+                    .attach(format!("failed to create CRDT from snapshot: {e:?}"))
+            })?;
 
         Ok(Self::spawn_actors(
             learner,
@@ -543,7 +538,6 @@ where
             app_message_tx,
             event_tx.clone(),
             cancel_token.clone(),
-            crdt,
         );
 
         let actor_handle = tokio::spawn(actor.run());
@@ -555,6 +549,7 @@ where
             cancel_token,
             actor_handle: Some(actor_handle),
             group_id,
+            crdt,
         }
     }
 
@@ -593,11 +588,17 @@ where
             })?
             .0;
 
+        // Capture CRDT snapshot from the Group-owned CRDT
+        let crdt_snapshot = self.crdt.snapshot().map_err(|e| {
+            Report::new(GroupError).attach(format!("failed to capture CRDT snapshot: {e:?}"))
+        })?;
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::AddMember {
                 key_package: Box::new(key_package),
                 member_addr,
+                crdt_snapshot,
                 reply: reply_tx,
             })
             .await
@@ -650,28 +651,39 @@ where
             .map_err(|_| Report::new(GroupError).attach("group actor dropped reply"))?
     }
 
-    /// Send an encrypted application message to the group.
+    /// Get a reference to the CRDT for reading state.
+    #[must_use]
+    pub fn crdt(&self) -> &dyn Crdt {
+        &*self.crdt
+    }
+
+    /// Get a mutable reference to the CRDT for local mutations.
     ///
-    /// The message is encrypted using MLS and sent to a subset of acceptors.
-    /// Messages are identified by `(group_id, epoch, sender, index)` where
-    /// the index is per-sender and resets each epoch.
+    /// After mutating, call [`send_update`](Self::send_update) to broadcast changes to peers.
+    pub fn crdt_mut(&mut self) -> &mut dyn Crdt {
+        &mut *self.crdt
+    }
+
+    /// Flush local CRDT changes and send the update to peers.
     ///
-    /// # Arguments
-    /// * `data` - The plaintext data to encrypt and send
-    ///
-    /// # Returns
-    /// The `EncryptedAppMessage` that was created (for tracking/debugging).
+    /// No-op if there are no pending local changes.
     ///
     /// # Errors
-    /// Returns an error if encryption or sending fails.
-    pub async fn send_message(
-        &mut self,
-        data: &[u8],
-    ) -> Result<EncryptedAppMessage, Report<GroupError>> {
+    /// Returns an error if flushing or sending fails.
+    pub async fn send_update(&mut self) -> Result<(), Report<GroupError>> {
+        let update = self
+            .crdt
+            .flush_update()
+            .map_err(|e| Report::new(GroupError).attach(format!("CRDT flush failed: {e:?}")))?;
+
+        let Some(data) = update else {
+            return Ok(());
+        };
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::SendMessage {
-                data: data.to_vec(),
+                data,
                 reply: reply_tx,
             })
             .await
@@ -682,12 +694,32 @@ where
             .map_err(|_| Report::new(GroupError).attach("group actor dropped reply"))?
     }
 
-    /// Receive the next decrypted application message.
+    /// Non-blocking: drain pending received updates and apply them to the CRDT.
     ///
-    /// This receives messages that were decrypted by the group actor.
-    /// Returns `None` if the channel is closed (group shutting down).
-    pub async fn recv_message(&mut self) -> Option<ReceivedAppMessage> {
-        self.app_message_rx.recv().await
+    /// Returns `true` if any updates were applied.
+    pub fn sync(&mut self) -> bool {
+        let mut applied = false;
+        while let Ok(data) = self.app_message_rx.try_recv() {
+            if let Err(e) = self.crdt.apply(&data) {
+                tracing::warn!(?e, "failed to apply CRDT update");
+            } else {
+                applied = true;
+            }
+        }
+        applied
+    }
+
+    /// Async wait: blocks until at least one remote update arrives, then applies it.
+    ///
+    /// Returns `None` if the group is shutting down (channel closed).
+    pub async fn wait_for_update(&mut self) -> Option<()> {
+        let data = self.app_message_rx.recv().await?;
+        if let Err(e) = self.crdt.apply(&data) {
+            tracing::warn!(?e, "failed to apply CRDT update");
+        }
+        // Also drain any additional pending updates
+        self.sync();
+        Some(())
     }
 
     /// Add an acceptor to the federation.
@@ -822,8 +854,8 @@ where
     /// Receiver for requests from the Group handle
     request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
 
-    /// Sender for decrypted application messages
-    app_message_tx: mpsc::Sender<ReceivedAppMessage>,
+    /// Sender for decrypted application message data (raw CRDT update bytes)
+    app_message_tx: mpsc::Sender<Vec<u8>>,
 
     /// Event broadcaster
     event_tx: broadcast::Sender<GroupEvent>,
@@ -860,9 +892,6 @@ where
 
     /// Active proposal state (waiting for quorum)
     active_proposal: Option<ActiveProposal>,
-
-    /// CRDT for application state synchronization
-    crdt: Box<dyn Crdt>,
 }
 
 /// State for an active proposal waiting for quorum
@@ -916,10 +945,9 @@ where
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
         request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
-        app_message_tx: mpsc::Sender<ReceivedAppMessage>,
+        app_message_tx: mpsc::Sender<Vec<u8>>,
         event_tx: broadcast::Sender<GroupEvent>,
         cancel_token: CancellationToken,
-        crdt: Box<dyn Crdt>,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
         let message_epoch = learner.mls_epoch();
@@ -948,7 +976,6 @@ where
             pending_messages: Vec::new(),
             join_epoch,
             active_proposal: None,
-            crdt,
         }
     }
 
@@ -1114,9 +1141,10 @@ where
             GroupRequest::AddMember {
                 key_package,
                 member_addr,
+                crdt_snapshot,
                 reply,
             } => {
-                self.handle_add_member(*key_package, member_addr, reply)
+                self.handle_add_member(*key_package, member_addr, crdt_snapshot, reply)
                     .await;
             }
             GroupRequest::RemoveMember {
@@ -1162,6 +1190,7 @@ where
         &mut self,
         key_package: MlsMessage,
         member_addr: EndpointAddr,
+        crdt_snapshot: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         // Safety check: cannot add members without at least one acceptor
@@ -1173,12 +1202,12 @@ where
             return;
         }
 
-        // Capture CRDT snapshot before building commit (snapshot of current state)
-        let crdt_snapshot = self.crdt.snapshot().ok();
-
-        // Build the commit
+        // Build the commit with CRDT snapshot in GroupInfo extensions
         let result = blocking(|| {
-            let acceptors_ext = acceptors_extension(self.learner.acceptors().values().cloned());
+            let group_info_ext = welcome_group_info_extensions(
+                self.learner.acceptors().values().cloned(),
+                crdt_snapshot,
+            );
 
             let commit_output = self
                 .learner
@@ -1186,12 +1215,12 @@ where
                 .commit_builder()
                 .add_member(key_package)
                 .change_context(GroupError)?
-                .set_group_info_ext(acceptors_ext)
+                .set_group_info_ext(group_info_ext)
                 .build()
                 .change_context(GroupError)?;
 
-            // Extract the welcome message bytes for later
-            let mls_welcome = commit_output
+            // Extract the welcome message bytes
+            let welcome_bytes = commit_output
                 .welcome_messages
                 .first()
                 .ok_or_else(|| Report::new(GroupError).attach("no welcome message generated"))?
@@ -1200,26 +1229,11 @@ where
                     Report::new(GroupError).attach(format!("welcome serialization failed: {e:?}"))
                 })?;
 
-            Ok::<_, Report<GroupError>>((commit_output, mls_welcome))
+            Ok::<_, Report<GroupError>>((commit_output, welcome_bytes))
         });
 
         match result {
-            Ok((commit_output, mls_welcome)) => {
-                // Create welcome bundle with CRDT snapshot if present
-                let welcome_bundle = match crdt_snapshot {
-                    Some(snapshot) => WelcomeBundle::with_crdt(mls_welcome, snapshot),
-                    None => WelcomeBundle::new(mls_welcome),
-                };
-
-                let welcome_bytes = match welcome_bundle.to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let _ = reply.send(Err(Report::new(GroupError)
-                            .attach(format!("welcome bundle serialization failed: {e:?}"))));
-                        return;
-                    }
-                };
-
+            Ok((commit_output, welcome_bytes)) => {
                 let message = GroupMessage::new(commit_output.commit_message);
                 self.start_proposal_with_welcome(message, member_addr, welcome_bytes, reply)
                     .await;
@@ -1282,7 +1296,7 @@ where
     fn handle_send_message(
         &mut self,
         data: &[u8],
-        reply: oneshot::Sender<Result<EncryptedAppMessage, Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         // Get current epoch and check if we need to reset the message counter
         let current_epoch = self.learner.mls_epoch();
@@ -1349,7 +1363,7 @@ where
             }
         }
 
-        let _ = reply.send(Ok(encrypted_msg));
+        let _ = reply.send(Ok(()));
     }
 
     /// Handle add acceptor request
@@ -2148,14 +2162,8 @@ where
         }
         self.seen_messages.insert(key);
 
-        let received_msg = ReceivedAppMessage {
-            sender,
-            epoch,
-            index,
-            data: app_msg.data().to_vec(),
-        };
-
-        let _ = self.app_message_tx.try_send(received_msg);
+        // Forward raw CRDT update bytes to the Group handle
+        let _ = self.app_message_tx.try_send(app_msg.data().to_vec());
     }
 }
 

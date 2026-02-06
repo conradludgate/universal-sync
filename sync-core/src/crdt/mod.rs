@@ -22,6 +22,7 @@
 //! - [`NoCrdt`] - A no-op implementation for groups without CRDT support
 //! - `YrsCrdt` - Yjs/Yrs document CRDT (in `universal-sync-testing` crate)
 
+use std::any::Any;
 use std::fmt;
 
 /// Error type for CRDT operations
@@ -57,12 +58,18 @@ impl std::error::Error for CrdtError {}
 ///
 /// Implementations should be deterministic - applying the same operations in any order
 /// should result in the same final state (this is the CRDT convergence property).
-pub trait Crdt: Send + Sync {
+pub trait Crdt: Send + Sync + 'static {
     /// Unique identifier for this CRDT type.
     ///
     /// This is used to ensure all group members use compatible CRDT implementations.
     /// Examples: "yjs", "automerge", "counter", "lww-register", "or-set"
     fn type_id(&self) -> &str;
+
+    /// Downcast to a concrete type for implementation-specific access.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to a concrete type for mutable implementation-specific access.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     /// Apply an operation to the CRDT state.
     ///
@@ -91,6 +98,16 @@ pub trait Crdt: Send + Sync {
     /// # Errors
     /// Returns an error if serialization fails.
     fn snapshot(&self) -> Result<Vec<u8>, CrdtError>;
+
+    /// Flush pending local changes as an update that can be sent to peers.
+    ///
+    /// Returns `None` if there are no changes since the last flush.
+    /// Implementations should track what has been flushed and only return
+    /// new changes on each call.
+    ///
+    /// # Errors
+    /// Returns an error if encoding the update fails.
+    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, CrdtError>;
 }
 
 /// Factory for creating CRDT instances.
@@ -130,6 +147,14 @@ impl Crdt for NoCrdt {
         "none"
     }
 
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn apply(&mut self, _operation: &[u8]) -> Result<(), CrdtError> {
         // No-op: we don't store any state
         Ok(())
@@ -143,6 +168,11 @@ impl Crdt for NoCrdt {
     fn snapshot(&self) -> Result<Vec<u8>, CrdtError> {
         // Empty snapshot
         Ok(Vec::new())
+    }
+
+    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, CrdtError> {
+        // No-op: never any pending changes
+        Ok(None)
     }
 }
 
@@ -172,24 +202,26 @@ mod tests {
     fn test_no_crdt() {
         let mut crdt = NoCrdt;
 
-        assert_eq!(crdt.type_id(), "none");
+        assert_eq!(Crdt::type_id(&crdt), "none");
         assert!(crdt.apply(b"anything").is_ok());
         assert!(crdt.merge(b"anything").is_ok());
 
         let snapshot = crdt.snapshot().unwrap();
         assert!(snapshot.is_empty());
+
+        assert!(crdt.flush_update().unwrap().is_none());
     }
 
     #[test]
     fn test_no_crdt_factory() {
         let factory = NoCrdtFactory;
 
-        assert_eq!(factory.type_id(), "none");
+        assert_eq!(CrdtFactory::type_id(&factory), "none");
 
         let crdt = factory.create();
-        assert_eq!(crdt.type_id(), "none");
+        assert_eq!(Crdt::type_id(&*crdt), "none");
 
         let crdt2 = factory.from_snapshot(b"ignored").unwrap();
-        assert_eq!(crdt2.type_id(), "none");
+        assert_eq!(Crdt::type_id(&*crdt2), "none");
     }
 }

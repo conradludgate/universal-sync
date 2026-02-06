@@ -12,8 +12,10 @@ use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
 use universal_sync_core::{AcceptorId, GroupId, PAXOS_ALPN};
+use universal_sync_proposer::GroupClient;
 use universal_sync_testing::{
-    test_cipher_suite, test_crypto_provider, test_group_client, test_identity_provider,
+    TestCipherSuiteProvider, YrsCrdt, YrsCrdtFactory, test_cipher_suite, test_crypto_provider,
+    test_group_client, test_identity_provider,
 };
 
 /// Initialize tracing for tests
@@ -594,28 +596,16 @@ async fn test_three_member_group() {
 }
 
 #[tokio::test]
-async fn test_send_application_message() {
+async fn test_send_update_no_changes() {
     init_tracing();
 
     let alice = test_group_client("alice", test_endpoint().await);
 
-    // Create group without acceptors (messages work locally)
+    // Create group without acceptors
     let mut group = alice.create_group(&[], "none").await.expect("create group");
 
-    // Send an application message
-    let message_data = b"Hello, World!";
-    let encrypted = group
-        .send_message(message_data)
-        .await
-        .expect("send message");
-
-    tracing::info!("Sent encrypted application message");
-
-    // Verify the encrypted message has expected properties
-    assert!(
-        !encrypted.ciphertext.is_empty(),
-        "Ciphertext should not be empty"
-    );
+    // send_update with no CRDT changes should be a no-op
+    group.send_update().await.expect("send update (no-op)");
 
     group.shutdown().await;
 }
@@ -1095,5 +1085,331 @@ async fn test_repl_full_workflow() {
     for (_id, group) in bob.groups.drain() {
         group.shutdown().await;
     }
+    acceptor_task.abort();
+}
+
+// =============================================================================
+// CRDT Tests
+// =============================================================================
+
+/// Create a GroupClient with YrsCrdtFactory registered (in addition to NoCrdtFactory).
+fn test_yrs_group_client(
+    name: &'static str,
+    endpoint: Endpoint,
+) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
+    let mut client = test_group_client(name, endpoint);
+    client.register_crdt_factory(YrsCrdtFactory::new());
+    client
+}
+
+/// Test creating a group with a Yrs CRDT and adding a member.
+///
+/// Verifies that the CRDT snapshot is included in the welcome's GroupInfo
+/// extensions and that the joiner can reconstruct the CRDT state.
+#[tokio::test]
+async fn test_yrs_crdt_snapshot_in_welcome() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Alice creates a group with Yrs CRDT
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create yrs group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Bob joins - he needs YrsCrdtFactory registered to process the snapshot
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob key package");
+
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join yrs group");
+
+    // Verify both are in the group
+    let alice_ctx = alice_group.context().await.expect("alice context");
+    let bob_ctx = bob_group.context().await.expect("bob context");
+    assert_eq!(alice_ctx.member_count, 2);
+    assert_eq!(bob_ctx.member_count, 2);
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}
+
+/// Test that CRDT updates are sent from one peer and applied by another
+/// through the acceptor relay.
+#[tokio::test]
+async fn test_crdt_operations_sent_and_received() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Alice creates group with Yrs CRDT
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Bob joins
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob key package");
+
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice edits the CRDT (insert text into a Yrs document)
+    {
+        use yrs::{Text, Transact};
+
+        let yrs_crdt = alice_group
+            .crdt_mut()
+            .as_any_mut()
+            .downcast_mut::<YrsCrdt>()
+            .expect("should be YrsCrdt");
+        let text = yrs_crdt.doc().get_or_insert_text("doc");
+        let mut txn = yrs_crdt.doc().transact_mut();
+        text.insert(&mut txn, 0, "Hello from Alice");
+    }
+
+    // Send the update
+    alice_group.send_update().await.expect("send update");
+
+    // Bob should receive and apply the update
+    tokio::time::timeout(Duration::from_secs(5), bob_group.wait_for_update())
+        .await
+        .expect("timeout waiting for update")
+        .expect("channel closed");
+
+    // Verify Bob's CRDT has Alice's text
+    {
+        use yrs::{GetString, Transact};
+
+        let yrs_crdt = bob_group
+            .crdt()
+            .as_any()
+            .downcast_ref::<YrsCrdt>()
+            .expect("should be YrsCrdt");
+        let text = yrs_crdt.doc().get_or_insert_text("doc");
+        let txn = yrs_crdt.doc().transact();
+        assert_eq!(text.get_string(&txn), "Hello from Alice");
+    }
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}
+
+/// Test bidirectional CRDT update exchange between two peers.
+#[tokio::test]
+async fn test_crdt_bidirectional_message_exchange() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob key package");
+
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice inserts text
+    {
+        use yrs::{Text, Transact};
+        let yrs = alice_group
+            .crdt_mut()
+            .as_any_mut()
+            .downcast_mut::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let mut txn = yrs.doc().transact_mut();
+        text.insert(&mut txn, 0, "Hello");
+    }
+    alice_group.send_update().await.expect("alice send");
+
+    // Bob receives Alice's update
+    tokio::time::timeout(Duration::from_secs(5), bob_group.wait_for_update())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Verify Bob has Alice's text, then Bob appends
+    {
+        use yrs::{GetString, Text, Transact};
+        let yrs = bob_group
+            .crdt_mut()
+            .as_any_mut()
+            .downcast_mut::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        {
+            let txn = yrs.doc().transact();
+            assert_eq!(text.get_string(&txn), "Hello");
+        }
+        let mut txn = yrs.doc().transact_mut();
+        text.insert(&mut txn, 5, " World");
+    }
+    bob_group.send_update().await.expect("bob send");
+
+    // Alice receives Bob's update
+    tokio::time::timeout(Duration::from_secs(5), alice_group.wait_for_update())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    // Verify Alice has the combined text
+    {
+        use yrs::{GetString, Transact};
+        let yrs = alice_group
+            .crdt()
+            .as_any()
+            .downcast_ref::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "Hello World");
+    }
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}
+
+/// Test that a late joiner receives the CRDT snapshot containing prior state
+/// and can exchange updates with the group.
+#[tokio::test]
+async fn test_crdt_late_joiner_snapshot_and_messages() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Alice writes some text before anyone joins
+    {
+        use yrs::{Text, Transact};
+        let yrs = alice_group
+            .crdt_mut()
+            .as_any_mut()
+            .downcast_mut::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let mut txn = yrs.doc().transact_mut();
+        text.insert(&mut txn, 0, "Initial content");
+    }
+
+    // Add Bob (advances epoch, snapshot includes "Initial content")
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob kp");
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    // Bob should have Alice's text from the snapshot
+    {
+        use yrs::{GetString, Transact};
+        let yrs = bob_group.crdt().as_any().downcast_ref::<YrsCrdt>().unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "Initial content");
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Add Carol (she joins at a later epoch with a snapshot)
+    let mut carol = test_yrs_group_client("carol", test_endpoint().await);
+    let carol_kp = carol.generate_key_package().expect("carol kp");
+    alice_group.add_member(carol_kp).await.expect("add carol");
+
+    let welcome = carol.recv_welcome().await.expect("carol welcome");
+    let mut carol_group = carol.join_group(&welcome).await.expect("carol join");
+
+    // Carol should also have Alice's text from the snapshot
+    {
+        use yrs::{GetString, Transact};
+        let yrs = carol_group
+            .crdt()
+            .as_any()
+            .downcast_ref::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "Initial content");
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice sends a CRDT update to Carol
+    {
+        use yrs::{Text, Transact};
+        let yrs = alice_group
+            .crdt_mut()
+            .as_any_mut()
+            .downcast_mut::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let mut txn = yrs.doc().transact_mut();
+        text.insert(&mut txn, 15, " + update");
+    }
+    alice_group.send_update().await.expect("alice send");
+
+    tokio::time::timeout(Duration::from_secs(5), carol_group.wait_for_update())
+        .await
+        .expect("carol timeout")
+        .expect("carol channel closed");
+
+    {
+        use yrs::{GetString, Transact};
+        let yrs = carol_group
+            .crdt()
+            .as_any()
+            .downcast_ref::<YrsCrdt>()
+            .unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "Initial content + update");
+    }
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    carol_group.shutdown().await;
     acceptor_task.abort();
 }

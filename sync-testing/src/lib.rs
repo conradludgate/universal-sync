@@ -11,8 +11,8 @@ use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use universal_sync_core::{
     ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
-    CRDT_REGISTRATION_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE, NoCrdtFactory,
-    SUPPORTED_CRDTS_EXTENSION_TYPE,
+    CRDT_REGISTRATION_EXTENSION_TYPE, CRDT_SNAPSHOT_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
+    NoCrdtFactory, SUPPORTED_CRDTS_EXTENSION_TYPE,
 };
 use universal_sync_proposer::{GroupClient, ReplContext};
 pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
@@ -92,6 +92,7 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
         .extension_type(MEMBER_ADDR_EXTENSION_TYPE)
         .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
         .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
+        .extension_type(CRDT_SNAPSHOT_EXTENSION_TYPE)
         .build();
 
     TestClientResult {

@@ -430,7 +430,7 @@ Note: Welcome messages are received automatically in the background.
     async fn cmd_send_message(
         &mut self,
         group_id_hex: &str,
-        message: &str,
+        _message: &str,
     ) -> Result<String, String> {
         let group_id = parse_group_id(group_id_hex)?;
 
@@ -440,11 +440,11 @@ Note: Welcome messages are received automatically in the background.
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
         group
-            .send_message(message.as_bytes())
+            .send_update()
             .await
-            .map_err(|e| format!("Failed to send message: {e:?}"))?;
+            .map_err(|e| format!("Failed to send update: {e:?}"))?;
 
-        Ok("Message sent".to_string())
+        Ok("Update sent".to_string())
     }
 
     async fn cmd_recv_message(&mut self, group_id_hex: &str) -> Result<String, String> {
@@ -460,31 +460,12 @@ Note: Welcome messages are received automatically in the background.
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
         // Use a short timeout to avoid blocking the REPL forever
-        let result = timeout(Duration::from_secs(5), group.recv_message()).await;
+        let result = timeout(Duration::from_secs(5), group.wait_for_update()).await;
 
         match result {
-            Ok(Some(msg)) => {
-                let mut output = String::new();
-                let _ = writeln!(output, "From: member {}", msg.sender.0);
-                let _ = writeln!(output, "Epoch: {}", msg.epoch.0);
-                let _ = writeln!(output, "Index: {}", msg.index);
-                // Try to decode as UTF-8, fall back to hex
-                match std::str::from_utf8(&msg.data) {
-                    Ok(text) => {
-                        let _ = writeln!(output, "Data: {text}");
-                    }
-                    Err(_) => {
-                        let _ = writeln!(
-                            output,
-                            "Data (base58): {}",
-                            bs58::encode(&msg.data).into_string()
-                        );
-                    }
-                }
-                Ok(output)
-            }
-            Ok(None) => Ok("No messages (channel closed)".to_string()),
-            Err(_) => Ok("No messages (timeout)".to_string()),
+            Ok(Some(())) => Ok("Update received and applied".to_string()),
+            Ok(None) => Ok("No updates (channel closed)".to_string()),
+            Err(_) => Ok("No updates (timeout)".to_string()),
         }
     }
 }

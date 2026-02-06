@@ -28,6 +28,9 @@ pub const CRDT_REGISTRATION_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0
 /// Extension type for supported CRDTs list (key package extension)
 pub const SUPPORTED_CRDTS_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF79A);
 
+/// Extension type for CRDT snapshot (group info extension, sent in welcome)
+pub const CRDT_SNAPSHOT_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF79B);
+
 /// Custom error code for postcard serialization failures
 const POSTCARD_ERROR: u8 = 1;
 
@@ -397,6 +400,57 @@ impl MlsCodecExtension for SupportedCrdtsExt {
     }
 }
 
+/// MLS group info extension containing the CRDT state snapshot.
+///
+/// This extension is included in the Welcome message's `GroupInfo` when adding
+/// a new member, so the joiner receives the current CRDT state atomically
+/// with the MLS welcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrdtSnapshotExt(pub Vec<u8>);
+
+impl CrdtSnapshotExt {
+    /// Create a new CRDT snapshot extension
+    #[must_use]
+    pub fn new(snapshot: Vec<u8>) -> Self {
+        Self(snapshot)
+    }
+
+    /// Get the snapshot bytes
+    #[must_use]
+    pub fn snapshot(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl MlsSize for CrdtSnapshotExt {
+    fn mls_encoded_len(&self) -> usize {
+        4 + self.0.len()
+    }
+}
+
+impl MlsEncode for CrdtSnapshotExt {
+    #[expect(clippy::cast_possible_truncation)]
+    fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+        let len = self.0.len() as u32;
+        writer.extend_from_slice(&len.to_be_bytes());
+        writer.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+impl MlsDecode for CrdtSnapshotExt {
+    fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
+        let data = read_length_prefixed(reader)?;
+        Ok(Self(data.to_vec()))
+    }
+}
+
+impl MlsCodecExtension for CrdtSnapshotExt {
+    fn extension_type() -> ExtensionType {
+        CRDT_SNAPSHOT_EXTENSION_TYPE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use iroh::SecretKey;
@@ -476,6 +530,28 @@ mod tests {
         assert!(AcceptorRemove::extension_type().raw_value() >= 0xF000);
         assert!(CrdtRegistrationExt::extension_type().raw_value() >= 0xF000);
         assert!(SupportedCrdtsExt::extension_type().raw_value() >= 0xF000);
+        assert!(CrdtSnapshotExt::extension_type().raw_value() >= 0xF000);
+    }
+
+    #[test]
+    fn test_crdt_snapshot_roundtrip() {
+        let snapshot = b"some crdt state".to_vec();
+        let ext = CrdtSnapshotExt::new(snapshot.clone());
+
+        let encoded = ext.mls_encode_to_vec().unwrap();
+
+        let decoded = CrdtSnapshotExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded.snapshot(), &snapshot);
+    }
+
+    #[test]
+    fn test_crdt_snapshot_empty() {
+        let ext = CrdtSnapshotExt::new(Vec::new());
+
+        let encoded = ext.mls_encode_to_vec().unwrap();
+
+        let decoded = CrdtSnapshotExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        assert!(decoded.snapshot().is_empty());
     }
 
     #[test]
