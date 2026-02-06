@@ -502,16 +502,19 @@ async fn test_three_member_group() {
     let welcome = carol.recv_welcome().await.expect("carol welcome");
     let mut carol_group = carol.join_group(&welcome).await.expect("carol join");
 
+    // Give Bob time to learn the commit that added Carol
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
     // Verify all have correct member count
     let alice_ctx = alice_group.context().await.expect("alice context");
     let bob_ctx = bob_group.context().await.expect("bob context");
     let carol_ctx = carol_group.context().await.expect("carol context");
 
     assert_eq!(alice_ctx.member_count, 3, "Alice should see 3 members");
-    // Bob joined before Carol was added
+    // Bob now learns about Carol via the passive learner subscription
     assert_eq!(
-        bob_ctx.member_count, 2,
-        "Bob should see 2 members (from when he joined)"
+        bob_ctx.member_count, 3,
+        "Bob should see 3 members (advances epoch via passive learning)"
     );
     assert_eq!(carol_ctx.member_count, 3, "Carol should see 3 members");
 
@@ -1665,17 +1668,13 @@ async fn test_welcome_reencryption_sequential_joiners() {
     acceptor_task.abort();
 }
 
-/// Test 4: Post-compaction message flow from new member to original.
+/// Test 4: Bidirectional message flow after compaction.
 ///
-/// After compaction clears the update buffer and a new member joins,
-/// the new member should be able to send messages that the original
-/// member can receive (via prior_epoch decryption).
-///
-/// Note: Messages from the original member to the new member at the
-/// post-CompactionComplete epoch are a known limitation — passive
-/// learners don't advance their epoch until they propose something.
+/// After compaction + new member join, both members should be able to
+/// exchange messages. Bob advances his epoch by learning Alice's
+/// CompactionComplete commit via the passive learner subscription.
 #[tokio::test]
-async fn test_post_compaction_new_member_sends() {
+async fn test_post_compaction_bidirectional() {
     init_tracing();
 
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
@@ -1713,16 +1712,25 @@ async fn test_post_compaction_new_member_sends() {
     // Bob catches up with initial state via backfill
     wait_for_sync(&mut bob_group, "Hello", 10).await;
 
-    // Bob writes a NEW message AFTER joining
-    yrs_insert_and_send(&mut bob_group, 5, " World").await;
+    // Give Bob time to learn the CompactionComplete commit and advance epoch
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Alice should receive Bob's message (prior_epoch decryption)
+    // Alice sends a NEW message AFTER compaction (at post-CompactionComplete epoch)
+    yrs_insert_and_send(&mut alice_group, 5, " World").await;
+
+    // Bob should receive Alice's message (Bob has advanced epoch via passive learning)
+    wait_for_sync(&mut bob_group, "Hello World", 10).await;
+
+    // Bob sends back to Alice
+    yrs_insert_and_send(&mut bob_group, 11, "!").await;
+
+    // Alice receives Bob's update
     tokio::time::timeout(Duration::from_secs(5), alice_group.wait_for_update())
         .await
         .expect("timeout waiting for Alice to receive Bob's message")
         .expect("channel closed");
 
-    assert_eq!(yrs_get_text(&alice_group), "Hello World");
+    assert_eq!(yrs_get_text(&alice_group), "Hello World!");
 
     alice_group.shutdown().await;
     bob_group.shutdown().await;

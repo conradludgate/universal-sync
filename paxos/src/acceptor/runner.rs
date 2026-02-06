@@ -72,6 +72,10 @@ impl<S: Stream> FusedStream for Fuse<S> {
 /// Waits for the learner to catch up when receiving proposals for future epochs.
 /// Needed when proposal validation depends on learned state (e.g., MLS roster
 /// for signature validation).
+///
+/// Immediately subscribes to learned values so that passive learners (clients
+/// that never propose) can advance their epoch by receiving commits from other
+/// proposers.
 #[allow(clippy::too_many_lines)]
 #[instrument(skip_all, name = "acceptor_epoch_aware", fields(node_id = ?handler.node_id(), proposer = ?proposer_id))]
 pub async fn run_acceptor_with_epoch_waiter<A, S, C>(
@@ -89,8 +93,13 @@ where
 {
     debug!("acceptor with epoch waiter started");
 
-    // sync is terminated until we receive the initial Prepare
-    let mut sync = pin!(Fuse::<S::Subscription>::terminated());
+    // Subscribe to learned values immediately so passive learners can
+    // advance their epoch by receiving commits from other proposers.
+    let initial_subscription = handler
+        .state()
+        .subscribe_from(Default::default())
+        .await;
+    let mut sync = pin!(Fuse::new(initial_subscription));
     let mut conn = pin!(conn);
 
     loop {
