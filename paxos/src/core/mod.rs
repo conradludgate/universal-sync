@@ -1,18 +1,5 @@
-//! Pure state machine core for Paxos - no I/O, no async
-//!
-//! This module contains the core state transition logic that is shared between:
-//! - The async runtime implementation
-//! - The Stateright model checker tests
-//!
-//! By extracting this logic, we ensure the model checker verifies the exact
-//! same state transitions as the production code.
-//!
-//! # Modules
-//!
-//! - [`types`]: Core type definitions (`ProposalKey`, message types)
-//! - [`acceptor`]: Acceptor state machine (`AcceptorCore`)
-//! - [`proposer`]: Proposer state machine (`ProposerCore`)
-//! - [`quorum`]: Quorum tracking (`QuorumCore`)
+//! Pure state machine core for Paxos — no I/O, no async.
+//! Shared between the async runtime and the Stateright model checker.
 
 pub(crate) mod acceptor;
 pub(crate) mod proposer;

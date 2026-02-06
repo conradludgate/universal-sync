@@ -1,12 +1,6 @@
-//! Universal Sync Proposer - client/device-side group membership
+//! Client/device-side group membership for Universal Sync.
 //!
-//! This crate provides the proposer (client/device) implementation for
-//! Universal Sync, including:
-//!
-//! - [`GroupClient`] - High-level client abstraction for creating/joining groups
-//! - [`Group`] - High-level API for synchronized MLS groups
-//! - [`GroupLearner`] - Lower-level MLS group member (for advanced use)
-//! - [`IrohConnector`] - P2P QUIC connections to acceptors
+//! Key types: [`GroupClient`], [`Group`], [`GroupLearner`], [`IrohConnector`].
 
 #![warn(clippy::pedantic)]
 
@@ -19,7 +13,6 @@ pub(crate) mod group;
 pub(crate) mod learner;
 pub(crate) mod rendezvous;
 
-/// REPL module for the CLI binary. Not part of the public API.
 #[doc(hidden)]
 pub mod repl;
 

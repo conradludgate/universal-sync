@@ -1,9 +1,4 @@
-//! Persistent acceptor state store using fjall
-//!
-//! This module provides a durable implementation of [`AcceptorStateStore`]
-//! backed by the fjall embedded key-value store.
-//!
-//! The store supports multiple groups, with keys prefixed by group ID.
+//! Persistent acceptor state store using fjall.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,62 +16,28 @@ use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
 
 use crate::epoch_roster::EpochRoster;
 
-/// Type alias for the broadcast sender map
 type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
 
-/// Persistent acceptor state store backed by fjall
-///
-/// This implementation persists all state changes to disk before returning,
-/// ensuring crash recovery is possible.
-///
-/// Supports multiple groups - keys are prefixed with group ID.
-///
-/// Uses separate keyspaces:
-/// - `promised`: (`group_id`, epoch) -> proposal
-/// - `accepted`: (`group_id`, epoch) -> (proposal, message)
-/// - `groups`: `group_id` -> `GroupInfo` bytes (for registry persistence)
-/// - `messages`: (`group_id`, `arrival_seq`) -> `EncryptedAppMessage`
-/// - `message_seq`: `group_id` -> next sequence number
-/// - `epoch_rosters`: (`group_id`, epoch) -> `EpochRoster` (for signature validation)
 pub(crate) struct FjallStateStore {
-    /// The fjall database
     db: Database,
-    /// Keyspace for promised proposals
     promised: Keyspace,
-    /// Keyspace for accepted values
     accepted: Keyspace,
-    /// Keyspace for registered groups (`GroupInfo` bytes)
     groups: Keyspace,
-    /// Keyspace for application messages: (`group_id`, `arrival_seq`) -> message
     messages: Keyspace,
-    /// Keyspace for per-group sequence counters: `group_id` -> next seq
     message_seq: Keyspace,
-    /// Keyspace for epoch rosters: (`group_id`, epoch) -> `EpochRoster`
     epoch_rosters: Keyspace,
-    /// Per-group broadcast channels for live subscriptions (proposals)
     broadcasts: GroupBroadcasts,
-    /// Per-group broadcast channels for application messages
     message_broadcasts: RwLock<HashMap<[u8; 32], broadcast::Sender<EncryptedAppMessage>>>,
 }
 
 impl FjallStateStore {
-    /// Open or create a new state store at the given path
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be opened.
-    ///
-    /// # Panics
-    /// Panics if the spawned blocking task panics.
     pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
         let path = path.as_ref().to_owned();
-
-        // Use spawn_blocking for the synchronous fjall operations
         tokio::task::spawn_blocking(move || Self::open_sync(&path))
             .await
             .expect("spawn_blocking panicked")
     }
 
-    /// Synchronous open for use in `spawn_blocking`
     fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
         let db = Database::builder(path).open()?;
 
@@ -100,9 +61,6 @@ impl FjallStateStore {
         })
     }
 
-    /// Build a key from (`group_id`, epoch)
-    ///
-    /// Format: `[group_id: 32 bytes][epoch: 8 bytes BE]` = 40 bytes total
     fn build_key(group_id: &GroupId, epoch: Epoch) -> [u8; 40] {
         let mut key = [0u8; 40];
         key[..32].copy_from_slice(group_id.as_bytes());
@@ -110,12 +68,10 @@ impl FjallStateStore {
         key
     }
 
-    /// Build a prefix for range queries on a group (just the `group_id`)
     fn build_group_prefix(group_id: &GroupId) -> [u8; 32] {
         *group_id.as_bytes()
     }
 
-    /// Parse epoch from a key (assumes key was created by `build_key`)
     fn parse_epoch_from_key(key: &[u8]) -> Option<Epoch> {
         if key.len() < 40 {
             return None;
@@ -124,29 +80,22 @@ impl FjallStateStore {
         Some(Epoch(u64::from_be_bytes(epoch_bytes)))
     }
 
-    /// Serialize a proposal for storage
     fn serialize_proposal(proposal: &GroupProposal) -> Vec<u8> {
         postcard::to_allocvec(proposal).expect("serialization should not fail")
     }
 
-    /// Deserialize a proposal from storage
     fn deserialize_proposal(bytes: &[u8]) -> Option<GroupProposal> {
         postcard::from_bytes(bytes).ok()
     }
 
-    /// Serialize a message for storage
     fn serialize_message(message: &GroupMessage) -> Vec<u8> {
         postcard::to_allocvec(message).expect("serialization should not fail")
     }
 
-    /// Deserialize a message from storage
     fn deserialize_message(bytes: &[u8]) -> Option<GroupMessage> {
         postcard::from_bytes(bytes).ok()
     }
 
-    // --- Application Message Helpers ---
-
-    /// Build a key for application messages: `group_id` + `arrival_seq`
     fn build_message_key(group_id: &GroupId, seq: u64) -> [u8; 40] {
         let mut key = [0u8; 40];
         key[..32].copy_from_slice(group_id.as_bytes());
@@ -154,21 +103,16 @@ impl FjallStateStore {
         key
     }
 
-    /// Serialize an encrypted app message for storage
     fn serialize_app_message(msg: &EncryptedAppMessage) -> Vec<u8> {
         postcard::to_allocvec(msg).expect("serialization should not fail")
     }
 
-    /// Deserialize an encrypted app message from storage
     fn deserialize_app_message(bytes: &[u8]) -> Option<EncryptedAppMessage> {
         postcard::from_bytes(bytes).ok()
     }
 
-    /// Get the next sequence number for a group and increment it
     fn next_message_seq(&self, group_id: &GroupId) -> Result<u64, fjall::Error> {
         let key = group_id.as_bytes();
-
-        // Get current value or default to 0
         let current = self.message_seq.get(key)?.map_or(0, |bytes| {
             if bytes.len() >= 8 {
                 u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
@@ -177,36 +121,23 @@ impl FjallStateStore {
             }
         });
 
-        // Store incremented value
         self.message_seq.insert(key, (current + 1).to_be_bytes())?;
 
         Ok(current)
     }
 
-    /// Store an application message.
-    ///
-    /// Returns the arrival sequence number for the message.
-    /// Deduplication is handled by clients, not the acceptor.
-    ///
-    /// # Errors
-    /// Returns an error if storage operations fail.
     pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
         msg: &EncryptedAppMessage,
     ) -> Result<u64, fjall::Error> {
-        // Get next sequence number
         let seq = self.next_message_seq(group_id)?;
-
-        // Store the message
         let msg_key = Self::build_message_key(group_id, seq);
         let msg_bytes = Self::serialize_app_message(msg);
         self.messages.insert(msg_key, &msg_bytes)?;
 
-        // Persist
         self.db.persist(PersistMode::SyncAll)?;
 
-        // Broadcast to subscribers
         if let Ok(broadcasts) = self.message_broadcasts.read()
             && let Some(tx) = broadcasts.get(group_id.as_bytes())
         {
@@ -216,7 +147,6 @@ impl FjallStateStore {
         Ok(seq)
     }
 
-    /// Get messages for a group starting from a sequence number
     pub(crate) fn get_messages_since(
         &self,
         group_id: &GroupId,
@@ -232,12 +162,10 @@ impl FjallStateStore {
                 continue;
             };
 
-            // Check if still in the same group
             if key.len() < 32 || &key[..32] != prefix.as_slice() {
                 break;
             }
 
-            // Parse sequence from key
             if key.len() >= 40 {
                 let seq = u64::from_be_bytes(key[32..40].try_into().unwrap_or([0; 8]));
                 if let Some(msg) = Self::deserialize_app_message(&value) {
@@ -249,10 +177,6 @@ impl FjallStateStore {
         messages
     }
 
-    /// Subscribe to new application messages for a group
-    ///
-    /// # Panics
-    /// Panics if the internal lock is poisoned.
     pub(crate) fn subscribe_messages(
         &self,
         group_id: &GroupId,
@@ -266,7 +190,6 @@ impl FjallStateStore {
             .subscribe()
     }
 
-    /// Get promised proposal for a (group, round) (synchronous)
     fn get_promised_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<GroupProposal> {
         let key = Self::build_key(group_id, epoch);
         self.promised
@@ -276,7 +199,6 @@ impl FjallStateStore {
             .and_then(|bytes| Self::deserialize_proposal(&bytes))
     }
 
-    /// Get accepted (proposal, message) for a (group, round) (synchronous)
     fn get_accepted_sync(
         &self,
         group_id: &GroupId,
@@ -284,7 +206,6 @@ impl FjallStateStore {
     ) -> Option<(GroupProposal, GroupMessage)> {
         let key = Self::build_key(group_id, epoch);
         self.accepted.get(key).ok().flatten().and_then(|bytes| {
-            // Accepted value is serialized as (proposal_len, proposal, message)
             if bytes.len() < 4 {
                 return None;
             }
@@ -298,7 +219,6 @@ impl FjallStateStore {
         })
     }
 
-    /// Set promised proposal for a (group, round) (synchronous)
     fn set_promised_sync(
         &self,
         group_id: &GroupId,
@@ -311,7 +231,6 @@ impl FjallStateStore {
         Ok(())
     }
 
-    /// Set accepted (proposal, message) for a (group, round) (synchronous)
     #[expect(clippy::cast_possible_truncation)]
     fn set_accepted_sync(
         &self,
@@ -321,7 +240,6 @@ impl FjallStateStore {
     ) -> Result<(), fjall::Error> {
         let key = Self::build_key(group_id, proposal.epoch);
 
-        // Serialize as (proposal_len: u32, proposal, message)
         let proposal_bytes = Self::serialize_proposal(proposal);
         let message_bytes = Self::serialize_message(message);
 
@@ -335,7 +253,6 @@ impl FjallStateStore {
         Ok(())
     }
 
-    /// Get all accepted values for a group from a given round onwards (synchronous)
     fn get_accepted_from_sync(
         &self,
         group_id: &GroupId,
@@ -348,7 +265,6 @@ impl FjallStateStore {
             .range(start_key..)
             .filter_map(|guard| {
                 let (key, value) = guard.into_inner().ok()?;
-                // Stop if we've left this group's prefix
                 if !key.starts_with(&prefix) {
                     return None;
                 }
@@ -356,7 +272,6 @@ impl FjallStateStore {
                 if epoch < from_epoch {
                     return None;
                 }
-                // Parse the value
                 if value.len() < 4 {
                     return None;
                 }
@@ -371,13 +286,10 @@ impl FjallStateStore {
             .collect()
     }
 
-    /// Get the highest accepted round for a group (synchronous)
     fn highest_accepted_round_sync(&self, group_id: &GroupId) -> Option<Epoch> {
         let prefix = Self::build_group_prefix(group_id);
 
-        // Build end key: group_id with last byte incremented
         let mut end_key = prefix;
-        // Find the first non-0xFF byte from the end and increment it
         for byte in end_key.iter_mut().rev() {
             if *byte < 0xFF {
                 *byte += 1;
@@ -386,7 +298,6 @@ impl FjallStateStore {
             *byte = 0;
         }
 
-        // Iterate through all entries for this group, tracking the highest epoch
         let mut highest: Option<Epoch> = None;
         for guard in self.accepted.range(prefix..end_key) {
             if let Ok((key, _)) = guard.into_inner()
@@ -398,17 +309,14 @@ impl FjallStateStore {
         highest
     }
 
-    /// Get or create the broadcast channel for a group
     fn get_broadcast(
         &self,
         group_id: &GroupId,
     ) -> broadcast::Sender<(GroupProposal, GroupMessage)> {
-        // Try read lock first
         if let Some(sender) = self.broadcasts.read().unwrap().get(&group_id.0) {
             return sender.clone();
         }
 
-        // Need to create - use write lock
         let mut broadcasts = self.broadcasts.write().unwrap();
         broadcasts
             .entry(group_id.0)
@@ -416,16 +324,12 @@ impl FjallStateStore {
             .clone()
     }
 
-    // ========== Group Registry Methods ==========
-
-    /// Store a group's `GroupInfo` bytes (synchronous)
     fn store_group_sync(&self, group_id: &GroupId, group_info: &[u8]) -> Result<(), fjall::Error> {
         self.groups.insert(group_id.as_bytes(), group_info)?;
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
-    /// Get a group's `GroupInfo` bytes (synchronous)
     fn get_group_sync(&self, group_id: &GroupId) -> Option<Vec<u8>> {
         self.groups
             .get(group_id.as_bytes())
@@ -434,7 +338,6 @@ impl FjallStateStore {
             .map(|slice| slice.to_vec())
     }
 
-    /// List all registered group IDs (synchronous)
     fn list_groups_sync(&self) -> Vec<GroupId> {
         self.groups
             .iter()
@@ -451,16 +354,12 @@ impl FjallStateStore {
             .collect()
     }
 
-    /// Remove a group (synchronous)
     fn remove_group_sync(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
         self.groups.remove(group_id.as_bytes())?;
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
-    // ========== Epoch Roster Methods ==========
-
-    /// Store an epoch roster snapshot
     fn store_epoch_roster_sync(
         &self,
         group_id: &GroupId,
@@ -472,20 +371,6 @@ impl FjallStateStore {
         Ok(())
     }
 
-    // /// Get an epoch roster snapshot
-    // fn get_epoch_roster_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
-    //     let key = Self::build_key(group_id, epoch);
-    //     self.epoch_rosters
-    //         .get(key)
-    //         .ok()
-    //         .flatten()
-    //         .and_then(|bytes| EpochRoster::from_bytes(&bytes))
-    // }
-
-    /// Get the closest epoch roster at or before the given epoch
-    ///
-    /// This is useful when we don't have a snapshot for the exact epoch
-    /// but need to validate against the closest prior state.
     fn get_epoch_roster_at_or_before_sync(
         &self,
         group_id: &GroupId,
@@ -494,7 +379,6 @@ impl FjallStateStore {
         let prefix = Self::build_group_prefix(group_id);
         let target_key = Self::build_key(group_id, epoch);
 
-        // Scan backwards from the target epoch
         for guard in self
             .epoch_rosters
             .range(prefix.as_slice()..=target_key.as_slice())
@@ -510,17 +394,12 @@ impl FjallStateStore {
     }
 }
 
-/// Wrapper to make `FjallStateStore` shareable across groups
 #[derive(Clone)]
 pub struct SharedFjallStateStore {
     inner: Arc<FjallStateStore>,
 }
 
 impl SharedFjallStateStore {
-    /// Open or create a new state store at the given path
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be opened.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
         let store = FjallStateStore::open(path).await?;
         Ok(Self {
@@ -528,7 +407,6 @@ impl SharedFjallStateStore {
         })
     }
 
-    /// Get a per-group state store view
     #[must_use]
     pub(crate) fn for_group(&self, group_id: GroupId) -> GroupStateStore {
         GroupStateStore {
@@ -537,46 +415,24 @@ impl SharedFjallStateStore {
         }
     }
 
-    // ========== Group Registry Methods ==========
-
-    /// Store a group's `GroupInfo` bytes
-    ///
-    /// This persists the `GroupInfo` so the group can be restored after restart.
-    ///
-    /// # Errors
-    /// Returns an error if persisting to the database fails.
     pub fn store_group(&self, group_id: &GroupId, group_info: &[u8]) -> Result<(), fjall::Error> {
         self.inner.store_group_sync(group_id, group_info)
     }
 
-    /// Get a group's `GroupInfo` bytes
-    ///
-    /// Returns `None` if the group is not registered.
     #[must_use]
     pub fn get_group_info(&self, group_id: &GroupId) -> Option<Vec<u8>> {
         self.inner.get_group_sync(group_id)
     }
 
-    /// List all registered group IDs
     #[must_use]
     pub fn list_groups(&self) -> Vec<GroupId> {
         self.inner.list_groups_sync()
     }
 
-    /// Remove a group registration
-    ///
-    /// # Errors
-    /// Returns an error if removing from the database fails.
     pub fn remove_group(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
         self.inner.remove_group_sync(group_id)
     }
 
-    // ========== Application Message Methods ==========
-
-    /// Store an application message.
-    ///
-    /// # Errors
-    /// Returns an error if persisting to the database fails.
     pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
@@ -585,7 +441,6 @@ impl SharedFjallStateStore {
         self.inner.store_app_message(group_id, msg)
     }
 
-    /// Get messages since a sequence number.
     #[must_use]
     pub(crate) fn get_messages_since(
         &self,
@@ -595,7 +450,6 @@ impl SharedFjallStateStore {
         self.inner.get_messages_since(group_id, since_seq)
     }
 
-    /// Subscribe to new messages for a group.
     #[must_use]
     pub(crate) fn subscribe_messages(
         &self,
@@ -604,42 +458,8 @@ impl SharedFjallStateStore {
         self.inner.subscribe_messages(group_id)
     }
 
-    // ========== Epoch Roster Methods ==========
-
-    // /// Store an epoch roster snapshot
-    // ///
-    // /// # Errors
-    // /// Returns an error if persisting to the database fails.
-    // pub(crate) fn store_epoch_roster(
-    //     &self,
-    //     group_id: &GroupId,
-    //     roster: &EpochRoster,
-    // ) -> Result<(), fjall::Error> {
-    //     self.inner.store_epoch_roster_sync(group_id, roster)
-    // }
-
-    // /// Get an epoch roster snapshot for a specific epoch
-    // #[must_use]
-    // pub(crate) fn get_epoch_roster(&self, group_id: &GroupId, epoch: Epoch) -> Option<EpochRoster> {
-    //     self.inner.get_epoch_roster_sync(group_id, epoch)
-    // }
-
-    // /// Get the closest epoch roster at or before the given epoch
-    // #[must_use]
-    // pub(crate) fn get_epoch_roster_at_or_before(
-    //     &self,
-    //     group_id: &GroupId,
-    //     epoch: Epoch,
-    // ) -> Option<EpochRoster> {
-    //     self.inner
-    //         .get_epoch_roster_at_or_before_sync(group_id, epoch)
-    // }
 }
 
-/// Per-group view of the state store
-///
-/// This wraps a [`SharedFjallStateStore`] with a specific group ID,
-/// implementing [`AcceptorStateStore`] for that group.
 #[derive(Clone)]
 pub struct GroupStateStore {
     inner: Arc<FjallStateStore>,
@@ -647,9 +467,6 @@ pub struct GroupStateStore {
 }
 
 impl GroupStateStore {
-    /// Get all accepted messages from the given epoch onwards
-    ///
-    /// This is useful for replaying messages to catch up a newly created acceptor.
     #[must_use]
     pub(crate) fn get_accepted_from(
         &self,
@@ -659,21 +476,10 @@ impl GroupStateStore {
             .get_accepted_from_sync(&self.group_id, from_epoch)
     }
 
-    /// Store an epoch roster snapshot for this group
-    ///
-    /// # Errors
-    /// Returns an error if persisting to the database fails.
     pub(crate) fn store_epoch_roster(&self, roster: &EpochRoster) -> Result<(), fjall::Error> {
         self.inner.store_epoch_roster_sync(&self.group_id, roster)
     }
 
-    // /// Get an epoch roster snapshot for a specific epoch
-    // #[must_use]
-    // pub(crate) fn get_epoch_roster(&self, epoch: Epoch) -> Option<EpochRoster> {
-    //     self.inner.get_epoch_roster_sync(&self.group_id, epoch)
-    // }
-
-    /// Get the closest epoch roster at or before the given epoch
     #[must_use]
     pub(crate) fn get_epoch_roster_at_or_before(&self, epoch: Epoch) -> Option<EpochRoster> {
         self.inner
@@ -681,7 +487,6 @@ impl GroupStateStore {
     }
 }
 
-/// Broadcast receiver wrapper that filters by group
 pub struct GroupReceiver {
     inner: tokio_stream::wrappers::BroadcastStream<(GroupProposal, GroupMessage)>,
 }
@@ -697,10 +502,7 @@ impl Stream for GroupReceiver {
     }
 }
 
-/// Historical stream type
 pub type HistoricalStream = stream::Iter<std::vec::IntoIter<(GroupProposal, GroupMessage)>>;
-
-/// Combined subscription stream
 pub type GroupSubscription = stream::Chain<HistoricalStream, GroupReceiver>;
 
 impl<L> AcceptorStateStore<L> for GroupStateStore
@@ -731,11 +533,9 @@ where
             let epoch = proposal.epoch;
             let key = proposal.key();
 
-            // Check current state
             let current_promised = inner.get_promised_sync(&group_id, epoch);
             let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-            // Use shared decision logic from TLA+ spec
             let promised_key = current_promised.as_ref().map(Proposal::key);
             let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
 
@@ -746,7 +546,6 @@ where
                 });
             }
 
-            // Persist the promise
             inner
                 .set_promised_sync(&group_id, &proposal)
                 .map_err(|_| RoundState {
@@ -774,11 +573,9 @@ where
             let epoch = proposal.epoch;
             let key = proposal.key();
 
-            // Check current state
             let current_promised = inner.get_promised_sync(&group_id, epoch);
             let current_accepted = inner.get_accepted_sync(&group_id, epoch);
 
-            // Use shared decision logic from TLA+ spec
             let promised_key = current_promised.as_ref().map(Proposal::key);
             let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
 
@@ -789,7 +586,6 @@ where
                 });
             }
 
-            // Persist the accept
             inner
                 .set_accepted_sync(&group_id, &proposal, &message)
                 .map_err(|_| RoundState {
@@ -797,7 +593,6 @@ where
                     accepted: current_accepted.clone(),
                 })?;
 
-            // Broadcast to learners for this group
             let _ = inner.get_broadcast(&group_id).send((proposal, message));
 
             Ok(())
@@ -810,14 +605,12 @@ where
         let inner = self.inner.clone();
         let group_id = self.group_id;
 
-        // Get historical values in a blocking task
         let historical = tokio::task::spawn_blocking(move || {
             inner.get_accepted_from_sync(&group_id, from_round)
         })
         .await
         .expect("spawn_blocking panicked");
 
-        // Create live receiver (this is just channel subscription, no blocking IO)
         let live = GroupReceiver {
             inner: tokio_stream::wrappers::BroadcastStream::new(
                 self.inner.get_broadcast(&self.group_id).subscribe(),

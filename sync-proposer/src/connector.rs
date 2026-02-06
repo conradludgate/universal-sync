@@ -1,7 +1,4 @@
-//! Iroh-based connector for Paxos acceptors
-//!
-//! This module provides a [`Connector`] implementation using iroh for
-//! p2p QUIC connections to acceptors.
+//! [`Connector`] implementation using iroh for p2p QUIC connections to acceptors.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,7 +9,6 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-// Re-export ConnectorError for public API
 pub use universal_sync_core::ConnectorError;
 use universal_sync_core::codec::PostcardCodec;
 use universal_sync_core::sink_stream::{Mapped, SinkStream};
@@ -21,24 +17,11 @@ use universal_sync_core::{
 };
 use universal_sync_paxos::{AcceptorMessage, AcceptorRequest, Connector, Learner};
 
-/// Iroh-based connector for Paxos acceptors
-///
-/// Connects to acceptors using iroh's p2p QUIC connections.
-/// Each acceptor is identified by its iroh public key ([`AcceptorId`]).
-///
-/// The connector performs a Join handshake when connecting to join an
-/// existing group. For registering new groups with acceptors, use
-/// [`register_group`] instead.
-///
-/// Generic over any [`Learner`] that uses:
-/// - `Proposal = GroupProposal`
-/// - `Message = GroupMessage`
-/// - `AcceptorId = AcceptorId`
-/// - `Error: From<ConnectorError>`
+/// Connects to Paxos acceptors using iroh p2p QUIC. Performs a Join handshake
+/// on connect. For registering new groups, use [`register_group_with_addr`].
 pub struct IrohConnector<L> {
     endpoint: Endpoint,
     group_id: GroupId,
-    /// Optional address hints for acceptors (useful when discovery is not available)
     address_hints: Arc<HashMap<AcceptorId, EndpointAddr>>,
     _marker: PhantomData<fn() -> L>,
 }
@@ -68,7 +51,6 @@ where
         let endpoint = self.endpoint.clone();
         let group_id = self.group_id;
 
-        // Use address hint if available, otherwise just the public key
         let addr: EndpointAddr =
             self.address_hints
                 .get(acceptor_id)
@@ -80,26 +62,22 @@ where
                 });
 
         Box::pin(async move {
-            // Connect to the acceptor
             let conn = endpoint
                 .connect(addr, PAXOS_ALPN)
                 .await
                 .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-            // Open a bidirectional stream for the Paxos protocol
             let (send, recv) = conn
                 .open_bi()
                 .await
                 .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-            // Create framed reader/writer for handshake
             let codec = LengthDelimitedCodec::builder()
                 .max_frame_length(16 * 1024 * 1024)
                 .new_codec();
             let mut reader = FramedRead::new(recv, codec.clone());
             let mut writer = FramedWrite::new(send, codec);
 
-            // Send the Join handshake
             let handshake = Handshake::JoinProposals(group_id);
             let handshake_bytes = postcard::to_allocvec(&handshake)
                 .map_err(|e| ConnectorError::Codec(e.to_string()))?;
@@ -108,7 +86,6 @@ where
                 .await
                 .map_err(ConnectorError::Io)?;
 
-            // Read the response
             let response_bytes = reader
                 .next()
                 .await
@@ -120,7 +97,6 @@ where
             let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
                 .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
 
-            // Check response
             match response {
                 HandshakeResponse::Ok => {}
                 HandshakeResponse::GroupNotFound => {
@@ -136,7 +112,6 @@ where
                 }
             }
 
-            // Extract inner streams and create connection
             let recv = reader.into_inner();
             let send = writer.into_inner();
 
@@ -145,46 +120,28 @@ where
     }
 }
 
-/// Register a new group with an acceptor using a full endpoint address
-///
-/// Like [`register_group`] but accepts an [`iroh::EndpointAddr`] for local testing
-/// where discovery may not be available.
-///
-/// # Arguments
-/// * `endpoint` - The iroh endpoint to use
-/// * `addr` - The endpoint address (includes direct addresses for local connections)
-/// * `group_info` - The MLS `GroupInfo` message bytes
-///
-/// # Returns
-/// The [`GroupId`] assigned to the group on success.
-///
-/// # Errors
-/// Returns an error if the connection fails or the handshake is rejected.
+/// Register a new group with an acceptor. Returns the [`GroupId`] on success.
 pub(crate) async fn register_group_with_addr(
     endpoint: &Endpoint,
     addr: impl Into<iroh::EndpointAddr>,
     group_info: &[u8],
 ) -> Result<GroupId, ConnectorError> {
-    // Connect to the acceptor
     let conn = endpoint
         .connect(addr, PAXOS_ALPN)
         .await
         .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-    // Open a bidirectional stream
     let (send, recv) = conn
         .open_bi()
         .await
         .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-    // Create framed reader/writer
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(16 * 1024 * 1024)
         .new_codec();
     let mut reader = FramedRead::new(recv, codec.clone());
     let mut writer = FramedWrite::new(send, codec);
 
-    // Send the Create handshake
     let handshake = Handshake::CreateGroup(group_info.to_vec());
     let handshake_bytes =
         postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
@@ -193,7 +150,6 @@ pub(crate) async fn register_group_with_addr(
         .await
         .map_err(ConnectorError::Io)?;
 
-    // Read the response
     let response_bytes = reader
         .next()
         .await
@@ -203,12 +159,8 @@ pub(crate) async fn register_group_with_addr(
     let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
         .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
 
-    // Check response
     match response {
         HandshakeResponse::Ok => {
-            // Parse the group ID from the GroupInfo
-            // The server creates the group and we trust it used the correct ID
-            // For now, derive from the group_info bytes
             Ok(GroupId::from_slice(group_info))
         }
         HandshakeResponse::GroupNotFound => Err(ConnectorError::Handshake(
@@ -221,10 +173,7 @@ pub(crate) async fn register_group_with_addr(
     }
 }
 
-/// A bidirectional Paxos connection over iroh
-///
-/// Implements both `Sink<AcceptorRequest>` and `Stream<Item = AcceptorMessage>`.
-/// Uses `MappedSinkStream` to convert `io::Error` to the learner's error type.
+/// Bidirectional Paxos connection over iroh (`Sink<AcceptorRequest>` + `Stream<AcceptorMessage>`).
 pub type IrohConnection<L, E> = Mapped<
     SinkStream<
         FramedWrite<iroh::endpoint::SendStream, PostcardCodec<AcceptorRequest<L>>>,
@@ -233,7 +182,6 @@ pub type IrohConnection<L, E> = Mapped<
     E,
 >;
 
-/// Create a new `IrohConnection` from iroh streams
 #[must_use]
 pub(crate) fn new_iroh_connection<L, E>(
     send: iroh::endpoint::SendStream,
@@ -248,11 +196,7 @@ where
     ))
 }
 
-// =============================================================================
-// Simplified proposal stream types (for push-based proposer)
-// =============================================================================
-
-/// Wire format for proposal requests (independent of Learner type)
+/// Wire format for proposal requests (independent of Learner type).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ProposalRequest {
@@ -262,24 +206,19 @@ pub(crate) enum ProposalRequest {
     Accept(GroupProposal, GroupMessage),
 }
 
-/// Wire format for proposal responses (independent of Learner type)
+/// Wire format for proposal responses (independent of Learner type).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProposalResponse {
-    /// Highest promised proposal
     pub(crate) promised: GroupProposal,
-    /// Highest accepted (proposal, message) pair
     pub(crate) accepted: Option<(GroupProposal, GroupMessage)>,
 }
 
-/// Writer for proposal requests
 pub(crate) type ProposalWriter =
     FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>>;
 
-/// Reader for proposal responses
 pub(crate) type ProposalReader =
     FramedRead<iroh::endpoint::RecvStream, PostcardCodec<ProposalResponse>>;
 
-/// Create proposal stream readers/writers from raw iroh streams
 #[must_use]
 pub(crate) fn make_proposal_streams(
     send: iroh::endpoint::SendStream,

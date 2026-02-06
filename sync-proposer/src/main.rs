@@ -1,6 +1,4 @@
-//! Universal Sync Proposer REPL
-//!
-//! Interactive command-line interface for managing MLS groups with Paxos consensus.
+//! Interactive CLI for managing MLS groups with Paxos consensus.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,21 +20,15 @@ use universal_sync_core::{
 use universal_sync_proposer::GroupClient;
 use universal_sync_proposer::repl::ReplContext;
 
-/// Universal Sync Proposer REPL
 #[derive(Parser, Debug)]
-#[command(name = "proposer")]
-#[command(about = "Interactive REPL for Universal Sync proposers")]
+#[command(name = "proposer", about = "Interactive REPL for Universal Sync proposers")]
 struct Args {
-    /// Path to the data directory for persistent state
     #[arg(short, long, default_value = "./proposer-data")]
     data: PathBuf,
 
-    /// Path to the signing key file (32 bytes, hex or raw)
-    /// If not provided, generates a new ephemeral key
     #[arg(short, long)]
     key_file: Option<PathBuf>,
 
-    /// Name for this client identity
     #[arg(short, long, default_value = "proposer")]
     name: String,
 }
@@ -53,7 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Load or generate iroh key
     let iroh_key = if let Some(ref key_path) = args.key_file {
         info!(?key_path, "Loading key from file");
         let bytes = load_secret_key(key_path)?;
@@ -68,13 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Using key"
     );
 
-    // Create crypto provider and cipher suite
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
         .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
         .expect("cipher suite should be available");
 
-    // Generate MLS signing key
     let (secret_key, public_key) = cipher_suite
         .signature_key_generate()
         .expect("key generation should succeed");
@@ -84,11 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "MLS signing key generated"
     );
 
-    // Create identity
     let credential = BasicCredential::new(args.name.as_bytes().to_vec());
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
 
-    // Create MLS client with extension types
     let client = Client::builder()
         .crypto_provider(crypto)
         .identity_provider(BasicIdentityProvider::new())
@@ -106,9 +93,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extension_type(CRDT_SNAPSHOT_EXTENSION_TYPE)
         .build();
 
-    info!("MLS client created");
-
-    // Create iroh endpoint
     let endpoint = Endpoint::builder()
         .secret_key(iroh_key)
         .alpns(vec![PAXOS_ALPN.to_vec()])
@@ -117,17 +101,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(addr = ?endpoint.addr(), "Iroh endpoint ready");
 
-    // Create GroupClient with NoCrdtFactory registered
     let mut group_client = GroupClient::new(client, secret_key, cipher_suite, endpoint);
     group_client.register_crdt_factory(NoCrdtFactory);
 
-    // Create REPL context
     let mut context = ReplContext {
         client: group_client,
         groups: HashMap::new(),
     };
 
-    // Run REPL
     println!("Universal Sync Proposer REPL");
     println!("Iroh key: {}", bs58::encode(key_bytes).into_string());
     println!("Type 'help' for available commands.\n");
@@ -180,15 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = rl.save_history(&history_path);
     });
 
-    // Main loop - just handle commands
-    // Group learning happens in background tasks managed by each Group
     while let Some(line) = rx.recv().await {
         let res = context.execute(&line).await;
         let _ = resp_tx.send(res).await;
     }
-
-    // Groups are dropped here, which cancels their background tasks
-    // (use group.shutdown().await for graceful shutdown if needed)
 
     Ok(())
 }

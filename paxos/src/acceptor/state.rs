@@ -1,14 +1,9 @@
-//! Shared acceptor state implementation
+//! Shared acceptor state.
 
 use crate::traits::Learner;
 
-/// Per-round acceptor state.
-///
-/// Contains the highest promised proposal and the accepted (proposal, message) pair.
 pub struct RoundState<L: Learner> {
-    /// Highest promised proposal
     pub promised: Option<L::Proposal>,
-    /// Accepted (proposal, message) pair
     pub accepted: Option<(L::Proposal, L::Message)>,
 }
 

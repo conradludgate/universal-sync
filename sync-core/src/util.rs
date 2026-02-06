@@ -1,10 +1,9 @@
-//! Utility functions shared across proposers and acceptors
+//! Shared utilities.
 
 use std::path::Path;
 
 use error_stack::{Report, ResultExt};
 
-/// Error type for key loading operations.
 #[derive(Debug)]
 pub struct KeyLoadError;
 
@@ -16,25 +15,7 @@ impl std::fmt::Display for KeyLoadError {
 
 impl std::error::Error for KeyLoadError {}
 
-/// Load a 32-byte secret key from a file.
-///
-/// Supports two formats:
-/// - Raw bytes: exactly 32 bytes
-/// - Base58 string: encoded 32-byte key
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The file cannot be read
-/// - The file is not a valid key format
-/// - The key is not exactly 32 bytes
-///
-/// # Example
-///
-/// ```ignore
-/// let key_bytes = load_secret_key("./my-key.b58")?;
-/// let iroh_key = iroh::SecretKey::from_bytes(&key_bytes);
-/// ```
+/// Load a 32-byte secret key from a file (raw bytes or base58).
 pub fn load_secret_key(path: impl AsRef<Path>) -> Result<[u8; 32], Report<KeyLoadError>> {
     let path = path.as_ref();
     let contents = std::fs::read(path)

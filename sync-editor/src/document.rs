@@ -1,12 +1,7 @@
 //! Per-document actor.
 //!
 //! Each open document is managed by a [`DocumentActor`] that owns a [`Group`]
-//! and runs a `select!` loop over:
-//!
-//! 1. Incoming [`DocRequest`]s from the coordinator / Tauri commands
-//! 2. Remote CRDT updates from peers (via [`Group::wait_for_update`])
-//!
-//! No mutexes — the actor is the sole owner of the `Group`.
+//! and is the sole owner — no mutexes.
 
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::{CipherSuiteProvider, MlsMessage};
@@ -20,7 +15,6 @@ use crate::types::{
     Delta, DocRequest, DocumentUpdatedPayload, EventEmitter, GroupStatePayload, PeerEntry,
 };
 
-/// Actor that manages a single open document / MLS group.
 pub struct DocumentActor<C, CS, E>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
@@ -40,7 +34,6 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
     E: EventEmitter,
 {
-    /// Create a new document actor.
     pub fn new(
         group: Group<C, CS>,
         group_id: GroupId,
@@ -58,9 +51,7 @@ where
         }
     }
 
-    /// Run the actor loop. Returns when the actor is shut down.
     pub async fn run(mut self) {
-        // Emit initial group state so the frontend has it from the start
         self.emit_group_state().await;
 
         loop {
@@ -78,20 +69,16 @@ where
                 update = self.group.wait_for_update() => {
                     match update {
                         Some(()) => self.emit_text_update(),
-                        None => break, // group shut down
+                        None => break,
                     }
                 }
                 event = self.event_rx.recv() => {
                     match event {
                         Ok(_group_event) => {
-                            // A group state change occurred (member added/removed,
-                            // epoch advanced, acceptor changed, etc.).
-                            // Notify the frontend.
                             self.emit_group_state().await;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::debug!(skipped = n, "group event receiver lagged");
-                            // Still emit the latest state
                             self.emit_group_state().await;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -103,7 +90,7 @@ where
         self.group.shutdown().await;
     }
 
-    /// Handle a single request. Returns `true` if shutdown was requested.
+    /// Returns `true` if shutdown was requested.
     async fn handle_request(&mut self, request: DocRequest) -> bool {
         match request {
             DocRequest::ApplyDelta { delta, reply } => {
@@ -163,10 +150,6 @@ where
         false
     }
 
-    // =========================================================================
-    // CRDT helpers
-    // =========================================================================
-
     fn yrs_crdt(&self) -> Result<&YrsCrdt, String> {
         self.group
             .crdt()
@@ -183,10 +166,6 @@ where
             .ok_or_else(|| "CRDT is not YrsCrdt".to_string())
     }
 
-    // =========================================================================
-    // Document operations
-    // =========================================================================
-
     fn get_text(&self) -> Result<String, String> {
         let yrs = self.yrs_crdt()?;
         let text_ref = yrs.doc().get_or_insert_text("doc");
@@ -200,11 +179,7 @@ where
             let text_ref = yrs.doc().get_or_insert_text("doc");
             let mut txn = yrs.doc().transact_mut();
 
-            // The current length of the CRDT text.  We clamp incoming
-            // positions / lengths so that stale or out-of-order deltas
-            // (e.g. from frontend debouncing or concurrent remote
-            // updates) never ask yrs to remove characters that don't
-            // exist — which would otherwise panic.
+            // Clamp positions so stale/out-of-order deltas don't panic
             let doc_len = text_ref.len(&txn);
 
             match delta {
@@ -306,14 +281,13 @@ where
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
 
-        // Try parsing as a KeyPackage first (add member)
+        // Try KeyPackage first, then EndpointAddr
         if let Ok(msg) = MlsMessage::from_bytes(&bytes) {
             if msg.as_key_package().is_some() {
                 return self.add_member(input_b58).await;
             }
         }
 
-        // Otherwise try as an EndpointAddr (add acceptor)
         if postcard::from_bytes::<iroh::EndpointAddr>(&bytes).is_ok() {
             return self.add_acceptor(input_b58).await;
         }

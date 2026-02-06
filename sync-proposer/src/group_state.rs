@@ -1,6 +1,4 @@
-//! Persistent group state storage using fjall.
-//!
-//! Implements `mls_rs_core::group::GroupStateStorage` for persisting MLS group state.
+//! `GroupStateStorage` implementation backed by fjall.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +8,6 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
 use zeroize::Zeroizing;
 
-/// Error type for group state storage operations.
 #[derive(Debug)]
 pub(crate) struct GroupStateError;
 
@@ -28,11 +25,7 @@ impl mls_rs_core::error::IntoAnyError for GroupStateError {
     }
 }
 
-/// Persistent group state storage backed by fjall.
-///
-/// Uses a single keyspace with keys formatted as:
-/// - Group state: `state:{group_id_hex}`
-/// - Epoch records: `epoch:{group_id_hex}:{epoch_id}`
+/// Keys: group state = raw `group_id`, epoch records = `group_id || epoch_be_bytes`.
 #[derive(Clone)]
 pub(crate) struct FjallGroupStateStorage {
     inner: Arc<FjallGroupStateStorageInner>,
@@ -45,13 +38,6 @@ struct FjallGroupStateStorageInner {
 }
 
 impl FjallGroupStateStorage {
-    /// Open or create a group state storage at the given path.
-    ///
-    /// # Errors
-    /// Returns an error if the database cannot be opened.
-    ///
-    /// # Panics
-    /// Panics if `spawn_blocking` fails.
     pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, Report<GroupStateError>> {
         let path = path.as_ref().to_owned();
         tokio::task::spawn_blocking(move || Self::open_sync(&path))
@@ -75,12 +61,10 @@ impl FjallGroupStateStorage {
         })
     }
 
-    /// Create a key for group state: just the `group_id`.
     fn state_key(group_id: &[u8]) -> &[u8] {
         group_id
     }
 
-    /// Create a key for an epoch record: `group_id` + epoch (8 bytes BE).
     fn epoch_key(group_id: &[u8], epoch_id: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(group_id.len() + 8);
         key.extend_from_slice(group_id);
@@ -88,7 +72,6 @@ impl FjallGroupStateStorage {
         key
     }
 
-    /// Parse epoch from an epoch key (last 8 bytes).
     fn parse_epoch(key: &[u8], group_id_len: usize) -> Option<u64> {
         if key.len() != group_id_len + 8 {
             return None;
@@ -130,13 +113,11 @@ impl GroupStateStorage for FjallGroupStateStorage {
     ) -> Result<(), Self::Error> {
         let group_id = &state.id;
 
-        // Write group state
         self.inner
             .keyspace
             .insert(Self::state_key(group_id), &*state.data)
             .map_err(|_| GroupStateError)?;
 
-        // Write new epoch records
         for record in epoch_inserts {
             let epoch_key = Self::epoch_key(group_id, record.id);
             self.inner
@@ -145,7 +126,6 @@ impl GroupStateStorage for FjallGroupStateStorage {
                 .map_err(|_| GroupStateError)?;
         }
 
-        // Update existing epoch records
         for record in epoch_updates {
             let epoch_key = Self::epoch_key(group_id, record.id);
             self.inner
@@ -160,16 +140,13 @@ impl GroupStateStorage for FjallGroupStateStorage {
     fn max_epoch_id(&self, group_id: &[u8]) -> Result<Option<u64>, Self::Error> {
         let group_id_len = group_id.len();
 
-        // Iterate in reverse (highest epoch first due to big-endian encoding)
         for guard in self.inner.keyspace.prefix(group_id).rev() {
             let (key, _) = guard.into_inner().map_err(|_| GroupStateError)?;
 
-            // Skip the state key (exact match on group_id)
             if key.len() == group_id_len {
                 continue;
             }
 
-            // First valid epoch key is the max
             if let Some(epoch_id) = Self::parse_epoch(&key, group_id_len) {
                 return Ok(Some(epoch_id));
             }

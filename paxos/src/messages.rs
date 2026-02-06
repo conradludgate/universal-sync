@@ -1,7 +1,4 @@
-//! Paxos protocol messages
-//!
-//! These are the high-level message types bound to the [`Learner`] trait,
-//! used by the async runtime. For the generic core types, see [`crate::core::types`].
+//! Paxos protocol messages bound to the [`Learner`] trait.
 
 use std::fmt;
 
@@ -11,11 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::acceptor::RoundState;
 use crate::traits::Learner;
 
-/// Messages from proposer/learner to acceptor
+/// Messages from proposer/learner to acceptor.
 ///
-/// Both proposers and learners use `Prepare` to initiate a connection.
-/// The acceptor responds with historical values and then streams live updates.
-/// Learners can send a "dummy" prepare with default `round`/`attempt`/`node_id`.
+/// Learners can send a "dummy" prepare with default `round`/`attempt`/`node_id`
+/// to initiate sync without proposing.
 #[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
@@ -26,10 +22,7 @@ use crate::traits::Learner;
     ))
 )]
 pub enum AcceptorRequest<L: Learner> {
-    /// Phase 1: Prepare request - sends signed proposal (can be validated)
-    /// Also triggers sync: acceptor sends all accepted values from this round onwards.
     Prepare(L::Proposal),
-    /// Phase 2: Accept request - sends signed proposal + message value
     Accept(L::Proposal, L::Message),
 }
 
@@ -42,10 +35,7 @@ impl<L: Learner> Clone for AcceptorRequest<L> {
     }
 }
 
-/// Messages from acceptor to proposer/learner
-///
-/// For proposers: both `promised` and `accepted` are relevant.
-/// For learners: only `accepted` is used (learners just track accepted values).
+/// Messages from acceptor to proposer/learner.
 #[cfg_attr(
     feature = "serde",
     derive(Serialize, Deserialize),
@@ -55,9 +45,7 @@ impl<L: Learner> Clone for AcceptorRequest<L> {
     ))
 )]
 pub struct AcceptorMessage<L: Learner> {
-    /// Highest proposal this acceptor has promised
     pub promised: L::Proposal,
-    /// Highest accepted proposal + message
     pub accepted: Option<(L::Proposal, L::Message)>,
 }
 
@@ -81,8 +69,6 @@ impl<L: Learner> Clone for AcceptorMessage<L> {
 }
 
 impl<L: Learner> AcceptorMessage<L> {
-    /// Create a response from round state.
-    ///
     /// # Panics
     /// Panics if `promised` is None, which should never happen for valid responses.
     #[must_use]

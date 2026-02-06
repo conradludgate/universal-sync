@@ -1,9 +1,4 @@
-//! Connection manager for multiplexed iroh connections
-//!
-//! This module provides [`ConnectionManager`] which caches iroh connections
-//! to acceptors and opens multiplexed streams for different purposes.
-//!
-//! # Architecture
+//! Connection cache with multiplexed streams per acceptor.
 //!
 //! ```text
 //! ConnectionManager
@@ -14,8 +9,6 @@
 //!         ├── Stream: Group Y - Proposals (Paxos)
 //!         └── Stream: Group Y - Messages
 //! ```
-//!
-//! Each stream is identified by a [`Handshake`] message sent at the start.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,23 +23,15 @@ use universal_sync_core::{AcceptorId, GroupId, Handshake, HandshakeResponse, PAX
 use crate::connector::ConnectorError;
 
 /// Manages connections to acceptors with stream multiplexing.
-///
-/// A single `ConnectionManager` should be shared across all groups
-/// to maximize connection reuse.
+/// Share across groups to maximize connection reuse.
 #[derive(Clone)]
 pub struct ConnectionManager {
     endpoint: Endpoint,
-    /// Cached connections by acceptor ID
     connections: Arc<RwLock<HashMap<AcceptorId, Connection>>>,
-    /// Address hints for acceptors (useful when discovery is not available)
     address_hints: Arc<RwLock<HashMap<AcceptorId, EndpointAddr>>>,
 }
 
 impl ConnectionManager {
-    /// Create a new connection manager.
-    ///
-    /// # Arguments
-    /// * `endpoint` - The iroh endpoint to use for connections
     #[must_use]
     pub(crate) fn new(endpoint: Endpoint) -> Self {
         Self {
@@ -56,40 +41,26 @@ impl ConnectionManager {
         }
     }
 
-    /// Get the underlying iroh endpoint.
     #[must_use]
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
 
-    /// Add an address hint for an acceptor.
-    ///
-    /// Use this when iroh discovery is not available and you have
-    /// the full endpoint address for an acceptor.
+    /// Add an address hint for when iroh discovery is not available.
     pub(crate) async fn add_address_hint(&self, acceptor_id: AcceptorId, addr: EndpointAddr) {
         self.address_hints.write().await.insert(acceptor_id, addr);
     }
 
-    /// Get or create a connection to an acceptor.
-    ///
-    /// Returns an existing cached connection if available and still alive,
-    /// otherwise creates a new connection.
-    ///
-    /// # Errors
-    /// Returns an error if connection fails.
     async fn get_connection(&self, acceptor_id: &AcceptorId) -> Result<Connection, ConnectorError> {
-        // Check for existing connection
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(acceptor_id) {
-                // Check if connection is still alive
                 if conn.closed().now_or_never().is_none() {
                     return Ok(conn.clone());
                 }
             }
         }
 
-        // Need to create a new connection
         let addr = self
             .address_hints
             .read()
@@ -108,7 +79,6 @@ impl ConnectionManager {
             .await
             .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-        // Cache the connection
         self.connections
             .write()
             .await
@@ -117,12 +87,6 @@ impl ConnectionManager {
         Ok(conn)
     }
 
-    /// Open a proposal stream for Paxos consensus.
-    ///
-    /// This opens a bidirectional stream and sends a `JoinProposals` handshake.
-    ///
-    /// # Errors
-    /// Returns an error if connection or handshake fails.
     pub(crate) async fn open_proposal_stream(
         &self,
         acceptor_id: &AcceptorId,
@@ -135,21 +99,12 @@ impl ConnectionManager {
         Ok((send, recv))
     }
 
-    /// Open a message stream for application messages.
-    ///
-    /// This opens a bidirectional stream and sends a `JoinMessages` handshake.
-    /// Note: This creates a new connection because the server handles only
-    /// one stream per connection (due to `AcceptorStateStore` not being Send).
-    ///
-    /// # Errors
-    /// Returns an error if connection or handshake fails.
+    /// Creates a new (uncached) connection because the server handles one stream per connection.
     pub(crate) async fn open_message_stream(
         &self,
         acceptor_id: &AcceptorId,
         group_id: GroupId,
     ) -> Result<(SendStream, RecvStream), ConnectorError> {
-        // Create a new connection for message stream
-        // (server handles one stream per connection)
         let conn = self.new_connection(acceptor_id).await?;
         let (send, recv) = self
             .open_stream_with_handshake(&conn, Handshake::JoinMessages(group_id))
@@ -157,7 +112,6 @@ impl ConnectionManager {
         Ok((send, recv))
     }
 
-    /// Create a new connection to an acceptor (not cached).
     async fn new_connection(&self, acceptor_id: &AcceptorId) -> Result<Connection, ConnectorError> {
         let addr = self
             .address_hints
@@ -177,28 +131,22 @@ impl ConnectionManager {
             .map_err(|e| ConnectorError::Connect(e.to_string()))
     }
 
-    /// Open a stream with a handshake.
-    ///
-    /// Returns the raw streams after handshake completion.
     async fn open_stream_with_handshake(
         &self,
         conn: &Connection,
         handshake: Handshake,
     ) -> Result<(SendStream, RecvStream), ConnectorError> {
-        // Open a bidirectional stream
         let (send, recv) = conn
             .open_bi()
             .await
             .map_err(|e| ConnectorError::Connect(e.to_string()))?;
 
-        // Create framed reader/writer for handshake
         let codec = LengthDelimitedCodec::builder()
             .max_frame_length(16 * 1024 * 1024)
             .new_codec();
         let mut reader = FramedRead::new(recv, codec.clone());
         let mut writer = FramedWrite::new(send, codec);
 
-        // Send the handshake
         let handshake_bytes =
             postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
         writer
@@ -206,7 +154,6 @@ impl ConnectionManager {
             .await
             .map_err(ConnectorError::Io)?;
 
-        // Read the response
         let response_bytes = reader
             .next()
             .await
@@ -218,7 +165,6 @@ impl ConnectionManager {
         let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
             .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
 
-        // Check response
         match response {
             HandshakeResponse::Ok => {}
             HandshakeResponse::GroupNotFound => {
@@ -234,7 +180,6 @@ impl ConnectionManager {
             }
         }
 
-        // Extract inner streams
         let recv = reader.into_inner();
         let send = writer.into_inner();
 

@@ -1,6 +1,4 @@
-//! MLS extensions for Universal Sync
-//!
-//! Custom MLS group context extensions used by the sync protocol.
+//! Custom MLS group context and key package extensions for the sync protocol.
 
 use iroh::EndpointAddr;
 use mls_rs::extension::{ExtensionType, MlsCodecExtension};
@@ -31,19 +29,12 @@ pub const SUPPORTED_CRDTS_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF
 /// Extension type for CRDT snapshot (group info extension, sent in welcome)
 pub const CRDT_SNAPSHOT_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF79B);
 
-/// Custom error code for postcard serialization failures
 const POSTCARD_ERROR: u8 = 1;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Codec helpers for length-prefixed postcard encoding
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Calculate encoded length for a postcard-serializable value with length prefix
 fn postcard_encoded_len<T: Serialize>(value: &T) -> usize {
     postcard::to_allocvec(value).map_or(4, |v| 4 + v.len())
 }
 
-/// Encode a value using postcard with a 4-byte length prefix
 #[expect(clippy::cast_possible_truncation)]
 fn postcard_encode<T: Serialize>(
     value: &T,
@@ -57,13 +48,11 @@ fn postcard_encode<T: Serialize>(
     Ok(())
 }
 
-/// Decode a value using postcard with a 4-byte length prefix
 fn postcard_decode<T: DeserializeOwned>(reader: &mut &[u8]) -> Result<T, mls_rs_codec::Error> {
     let data = read_length_prefixed(reader)?;
     postcard::from_bytes(data).map_err(|_| mls_rs_codec::Error::Custom(POSTCARD_ERROR))
 }
 
-/// Read a length-prefixed slice from the reader
 fn read_length_prefixed<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], mls_rs_codec::Error> {
     if reader.len() < 4 {
         return Err(mls_rs_codec::Error::UnexpectedEOF);
@@ -79,30 +68,23 @@ fn read_length_prefixed<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], mls_rs_co
     Ok(data)
 }
 
-/// MLS group context extension containing the full list of acceptors
+/// Full list of acceptor endpoint addresses (group context extension).
 ///
-/// This extension is set when the group is created and updated whenever
-/// acceptors are added or removed. New members joining via Welcome can
-/// read this extension to discover the acceptor set.
-///
-/// Each acceptor is stored as a full `EndpointAddr` which includes the
-/// public key and network addresses needed to connect.
+/// Set at group creation and included in Welcome messages so joiners
+/// can discover the acceptor set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AcceptorsExt(pub Vec<EndpointAddr>);
 
 impl AcceptorsExt {
-    /// Create a new `AcceptorsExt` from a list of endpoint addresses
     pub fn new(acceptors: impl IntoIterator<Item = EndpointAddr>) -> Self {
         Self(acceptors.into_iter().collect())
     }
 
-    /// Get the list of endpoint addresses
     #[must_use]
     pub fn acceptors(&self) -> &[EndpointAddr] {
         &self.0
     }
 
-    /// Get the list of acceptor IDs (public keys) from the addresses
     #[must_use]
     pub fn acceptor_ids(&self) -> Vec<AcceptorId> {
         self.0
@@ -136,29 +118,21 @@ impl MlsCodecExtension for AcceptorsExt {
     }
 }
 
-/// MLS group context extension to add a federated acceptor
-///
-/// When this extension is present in the group context, the acceptor
-/// should be added to the set of known acceptors.
-///
-/// Contains the full `EndpointAddr` so other members know how to connect.
+/// Signal to add a federated acceptor (group context extension).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptorAdd(pub EndpointAddr);
 
 impl AcceptorAdd {
-    /// Create a new `AcceptorAdd` extension
     #[must_use]
     pub fn new(addr: EndpointAddr) -> Self {
         Self(addr)
     }
 
-    /// Get the endpoint address being added
     #[must_use]
     pub fn addr(&self) -> &EndpointAddr {
         &self.0
     }
 
-    /// Get the acceptor ID (public key) from the address
     #[must_use]
     pub fn acceptor_id(&self) -> AcceptorId {
         AcceptorId::from_bytes(*self.0.id.as_bytes())
@@ -189,21 +163,16 @@ impl MlsCodecExtension for AcceptorAdd {
     }
 }
 
-/// MLS group context extension to remove a federated acceptor
-///
-/// When this extension is present in the group context, the acceptor
-/// should be removed from the set of known acceptors.
+/// Signal to remove a federated acceptor (group context extension).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptorRemove(pub AcceptorId);
 
 impl AcceptorRemove {
-    /// Create a new `AcceptorRemove` extension
     #[must_use]
     pub fn new(acceptor_id: AcceptorId) -> Self {
         Self(acceptor_id)
     }
 
-    /// Get the acceptor ID being removed
     #[must_use]
     pub fn acceptor_id(&self) -> AcceptorId {
         self.0
@@ -241,21 +210,18 @@ impl MlsCodecExtension for AcceptorRemove {
     }
 }
 
-/// MLS key package extension containing the member's endpoint address
+/// Member's endpoint address (key package extension).
 ///
-/// This extension is included in key packages to allow the group leader
-/// to send the Welcome message directly to the new member.
+/// Allows the group leader to send the Welcome message directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberAddrExt(pub EndpointAddr);
 
 impl MemberAddrExt {
-    /// Create a new `MemberAddrExt` extension
     #[must_use]
     pub fn new(addr: EndpointAddr) -> Self {
         Self(addr)
     }
 
-    /// Get the endpoint address
     #[must_use]
     pub fn addr(&self) -> &EndpointAddr {
         &self.0
@@ -286,21 +252,15 @@ impl MlsCodecExtension for MemberAddrExt {
     }
 }
 
-/// MLS group context extension registering the CRDT type for this group.
+/// CRDT type registration (group context extension).
 ///
-/// This extension is set when the group is created and identifies which
-/// CRDT implementation the group uses for state synchronization.
-///
-/// When joining a group, members check this extension to ensure they have
-/// a compatible CRDT factory registered.
+/// Joiners check this to ensure they have a compatible CRDT factory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdtRegistrationExt {
-    /// CRDT type identifier (e.g., "yjs", "automerge", "counter", "none")
     pub type_id: String,
 }
 
 impl CrdtRegistrationExt {
-    /// Create a new CRDT registration extension
     #[must_use]
     pub fn new(type_id: impl Into<String>) -> Self {
         Self {
@@ -308,7 +268,6 @@ impl CrdtRegistrationExt {
         }
     }
 
-    /// Get the CRDT type identifier
     #[must_use]
     pub fn type_id(&self) -> &str {
         &self.type_id
@@ -347,19 +306,13 @@ impl MlsCodecExtension for CrdtRegistrationExt {
     }
 }
 
-/// MLS key package extension listing supported CRDT types.
-///
-/// This extension is included in key packages to advertise which CRDT
-/// implementations the member supports. The group creator should only
-/// add members whose supported CRDTs include the group's CRDT type.
+/// Supported CRDT types (key package extension).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SupportedCrdtsExt {
-    /// List of supported CRDT type identifiers
     pub type_ids: Vec<String>,
 }
 
 impl SupportedCrdtsExt {
-    /// Create a new supported CRDTs extension
     #[must_use]
     pub fn new(type_ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
@@ -367,7 +320,6 @@ impl SupportedCrdtsExt {
         }
     }
 
-    /// Check if a CRDT type is supported
     #[must_use]
     pub fn supports(&self, type_id: &str) -> bool {
         self.type_ids.iter().any(|id| id == type_id)
@@ -400,22 +352,16 @@ impl MlsCodecExtension for SupportedCrdtsExt {
     }
 }
 
-/// MLS group info extension containing the CRDT state snapshot.
-///
-/// This extension is included in the Welcome message's `GroupInfo` when adding
-/// a new member, so the joiner receives the current CRDT state atomically
-/// with the MLS welcome.
+/// CRDT state snapshot (group info extension, sent in Welcome).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrdtSnapshotExt(pub Vec<u8>);
 
 impl CrdtSnapshotExt {
-    /// Create a new CRDT snapshot extension
     #[must_use]
     pub fn new(snapshot: Vec<u8>) -> Self {
         Self(snapshot)
     }
 
-    /// Get the snapshot bytes
     #[must_use]
     pub fn snapshot(&self) -> &[u8] {
         &self.0

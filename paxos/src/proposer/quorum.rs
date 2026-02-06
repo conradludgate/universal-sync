@@ -1,4 +1,4 @@
-//! Quorum tracking utilities for the proposer/learner runtime
+//! Quorum tracking for the proposer/learner runtime.
 
 use std::collections::BTreeMap;
 
@@ -6,32 +6,24 @@ use tracing::trace;
 
 use crate::traits::{Learner, Proposal, ProposalKey};
 
-/// Key type for quorum tracking maps.
 type Key<L> = ProposalKey<<L as Learner>::Proposal>;
 
 /// Tracks proposal counts and detects when quorum is reached.
-///
-/// Used by both proposer (to detect learned values) and learner
-/// (to know when to apply a value).
 pub struct QuorumTracker<L: Learner> {
     counts: BTreeMap<Key<L>, (usize, L::Proposal, L::Message)>,
     quorum: usize,
-    // num_acceptors: usize,
 }
 
 impl<L: Learner> QuorumTracker<L> {
-    /// Create a new tracker for the given number of acceptors.
     #[must_use]
     pub fn new(num_acceptors: usize) -> Self {
         Self {
             counts: BTreeMap::new(),
             quorum: (num_acceptors / 2) + 1,
-            // num_acceptors,
         }
     }
 
-    /// Track a (proposal, message) pair. Returns `Some((&proposal, &message))` if quorum
-    /// was just reached, `None` otherwise.
+    /// Track a (proposal, message) pair. Returns `Some` if quorum was just reached.
     pub fn track(
         &mut self,
         proposal: L::Proposal,
@@ -51,9 +43,6 @@ impl<L: Learner> QuorumTracker<L> {
         }
     }
 
-    /// Check if any proposal for the given round has reached quorum.
-    ///
-    /// Returns `Some((&proposal, &message))` if quorum was reached, `None` otherwise.
     pub fn check_quorum(
         &self,
         round: <L::Proposal as Proposal>::RoundId,

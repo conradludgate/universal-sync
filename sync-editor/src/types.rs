@@ -1,38 +1,20 @@
 //! Request/response types for the editor actor system.
-//!
-//! These types are intentionally non-generic so they can be held in Tauri's
-//! managed state without leaking MLS type parameters.
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tokio::sync::{mpsc, oneshot};
 use universal_sync_core::GroupId;
 
-// =============================================================================
-// Tauri-managed application state
-// =============================================================================
-
-/// Application state managed by Tauri.
-///
-/// Contains only an `mpsc::Sender` — no mutexes, no shared mutable state.
+/// No mutexes — only an `mpsc::Sender` to the coordinator.
 pub struct AppState {
-    /// Channel to send requests to the [`CoordinatorActor`](crate::actor::CoordinatorActor).
     pub coordinator_tx: mpsc::Sender<CoordinatorRequest>,
 }
 
-// =============================================================================
-// Data types exchanged with the frontend
-// =============================================================================
-
-/// A text editing operation.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Delta {
-    /// Insert text at a position.
     Insert { position: u32, text: String },
-    /// Delete `length` characters starting at `position`.
     Delete { position: u32, length: u32 },
-    /// Replace `length` characters at `position` with `text`.
     Replace {
         position: u32,
         length: u32,
@@ -40,7 +22,6 @@ pub enum Delta {
     },
 }
 
-/// Information about an open document, returned to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentInfo {
     pub group_id: String,
@@ -48,7 +29,6 @@ pub struct DocumentInfo {
     pub member_count: usize,
 }
 
-/// A member or acceptor listed in the peers dialog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum PeerEntry {
@@ -62,15 +42,12 @@ pub enum PeerEntry {
     },
 }
 
-/// Payload emitted to the frontend when a document is updated by a remote peer.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentUpdatedPayload {
     pub group_id: String,
     pub text: String,
 }
 
-/// Payload emitted to the frontend when the group state changes
-/// (epoch advance, membership change, etc.).
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupStatePayload {
     pub group_id: String,
@@ -79,19 +56,12 @@ pub struct GroupStatePayload {
     pub member_count: usize,
 }
 
-// =============================================================================
-// Event emission abstraction (for testability)
-// =============================================================================
-
-/// Trait abstracting event emission so actors can be tested without Tauri.
+/// Abstracts event emission so actors can be tested without Tauri.
 pub trait EventEmitter: Clone + Send + 'static {
-    /// Emit a document-updated event.
     fn emit_document_updated(&self, payload: &DocumentUpdatedPayload);
-    /// Emit a group-state-changed event (epoch, transcript hash, member count).
     fn emit_group_state_changed(&self, payload: &GroupStatePayload);
 }
 
-/// Production implementation: emits Tauri events to all webviews.
 impl EventEmitter for AppHandle {
     fn emit_document_updated(&self, payload: &DocumentUpdatedPayload) {
         use tauri::Emitter;
@@ -103,109 +73,75 @@ impl EventEmitter for AppHandle {
     }
 }
 
-// =============================================================================
-// Coordinator ↔ Tauri command messages
-// =============================================================================
-
-/// Request sent from Tauri commands to the [`CoordinatorActor`](crate::actor::CoordinatorActor).
 pub enum CoordinatorRequest {
-    /// Create a new document (group with Yrs CRDT).
     CreateDocument {
         reply: oneshot::Sender<Result<DocumentInfo, String>>,
     },
-    /// Generate a key package for joining a group.
     GetKeyPackage {
         reply: oneshot::Sender<Result<String, String>>,
     },
-    /// Wait for an incoming welcome message, auto-join, and return the document.
     RecvWelcome {
         reply: oneshot::Sender<Result<DocumentInfo, String>>,
     },
-    /// Join a group from raw welcome bytes (base58-encoded).
     JoinDocumentBytes {
         welcome_b58: String,
         reply: oneshot::Sender<Result<DocumentInfo, String>>,
     },
-    /// Forward a request to a specific document actor.
     ForDoc {
         group_id: GroupId,
         request: DocRequest,
     },
 }
 
-// =============================================================================
-// DocumentActor messages
-// =============================================================================
-
-/// Request sent from the coordinator (or commands) to a [`DocumentActor`](crate::document::DocumentActor).
 pub enum DocRequest {
-    /// Apply a text editing delta and broadcast to peers.
     ApplyDelta {
         delta: Delta,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Read the current document text.
     GetText {
         reply: oneshot::Sender<Result<String, String>>,
     },
-    /// Add a member to the group.
     AddMember {
         key_package_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Add an acceptor to the group.
     AddAcceptor {
         addr_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// List the group's acceptors.
     ListAcceptors {
         reply: oneshot::Sender<Result<Vec<String>, String>>,
     },
-    /// List all peers (members + acceptors).
     ListPeers {
         reply: oneshot::Sender<Result<Vec<PeerEntry>, String>>,
     },
-    /// Add a peer: auto-detect KeyPackage (member) vs EndpointAddr (acceptor).
+    /// Auto-detect KeyPackage (member) vs EndpointAddr (acceptor).
     AddPeer {
         input_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Remove a member by roster index.
     RemoveMember {
         member_index: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Remove an acceptor by its ID (base58).
     RemoveAcceptor {
         acceptor_id_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Get the current group state (epoch, transcript hash, member count).
     GetGroupState {
         reply: oneshot::Sender<Result<GroupStatePayload, String>>,
     },
-    /// Update this member's keys (forward secrecy / epoch advance).
     UpdateKeys {
         reply: oneshot::Sender<Result<(), String>>,
     },
-    /// Shut down the document actor.
     #[allow(dead_code)]
     Shutdown,
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json;
-
-    // =========================================================================
-    // Delta serde round-trip
-    // =========================================================================
 
     #[test]
     fn delta_insert_round_trip() {
@@ -266,7 +202,6 @@ mod tests {
 
     #[test]
     fn delta_deserialize_from_frontend_json() {
-        // Simulate the JSON the frontend sends
         let json = r#"{"type":"Insert","position":0,"text":"abc"}"#;
         let delta: Delta = serde_json::from_str(json).unwrap();
         match delta {
@@ -277,10 +212,6 @@ mod tests {
             other => panic!("expected Insert, got {:?}", other),
         }
     }
-
-    // =========================================================================
-    // Delta applied to a standalone YrsCrdt
-    // =========================================================================
 
     fn apply_delta_to_doc(doc: &yrs::Doc, delta: &Delta) {
         use yrs::{Text, Transact};
@@ -485,10 +416,6 @@ mod tests {
         assert_eq!(read_doc_text(&doc), "hi");
     }
 
-    // =========================================================================
-    // DocumentInfo serialization
-    // =========================================================================
-
     #[test]
     fn document_info_round_trip() {
         let info = DocumentInfo {
@@ -517,10 +444,6 @@ mod tests {
         assert!(v.get("member_count").unwrap().is_number());
     }
 
-    // =========================================================================
-    // Base58 parsing helpers
-    // =========================================================================
-
     #[test]
     fn base58_valid_round_trip() {
         let data = [1u8, 2, 3, 4, 5];
@@ -531,7 +454,7 @@ mod tests {
 
     #[test]
     fn base58_invalid_input() {
-        let result = bs58::decode("0OIl").into_vec(); // 0, O, I, l are invalid in base58
+        let result = bs58::decode("0OIl").into_vec();
         assert!(result.is_err());
     }
 

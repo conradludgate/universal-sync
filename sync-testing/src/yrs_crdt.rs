@@ -1,15 +1,4 @@
-//! Yrs (Yjs) CRDT implementation for testing
-//!
-//! This module provides a CRDT implementation using the yrs crate,
-//! which is a Rust port of the Yjs CRDT library.
-//!
-//! Yrs provides a document-based CRDT that supports:
-//! - Text editing
-//! - Arrays
-//! - Maps
-//! - XML structures
-//!
-//! This implementation wraps a `yrs::Doc` and exposes it through the [`Crdt`] trait.
+//! Yrs (Yjs) CRDT implementation — wraps `yrs::Doc` for the [`Crdt`] trait.
 
 use std::sync::Arc;
 
@@ -17,18 +6,13 @@ use universal_sync_core::{Crdt, CrdtError, CrdtFactory};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
-/// A CRDT implementation backed by a Yrs document.
-///
-/// This provides access to the full Yrs document API for creating and
-/// manipulating shared data types like Text, Array, Map, etc.
 pub struct YrsCrdt {
     doc: Doc,
-    /// State vector at the time of the last flush (for computing diffs)
+    /// For computing diffs since the last flush
     last_flushed_sv: StateVector,
 }
 
 impl YrsCrdt {
-    /// Create a new empty Yrs document.
     #[must_use]
     pub fn new() -> Self {
         let doc = Doc::new();
@@ -39,10 +23,7 @@ impl YrsCrdt {
         }
     }
 
-    /// Create a Yrs document with a specific client ID.
-    ///
-    /// Client IDs are used to identify the source of operations.
-    /// In a group, each member should have a unique client ID.
+    /// Each member in a group should have a unique client ID.
     #[must_use]
     pub fn with_client_id(client_id: u64) -> Self {
         let doc = Doc::with_client_id(client_id);
@@ -53,34 +34,20 @@ impl YrsCrdt {
         }
     }
 
-    /// Get a reference to the underlying Yrs document.
-    ///
-    /// Use this to access Yrs-specific APIs like creating Text, Array, Map, etc.
     #[must_use]
     pub fn doc(&self) -> &Doc {
         &self.doc
     }
 
-    /// Get a mutable reference to the underlying Yrs document.
     pub fn doc_mut(&mut self) -> &mut Doc {
         &mut self.doc
     }
 
-    /// Get the current state vector of the document.
-    ///
-    /// The state vector can be used to request only the updates that
-    /// another peer is missing.
     #[must_use]
     pub fn state_vector(&self) -> StateVector {
         self.doc.transact().state_vector()
     }
 
-    /// Encode an update containing all changes since a given state vector.
-    ///
-    /// This is useful for syncing specific changes to a peer.
-    ///
-    /// # Errors
-    /// Returns an error if encoding fails.
     pub fn encode_diff(&self, sv: &StateVector) -> Result<Vec<u8>, CrdtError> {
         let txn = self.doc.transact();
         Ok(txn.encode_diff_v1(sv))
@@ -119,14 +86,12 @@ impl Crdt for YrsCrdt {
     }
 
     fn merge(&mut self, snapshot: &[u8]) -> Result<(), CrdtError> {
-        // In Yrs, merging a snapshot is the same as applying an update
-        // that contains the full state
+        // In Yrs, merging a snapshot is the same as applying a full-state update
         self.apply(snapshot)
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, CrdtError> {
         let txn = self.doc.transact();
-        // Encode all state as an update from empty state vector
         Ok(txn.encode_state_as_update_v1(&StateVector::default()))
     }
 
@@ -143,11 +108,8 @@ impl Crdt for YrsCrdt {
     }
 }
 
-/// Factory for creating [`YrsCrdt`] instances.
 #[derive(Default, Clone)]
 pub struct YrsCrdtFactory {
-    /// Optional client ID generator.
-    /// If None, Yrs will generate random client IDs.
     client_id: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
@@ -160,15 +122,11 @@ impl std::fmt::Debug for YrsCrdtFactory {
 }
 
 impl YrsCrdtFactory {
-    /// Create a new factory that generates random client IDs.
     #[must_use]
     pub fn new() -> Self {
         Self { client_id: None }
     }
 
-    /// Create a factory with a fixed client ID.
-    ///
-    /// This is useful for testing or when you want deterministic client IDs.
     #[must_use]
     pub fn with_fixed_client_id(client_id: u64) -> Self {
         Self {
@@ -176,7 +134,6 @@ impl YrsCrdtFactory {
         }
     }
 
-    /// Create a factory with a custom client ID generator.
     #[must_use]
     pub fn with_client_id_generator<F>(generator: F) -> Self
     where
@@ -225,9 +182,8 @@ mod tests {
         let crdt = YrsCrdt::new();
         assert_eq!(Crdt::type_id(&crdt), "yrs");
 
-        // Empty snapshot should work
         let snapshot = crdt.snapshot().unwrap();
-        assert!(!snapshot.is_empty()); // Yrs always has some metadata
+        assert!(!snapshot.is_empty());
     }
 
     #[test]
@@ -235,36 +191,30 @@ mod tests {
         let mut crdt1 = YrsCrdt::with_client_id(1);
         let mut crdt2 = YrsCrdt::with_client_id(2);
 
-        // Create and modify text in crdt1
         {
             let text = crdt1.doc().get_or_insert_text("my-text");
             let mut txn = crdt1.doc().transact_mut();
             text.insert(&mut txn, 0, "Hello, ");
         }
 
-        // Sync to crdt2
         let update = crdt1.snapshot().unwrap();
         crdt2.merge(&update).unwrap();
 
-        // Verify crdt2 has the text
         {
             let text = crdt2.doc().get_or_insert_text("my-text");
             let txn = crdt2.doc().transact();
             assert_eq!(text.get_string(&txn), "Hello, ");
         }
 
-        // Modify in crdt2
         {
             let text = crdt2.doc().get_or_insert_text("my-text");
             let mut txn = crdt2.doc().transact_mut();
             text.insert(&mut txn, 7, "World!");
         }
 
-        // Sync back to crdt1
         let update2 = crdt2.snapshot().unwrap();
         crdt1.merge(&update2).unwrap();
 
-        // Verify crdt1 has both modifications
         {
             let text = crdt1.doc().get_or_insert_text("my-text");
             let txn = crdt1.doc().transact();
@@ -276,7 +226,6 @@ mod tests {
     fn test_yrs_crdt_map() {
         let crdt = YrsCrdt::with_client_id(1);
 
-        // Create a map and add some values
         {
             let map = crdt.doc().get_or_insert_map("my-map");
             let mut txn = crdt.doc().transact_mut();
@@ -284,12 +233,10 @@ mod tests {
             map.insert(&mut txn, "key2", 42i64);
         }
 
-        // Snapshot and restore
         let snapshot = crdt.snapshot().unwrap();
         let mut crdt2 = YrsCrdt::with_client_id(2);
         crdt2.merge(&snapshot).unwrap();
 
-        // Verify the map contents
         {
             let map = crdt2.doc().get_or_insert_map("my-map");
             let txn = crdt2.doc().transact();
@@ -297,7 +244,6 @@ mod tests {
 
             if let Any::Map(m) = json {
                 assert_eq!(m.get("key1"), Some(&Any::String("value1".into())));
-                // Numbers are stored as f64 in Yrs JSON representation
                 assert_eq!(m.get("key2"), Some(&Any::Number(42.0)));
             } else {
                 panic!("Expected map");
@@ -313,7 +259,6 @@ mod tests {
         let crdt = factory.create();
         assert_eq!(Crdt::type_id(&*crdt), "yrs");
 
-        // Test from_snapshot
         let snapshot = crdt.snapshot().unwrap();
         let crdt2 = factory.from_snapshot(&snapshot).unwrap();
         assert_eq!(Crdt::type_id(&*crdt2), "yrs");
@@ -329,11 +274,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_edits() {
-        // Simulate two users editing concurrently
         let mut crdt1 = YrsCrdt::with_client_id(1);
         let mut crdt2 = YrsCrdt::with_client_id(2);
 
-        // Both start with same initial state
         {
             let text = crdt1.doc().get_or_insert_text("doc");
             let mut txn = crdt1.doc().transact_mut();
@@ -342,27 +285,24 @@ mod tests {
         let initial = crdt1.snapshot().unwrap();
         crdt2.merge(&initial).unwrap();
 
-        // User 1 inserts at position 1
         {
             let text = crdt1.doc().get_or_insert_text("doc");
             let mut txn = crdt1.doc().transact_mut();
             text.insert(&mut txn, 1, "X");
         }
 
-        // User 2 inserts at position 2 (concurrently)
         {
             let text = crdt2.doc().get_or_insert_text("doc");
             let mut txn = crdt2.doc().transact_mut();
             text.insert(&mut txn, 2, "Y");
         }
 
-        // Sync both ways
         let update1 = crdt1.snapshot().unwrap();
         let update2 = crdt2.snapshot().unwrap();
         crdt1.merge(&update2).unwrap();
         crdt2.merge(&update1).unwrap();
 
-        // Both should converge to the same state
+        // Both should converge
         let text1 = {
             let text = crdt1.doc().get_or_insert_text("doc");
             let txn = crdt1.doc().transact();
@@ -375,8 +315,6 @@ mod tests {
         };
 
         assert_eq!(text1, text2);
-        // The exact order depends on Yrs conflict resolution,
-        // but both should have all characters
         assert!(text1.contains('A'));
         assert!(text1.contains('B'));
         assert!(text1.contains('C'));

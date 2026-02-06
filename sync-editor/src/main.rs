@@ -1,13 +1,5 @@
 //! Sync Editor — a collaborative text editor built on Universal Sync.
-//!
-//! This is a Tauri v2 app with an actor-based Rust backend:
-//!
-//! - [`CoordinatorActor`](actor::CoordinatorActor) — owns the `GroupClient`,
-//!   routes requests, and manages document actor lifecycle.
-//! - [`DocumentActor`](document::DocumentActor) — one per open document,
-//!   owns the `Group` and its CRDT, handles edits and remote sync.
-//!
-//! No mutexes. All shared state is mediated by `mpsc` + `oneshot` channels.
+//! Actor-based Tauri v2 app: no mutexes, all state mediated by channels.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -35,7 +27,6 @@ use crate::actor::CoordinatorActor;
 use crate::types::{AppState, CoordinatorRequest};
 
 fn main() {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,14 +34,12 @@ fn main() {
         )
         .init();
 
-    // Create the coordinator channel eagerly so AppState is available immediately.
     let (coordinator_tx, coordinator_rx) = mpsc::channel::<CoordinatorRequest>(64);
 
     tauri::Builder::default()
         .manage(AppState { coordinator_tx })
         .setup(move |app| {
             let handle = app.handle().clone();
-            // Spawn the async setup on the Tauri runtime.
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = setup_coordinator(coordinator_rx, handle).await {
                     tracing::error!(?e, "coordinator setup failed");
@@ -79,32 +68,26 @@ fn main() {
         .expect("error while running tauri application");
 }
 
-/// Async setup: create the MLS client, iroh endpoint, and coordinator actor.
 async fn setup_coordinator(
     coordinator_rx: mpsc::Receiver<CoordinatorRequest>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Generate an ephemeral iroh key
     let iroh_key = SecretKey::generate(&mut rand::rng());
     info!(public_key = %iroh_key.public(), "iroh key generated");
 
-    // Create crypto provider and cipher suite
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
         .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
         .expect("cipher suite should be available");
 
-    // Generate MLS signing key
     let (secret_key, public_key) = cipher_suite
         .signature_key_generate()
         .expect("key generation should succeed");
 
-    // Create identity — must be unique per instance so multiple peers can join the same group.
-    // Use the iroh public key as the identity since it's already unique per instance.
+    // Use iroh public key as identity since it's already unique per instance
     let credential = BasicCredential::new(iroh_key.public().as_bytes().to_vec());
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
 
-    // Create MLS client with all extension types
     let client = Client::builder()
         .crypto_provider(crypto)
         .identity_provider(BasicIdentityProvider::new())
@@ -124,7 +107,6 @@ async fn setup_coordinator(
 
     info!("MLS client created");
 
-    // Create iroh endpoint
     let endpoint = Endpoint::builder()
         .secret_key(iroh_key)
         .alpns(vec![PAXOS_ALPN.to_vec()])
@@ -133,12 +115,10 @@ async fn setup_coordinator(
 
     info!(addr = ?endpoint.addr(), "iroh endpoint ready");
 
-    // Create GroupClient with CRDT factories
     let mut group_client = GroupClient::new(client, secret_key, cipher_suite, endpoint);
     group_client.register_crdt_factory(NoCrdtFactory);
     group_client.register_crdt_factory(YrsCrdtFactory::new());
 
-    // Create and run the coordinator actor (blocks until shutdown)
     let coordinator = CoordinatorActor::new(group_client, coordinator_rx, app_handle);
     coordinator.run().await;
 

@@ -1,8 +1,4 @@
-//! Tauri command handlers.
-//!
-//! Each command is a thin async function that sends a request to the
-//! [`CoordinatorActor`](crate::actor::CoordinatorActor) and awaits the reply.
-//! No business logic lives here.
+//! Tauri command handlers — thin wrappers that forward to the coordinator actor.
 
 use tokio::sync::oneshot;
 use universal_sync_core::GroupId;
@@ -11,7 +7,6 @@ use crate::types::{
     AppState, CoordinatorRequest, Delta, DocRequest, DocumentInfo, GroupStatePayload, PeerEntry,
 };
 
-/// Helper: send a coordinator request and await the reply.
 async fn coord_request<T>(
     state: &AppState,
     make_request: impl FnOnce(oneshot::Sender<Result<T, String>>) -> CoordinatorRequest,
@@ -26,7 +21,6 @@ async fn coord_request<T>(
         .map_err(|_| "coordinator dropped reply".to_string())?
 }
 
-/// Helper: send a doc-level request via the coordinator and await the reply.
 async fn doc_request<T>(
     state: &AppState,
     group_id_b58: &str,
@@ -52,10 +46,6 @@ fn parse_group_id(b58: &str) -> Result<GroupId, String> {
         .map_err(|e| format!("invalid group ID: {e}"))?;
     Ok(GroupId::from_slice(&bytes))
 }
-
-// =============================================================================
-// Coordinator-level commands
-// =============================================================================
 
 #[tauri::command]
 pub async fn create_document(
@@ -96,10 +86,6 @@ pub async fn join_document_bytes(
     })
     .await
 }
-
-// =============================================================================
-// Document-level commands
-// =============================================================================
 
 #[tauri::command]
 pub async fn apply_delta(

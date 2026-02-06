@@ -1,15 +1,4 @@
-//! Core Paxos traits
-//!
-//! This module defines the core abstractions for the Paxos protocol:
-//!
-//! - [`Proposal`]: A proposal that can be ordered and compared
-//! - [`ProposalKey`]: Ordering key for proposals
-//! - [`Validated`]: Marker type proving validation was performed
-//! - [`Learner`]: State machine that learns from consensus and can create proposals
-//! - [`Acceptor`]: Marker for a Learner that can act as an acceptor
-//! - [`AcceptorStateStore`]: Shared state for acceptors
-//! - [`Connector`]: Connects to acceptors by node ID
-//! - [`AcceptorConn`]: Connection to an acceptor
+//! Core Paxos traits.
 
 use core::fmt;
 use core::future::Future;
@@ -21,9 +10,6 @@ use futures::{Sink, Stream};
 use crate::acceptor::RoundState;
 use crate::messages::{AcceptorMessage, AcceptorRequest};
 
-/// Error type for proposal validation failures.
-///
-/// Use `error_stack` attachments to provide context about why validation failed.
 #[derive(Debug)]
 pub struct ValidationError;
 
@@ -36,41 +22,18 @@ impl fmt::Display for ValidationError {
 impl core::error::Error for ValidationError {}
 
 /// Marker type proving that validation was performed.
-///
-/// This type cannot be constructed outside of validation functions,
-/// ensuring that code receiving a `Validated` value knows that
-/// validation actually occurred.
-///
-/// # Example
-///
-/// ```ignore
-/// fn validate(&self, proposal: &Self::Proposal) -> Result<Validated, Report<ValidationError>> {
-///     if proposal.epoch != self.current_epoch() {
-///         return Err(Report::new(ValidationError)
-///             .attach("epoch mismatch"));
-///     }
-///     // ... more checks ...
-///     Ok(Validated::assert_valid())
-/// }
-/// ```
+/// Cannot be constructed outside of validation functions.
 #[derive(Debug, Clone, Copy)]
 pub struct Validated(());
 
 impl Validated {
-    /// Assert that validation has been performed.
-    ///
-    /// # Safety (logical)
-    ///
     /// Only call this after actually performing all validation checks.
-    /// Calling this without proper validation defeats the purpose of
-    /// the marker type.
     #[must_use]
     pub fn assert_valid() -> Self {
         Self(())
     }
 }
 
-/// A proposal that can be ordered by (`node_id`, round, attempt)
 pub trait Proposal: Clone {
     type NodeId: Copy + Ord + fmt::Debug + Hash + Send + Sync;
     type RoundId: Copy + Ord + Default + fmt::Debug + Hash + Send + Sync;
@@ -79,20 +42,14 @@ pub trait Proposal: Clone {
     fn node_id(&self) -> Self::NodeId;
     fn round(&self) -> Self::RoundId;
     fn attempt(&self) -> Self::AttemptId;
-
-    /// Return the next attempt ID after the given one.
-    /// Used when a proposal is rejected to retry with a higher attempt.
     fn next_attempt(attempt: Self::AttemptId) -> Self::AttemptId;
 
-    /// Get the ordering key for this proposal (round, attempt, `node_id`).
-    /// Used for comparing proposals in the Paxos protocol.
     fn key(&self) -> ProposalKey<Self> {
         ProposalKey::new(self.round(), self.attempt(), self.node_id())
     }
 }
 
-/// Ordering key for proposals - compares by (round, attempt, `node_id`).
-/// The `node_id` ensures proposals from different proposers are always unique.
+/// Ordering key for proposals — compares by (round, attempt, `node_id`).
 #[derive(Debug)]
 pub struct ProposalKey<P: Proposal>(
     pub(crate) P::RoundId,
@@ -145,25 +102,18 @@ impl<P: Proposal> Ord for ProposalKey<P> {
 }
 
 impl<P: Proposal> ProposalKey<P> {
-    /// Create a new proposal key.
     #[must_use]
     pub(crate) fn new(round: P::RoundId, attempt: P::AttemptId, node_id: P::NodeId) -> Self {
         Self(round, attempt, node_id)
     }
 
-    /// Get the attempt ID from this key.
     #[must_use]
     pub fn attempt(&self) -> P::AttemptId {
         self.1
     }
 }
 
-/// State machine that learns from consensus and can create proposals
-///
-/// All learners need to be able to:
-/// 1. Create proposals (for sync and actual proposing)
-/// 2. Know the current acceptor set (for connecting)
-/// 3. Validate and apply proposals
+/// State machine that learns from consensus and can create proposals.
 ///
 /// For devices/clients, `propose()` creates a signed proposal with real content.
 /// For acceptors, `propose()` creates a sync-only proposal for the learning process.
@@ -171,39 +121,14 @@ impl<P: Proposal> ProposalKey<P> {
 pub trait Learner: Send + Sync + 'static {
     type Proposal: Proposal + fmt::Debug + Send + Sync + 'static;
     type Message: Clone + fmt::Debug + Send + Sync + 'static;
-    /// Error type for apply operations.
-    ///
-    /// Use `error_stack::Report<YourError>` for rich context.
     type Error: fmt::Debug + Send + 'static;
-
-    /// Type used to identify acceptors
     type AcceptorId: Copy + Ord + fmt::Debug + Hash + Send + Sync;
 
-    /// This node's unique identifier (as a proposer)
     fn node_id(&self) -> <Self::Proposal as Proposal>::NodeId;
-
-    /// Current round (next to be learned)
     fn current_round(&self) -> <Self::Proposal as Proposal>::RoundId;
-
-    /// Current acceptor set based on learned state
     fn acceptors(&self) -> impl IntoIterator<Item = Self::AcceptorId, IntoIter: ExactSizeIterator>;
-
-    /// Create a proposal for the current round and attempt.
-    ///
-    /// For devices/clients: creates a signed proposal with real content.
-    /// For acceptors: creates a sync-only proposal for the learning process.
     fn propose(&self, attempt: <Self::Proposal as Proposal>::AttemptId) -> Self::Proposal;
-
-    /// Validate a proposal (signatures, authorization, etc.)
-    ///
-    /// Returns a [`Validated`] marker on success, proving validation occurred.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ValidationError`] with context explaining why validation failed.
     fn validate(&self, proposal: &Self::Proposal) -> Result<Validated, Report<ValidationError>>;
-
-    /// Apply a learned proposal + message to the state machine
     async fn apply(
         &mut self,
         proposal: Self::Proposal,
@@ -213,88 +138,37 @@ pub trait Learner: Send + Sync + 'static {
 
 /// Shared state for an acceptor, allowing multiple connections to coordinate.
 ///
-/// This is the key abstraction for multi-proposer support - all connections
-/// to the same acceptor must share this state. State is tracked per-round
-/// to support Multi-Paxos. Also handles broadcasting to learners.
+/// All connections to the same acceptor must share this state.
 ///
-/// # Persistence Safety
-///
-/// For crash recovery, implementations should:
-/// 1. Persist state BEFORE returning success from `promise()`/`accept()`
-/// 2. Use `fsync`/`sync_all` to ensure durability
-/// 3. On restart, reload state before accepting new requests
-///
-/// # Async Requirements
-///
-/// Methods are async to support implementations that use `spawn_blocking`
-/// for filesystem operations. In-memory implementations can simply return
-/// ready futures.
-///
-/// # Concurrency Safety
-///
-/// Both `promise()` and `accept()` must be atomic with respect to the
-/// round's state. Use appropriate locking to prevent race conditions.
+/// Implementations MUST persist state before returning success from
+/// `promise()`/`accept()` (use fsync) and reload on restart for crash recovery.
+/// Both `promise()` and `accept()` must be atomic per-round.
 #[expect(async_fn_in_trait)]
 pub trait AcceptorStateStore<L: Learner>: Send + Sync {
-    /// Combined subscription stream (historical + live broadcasts).
     type Subscription: futures::Stream<Item = (L::Proposal, L::Message)> + Send;
 
-    /// Get the state for a specific round.
     async fn get(&self, round: <L::Proposal as Proposal>::RoundId) -> RoundState<L>;
 
-    /// Try to promise this proposal for a round.
-    ///
-    /// # Safety Requirements
-    ///
-    /// MUST reject if ANY of the following are true:
-    /// - A higher proposal was already promised for this round
-    /// - A higher proposal was already accepted for this round
-    ///
-    /// The second check prevents promising to a proposal that would be
-    /// superseded by an already-accepted value, maintaining consistency.
-    ///
-    /// # Errors
-    /// Returns `Err(current_state)` if the proposal is dominated.
+    /// MUST reject if a higher proposal was already promised or accepted for this round.
     async fn promise(&self, proposal: &L::Proposal) -> Result<(), RoundState<L>>;
 
-    /// Try to accept this proposal + message for a round.
+    /// MUST reject if a higher proposal was already promised or accepted for this round.
     /// On success, broadcasts to all subscribed learners.
-    ///
-    /// # Safety Requirements
-    ///
-    /// MUST reject if ANY of the following are true:
-    /// - A higher proposal was already promised for this round
-    /// - A higher proposal was already accepted for this round
-    ///
-    /// The second check is critical: without it, concurrent proposers can
-    /// cause different acceptors to have different "winning" values for
-    /// the same round, violating consensus.
-    ///
-    /// # Errors
-    /// Returns `Err(current_state)` if the proposal is dominated.
     async fn accept(
         &self,
         proposal: &L::Proposal,
         message: &L::Message,
     ) -> Result<(), RoundState<L>>;
 
-    /// Subscribe to accepted (proposal, message) pairs from a given round onwards.
-    ///
-    /// Returns a stream that yields:
-    /// 1. Historical values first (rounds >= `from_round` that were already accepted)
-    /// 2. Live broadcasts (new accepts as they happen)
+    /// Returns historical values (rounds >= `from_round`) then live broadcasts.
     async fn subscribe_from(
         &self,
         from_round: <L::Proposal as Proposal>::RoundId,
     ) -> Self::Subscription;
 
-    /// Get the highest round that has been accepted (for sync complete message).
     async fn highest_accepted_round(&self) -> Option<<L::Proposal as Proposal>::RoundId>;
 
-    /// Get all accepted (proposal, message) pairs from a given round onwards.
-    ///
     /// Returns historical values only (no live subscription).
-    /// Used by the epoch-aware runner to apply learned values after waiting.
     async fn get_accepted_from(
         &self,
         from_round: <L::Proposal as Proposal>::RoundId,
@@ -302,9 +176,7 @@ pub trait AcceptorStateStore<L: Learner>: Send + Sync {
 }
 
 /// Connects to acceptors by their ID.
-///
-/// Implementations should handle backoff/retry logic internally when connections fail.
-/// The connector is cloned per-address, so `&mut self` can be used to track retry state.
+/// Implementations should handle backoff/retry logic internally.
 pub trait Connector<L: Learner>: Clone + Send + 'static {
     type Connection: AcceptorConn<L> + Send;
     type Error: core::error::Error;
@@ -313,7 +185,6 @@ pub trait Connector<L: Learner>: Clone + Send + 'static {
     fn connect(&mut self, acceptor_id: &L::AcceptorId) -> Self::ConnectFuture;
 }
 
-/// Connection to an acceptor
 pub trait AcceptorConn<L: Learner>:
     Sink<AcceptorRequest<L>, Error = L::Error> + Stream<Item = Result<AcceptorMessage<L>, L::Error>>
 {

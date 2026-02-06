@@ -1,37 +1,4 @@
-//! Acceptor learning infrastructure
-//!
-//! This module provides the learning capability for acceptors in a multi-acceptor
-//! deployment. Each acceptor acts as a learner, connecting to peer acceptors to:
-//!
-//! 1. Receive accepted values from peers
-//! 2. Track quorum across all acceptors (including itself)
-//! 3. Notify when quorum is reached so values can be applied
-//!
-//! # Architecture
-//!
-//! ```text
-//!                    ┌─────────────────────────────────────┐
-//!                    │         GroupLearningActor          │
-//!                    │                                     │
-//!  Local state ─────►│  ┌─────────────────────────────┐   │
-//!  subscription      │  │      QuorumTracker          │   │
-//!                    │  │  (tracks quorum per round)  │   │──► epoch notification
-//!  Peer streams ────►│  └─────────────────────────────┘   │
-//!                    │                                     │
-//!                    │  ┌─────────────────────────────┐   │
-//!                    │  │  PeerAcceptorActor (each)   │   │
-//!                    │  │  - Connects to peer         │   │
-//!                    │  │  - Sends sync proposals     │   │
-//!                    │  │  - Receives accepts         │   │
-//!                    │  └─────────────────────────────┘   │
-//!                    └─────────────────────────────────────┘
-//! ```
-//!
-//! # Learning Protocol
-//!
-//! Learners act as "pseudo-proposers" by sending a sync proposal (Prepare)
-//! to initiate the learning stream from each acceptor. The acceptor responds
-//! with all accepted values from that round onwards.
+//! Acceptor-side learning for multi-acceptor quorum tracking.
 
 use std::collections::BTreeMap;
 
@@ -47,56 +14,32 @@ use universal_sync_paxos::proposer::QuorumTracker;
 use crate::acceptor::GroupAcceptor;
 use crate::state_store::GroupStateStore;
 
-/// Events sent from peer acceptor actors to the learning coordinator
 #[derive(Debug)]
 enum PeerEvent {
-    /// Peer accepted a value
     Accepted {
-        /// The acceptor ID that sent this
         acceptor_id: AcceptorId,
-        /// The accepted proposal
         proposal: GroupProposal,
-        /// The accepted message (boxed to reduce enum size)
         message: Box<GroupMessage>,
     },
-    /// Peer connection failed
     Disconnected {
-        /// The acceptor ID that disconnected
         acceptor_id: AcceptorId,
-        /// Error message
         error: String,
     },
 }
 
-/// Learning actor that coordinates quorum tracking across acceptors
-///
-/// This actor:
-/// - Subscribes to local state store for accepted values
-/// - Manages connections to peer acceptors
-/// - Tracks accepted values from all sources (local + peers)
-/// - Notifies epoch watcher when quorum is reached
 pub(crate) struct GroupLearningActor<C, CS>
 where
     C: mls_rs::external_client::builder::MlsConfig + Clone + 'static,
     CS: mls_rs::CipherSuiteProvider + 'static,
 {
-    /// This acceptor's ID
     own_id: AcceptorId,
-    /// The group ID
     group_id: GroupId,
-    /// Iroh endpoint for peer connections
     endpoint: Endpoint,
-    /// Current acceptor addresses (excluding self)
     peer_acceptors: BTreeMap<AcceptorId, EndpointAddr>,
-    /// Quorum tracker
     quorum_tracker: QuorumTracker<GroupAcceptor<C, CS>>,
-    /// Channel for receiving peer events
     peer_rx: mpsc::Receiver<PeerEvent>,
-    /// Channel sender for peer actors to send events
     peer_tx: mpsc::Sender<PeerEvent>,
-    /// Epoch watcher to notify when quorum reached
     epoch_tx: watch::Sender<Epoch>,
-    /// Current peer actor handles (for cleanup)
     peer_handles: BTreeMap<AcceptorId, tokio::task::JoinHandle<()>>,
 }
 
@@ -105,14 +48,6 @@ where
     C: mls_rs::external_client::builder::MlsConfig + Clone + Send + Sync + 'static,
     CS: mls_rs::CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
-    /// Create a new learning actor
-    ///
-    /// # Arguments
-    /// * `own_id` - This acceptor's ID
-    /// * `group_id` - The group being learned
-    /// * `endpoint` - Iroh endpoint for peer connections
-    /// * `initial_acceptors` - Initial set of acceptor addresses
-    /// * `epoch_tx` - Watch channel to notify epoch changes
     #[must_use]
     pub(crate) fn new(
         own_id: AcceptorId,
@@ -123,13 +58,11 @@ where
     ) -> Self {
         let (peer_tx, peer_rx) = mpsc::channel(256);
 
-        // Filter out self from peer acceptors
         let peer_acceptors: BTreeMap<_, _> = initial_acceptors
             .into_iter()
             .filter(|(id, _)| *id != own_id)
             .collect();
 
-        // Total acceptors includes self
         let total_acceptors = peer_acceptors.len() + 1;
 
         Self {
@@ -145,20 +78,10 @@ where
         }
     }
 
-    /// Run the learning actor
-    ///
-    /// Subscribes to the local state store and peer acceptors, tracking quorum
-    /// and notifying the epoch watcher when values reach consensus.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the state store subscription fails.
     pub(crate) async fn run(mut self, state: GroupStateStore, initial_round: Epoch) {
-        // Subscribe to local state store for accepted values
         let mut local_subscription =
             AcceptorStateStore::<GroupAcceptor<C, CS>>::subscribe_from(&state, initial_round).await;
 
-        // Spawn peer actors for initial acceptors
         let peers: Vec<_> = self
             .peer_acceptors
             .iter()
@@ -170,19 +93,16 @@ where
 
         loop {
             tokio::select! {
-                // Handle local accepted values
                 Some((proposal, message)) = local_subscription.next() => {
                     self.handle_accepted(self.own_id, proposal, message);
                 }
 
-                // Handle peer events
                 Some(event) = self.peer_rx.recv() => {
                     match event {
                         PeerEvent::Accepted { acceptor_id, proposal, message } => {
                             self.handle_accepted(acceptor_id, proposal, *message);
                         }
                         PeerEvent::Disconnected { acceptor_id, error } => {
-                            // Peer actor handles its own reconnection, this is just informational
                             tracing::debug!(?acceptor_id, %error, "peer disconnected (will reconnect)");
                         }
                     }
@@ -192,14 +112,12 @@ where
             }
         }
 
-        // Cleanup: abort peer actors
         for handle in self.peer_handles.values() {
             handle.abort();
         }
         self.peer_handles.clear();
     }
 
-    /// Handle an accepted value (from local or peer)
     fn handle_accepted(
         &mut self,
         _acceptor_id: AcceptorId,
@@ -208,21 +126,17 @@ where
     ) {
         let current_epoch = *self.epoch_tx.borrow();
 
-        // Skip old rounds
         if proposal.epoch < current_epoch {
             return;
         }
 
-        // Track and check for quorum
         if let Some((p, _m)) = self.quorum_tracker.track(proposal, message) {
-            // Quorum reached - notify epoch watcher
             let new_epoch = Epoch(p.epoch.0 + 1);
             tracing::info!(epoch = ?p.epoch, "quorum reached");
             let _ = self.epoch_tx.send(new_epoch);
         }
     }
 
-    /// Spawn a peer actor for connecting to a peer acceptor
     fn spawn_peer_actor(&mut self, id: AcceptorId, addr: EndpointAddr, current_round: Epoch) {
         let endpoint = self.endpoint.clone();
         let group_id = self.group_id;
@@ -236,18 +150,10 @@ where
     }
 }
 
-/// Maximum reconnection attempts before giving up
 const MAX_RECONNECT_ATTEMPTS: u32 = 10;
-/// Initial reconnection delay
 const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-/// Maximum reconnection delay
 const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Run a peer acceptor actor with reconnection logic
-///
-/// Connects to a peer acceptor, sends a sync proposal to initiate the
-/// learning stream, and forwards received accepts to the learning actor.
-/// Automatically reconnects with exponential backoff on disconnection.
 async fn run_peer_actor(
     endpoint: Endpoint,
     addr: EndpointAddr,
@@ -261,13 +167,10 @@ async fn run_peer_actor(
     let mut current_round = initial_round;
 
     loop {
-        // Try to run a connection
         match run_peer_connection(&endpoint, &addr, group_id, acceptor_id, current_round, &tx).await
         {
             Ok(last_epoch) => {
-                // Connection closed gracefully, update round for next connection
                 current_round = last_epoch;
-                // Reset backoff on successful connection that ran for a while
                 reconnect_attempts = 0;
                 reconnect_delay = INITIAL_RECONNECT_DELAY;
             }
@@ -299,7 +202,6 @@ async fn run_peer_actor(
             }
         }
 
-        // Notify about disconnection (informational)
         let _ = tx
             .send(PeerEvent::Disconnected {
                 acceptor_id,
@@ -307,17 +209,11 @@ async fn run_peer_actor(
             })
             .await;
 
-        // Wait before reconnecting
         tokio::time::sleep(reconnect_delay).await;
-
-        // Exponential backoff with cap
         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
     }
 }
 
-/// Run a single peer connection session
-///
-/// Returns the last epoch seen on success (for resuming), or an error on failure.
 async fn run_peer_connection(
     endpoint: &Endpoint,
     addr: &EndpointAddr,

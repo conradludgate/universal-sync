@@ -1,7 +1,4 @@
-//! Universal Sync Testing - test utilities and integration tests
-//!
-//! This crate provides test utilities for Universal Sync, importing both
-//! proposer and acceptor functionality for integration testing.
+//! Test utilities for Universal Sync integration tests.
 
 pub mod yrs_crdt;
 
@@ -25,17 +22,13 @@ use universal_sync_core::{
 use universal_sync_proposer::{GroupClient, ReplContext};
 pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
 
-/// Default cipher suite for testing
 pub const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 
-/// Create a test crypto provider
 #[must_use]
 pub fn test_crypto_provider() -> RustCryptoProvider {
     RustCryptoProvider::default()
 }
 
-/// Create a test cipher suite provider
-///
 /// # Panics
 /// Panics if the cipher suite is not available.
 #[must_use]
@@ -47,32 +40,19 @@ pub fn test_cipher_suite(
         .expect("cipher suite should be available")
 }
 
-/// Create a basic identity provider for testing
 #[must_use]
 pub fn test_identity_provider() -> BasicIdentityProvider {
     BasicIdentityProvider::new()
 }
 
-/// Type alias for the cipher suite provider used in tests
 pub type TestCipherSuiteProvider = <RustCryptoProvider as CryptoProvider>::CipherSuiteProvider;
 
-/// Result of creating a test client
 pub struct TestClientResult<C> {
-    /// The MLS client
     pub client: Client<C>,
-    /// The signing secret key
     pub signer: SignatureSecretKey,
-    /// The cipher suite provider
     pub cipher_suite: TestCipherSuiteProvider,
 }
 
-/// Create a test MLS client with the given identity name
-///
-/// This returns a fully configured client that can create groups.
-///
-/// # Arguments
-/// * `name` - A human-readable name for this client (e.g., "alice", "bob")
-///
 /// # Panics
 /// Panics if key generation or client building fails.
 #[must_use]
@@ -80,16 +60,13 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
     let crypto = test_crypto_provider();
     let cipher_suite = test_cipher_suite(&crypto);
 
-    // Generate a signing key pair
     let (secret_key, public_key) = cipher_suite
         .signature_key_generate()
         .expect("key generation should succeed");
 
-    // Create a basic credential
     let credential = BasicCredential::new(name.as_bytes().to_vec());
     let signing_identity = SigningIdentity::new(credential.into_credential(), public_key);
 
-    // Build the client with signing identity and custom extension types
     let client = Client::builder()
         .crypto_provider(crypto)
         .identity_provider(test_identity_provider())
@@ -110,16 +87,7 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
     }
 }
 
-/// Create a test [`GroupClient`] with the given identity name and endpoint.
-///
-/// This combines a fully configured MLS client with an iroh endpoint,
-/// providing a convenient high-level API for creating and joining groups.
-///
-/// The client is pre-registered with a `NoCrdtFactory` for the "none" type.
-///
-/// # Arguments
-/// * `name` - A human-readable name for this client (e.g., "alice", "bob")
-/// * `endpoint` - The iroh endpoint for networking
+/// Pre-registered with `NoCrdtFactory`.
 ///
 /// # Panics
 /// Panics if key generation or client building fails.
@@ -130,22 +98,10 @@ pub fn test_group_client(
 ) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
     let result = test_client(name);
     let mut client = GroupClient::new(result.client, result.signer, result.cipher_suite, endpoint);
-    // Register default CRDT factory
     client.register_crdt_factory(NoCrdtFactory);
     client
 }
 
-/// Create a test [`ReplContext`] with the given identity name and endpoint.
-///
-/// This combines a fully configured MLS client with an iroh endpoint
-/// and wraps it in a `ReplContext` for testing REPL commands.
-///
-/// The client is pre-registered with a `NoCrdtFactory` for the "none" type.
-///
-/// # Arguments
-/// * `name` - A human-readable name for this client (e.g., "alice", "bob")
-/// * `endpoint` - The iroh endpoint for networking
-///
 /// # Panics
 /// Panics if key generation or client building fails.
 #[must_use]
@@ -157,10 +113,7 @@ pub fn test_repl_context(
     ReplContext::new(client)
 }
 
-/// Create a test [`GroupClient`] with `YrsCrdtFactory` registered.
-///
-/// This is a convenience wrapper around [`test_group_client`] that also
-/// registers the Yrs CRDT factory.
+/// Like [`test_group_client`] but also registers `YrsCrdtFactory`.
 #[must_use]
 pub fn test_yrs_group_client(
     name: &'static str,
@@ -171,11 +124,7 @@ pub fn test_yrs_group_client(
     client
 }
 
-// =============================================================================
-// Test infrastructure helpers
-// =============================================================================
-
-/// Initialize tracing for tests. Safe to call multiple times.
+/// Safe to call multiple times.
 pub fn init_tracing() {
     let _ = fmt()
         .with_env_filter(
@@ -186,10 +135,7 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Create an iroh endpoint for testing.
-///
-/// Uses an empty builder with relays disabled and binds only to localhost
-/// for faster local-only connections.
+/// Localhost-only endpoint with relays disabled for fast local testing.
 ///
 /// # Panics
 /// Panics if the endpoint fails to bind.
@@ -204,8 +150,8 @@ pub async fn test_endpoint() -> Endpoint {
         .expect("failed to create endpoint")
 }
 
-/// Spawn a test acceptor. Returns the task handle, the acceptor's address,
-/// and the temp directory (must be kept alive for the acceptor's state store).
+/// Returns (task handle, acceptor address, temp dir).
+/// Keep the `TempDir` alive for the acceptor's state store.
 ///
 /// # Panics
 /// Panics if the acceptor fails to start.

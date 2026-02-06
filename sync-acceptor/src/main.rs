@@ -1,6 +1,4 @@
-//! Universal Sync Acceptor Server
-//!
-//! Runs a Paxos acceptor server for Universal Sync groups.
+//! Paxos acceptor server for Universal Sync groups.
 
 use std::path::PathBuf;
 
@@ -14,28 +12,22 @@ use tracing::{error, info};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
 use universal_sync_core::{PAXOS_ALPN, load_secret_key};
 
-/// Universal Sync Acceptor Server
 #[derive(Parser, Debug)]
 #[command(name = "acceptor")]
 #[command(about = "Run a Universal Sync acceptor server")]
 struct Args {
-    /// Path to the database directory
     #[arg(short, long, default_value = "./acceptor-db")]
     database: PathBuf,
 
-    /// Path to the iroh secret key file (32 bytes, hex or raw)
-    /// If not provided, generates a new ephemeral key
     #[arg(short, long)]
     key_file: Option<PathBuf>,
 
-    /// Bind address for the QUIC endpoint (IPv4)
     #[arg(short, long, default_value = "0.0.0.0:0")]
     bind: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -45,7 +37,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Load or generate secret key
     let secret_key = if let Some(ref key_path) = args.key_file {
         info!(?key_path, "Loading secret key from file");
         let bytes = load_secret_key(key_path)?;
@@ -62,27 +53,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_key = secret_key.public();
     info!(%public_key, "Acceptor public key");
 
-    // Open the state store
     info!(path = ?args.database, "Opening database");
     let state_store = SharedFjallStateStore::open(&args.database).await?;
 
-    // List existing groups
     let groups = state_store.list_groups();
     info!(count = groups.len(), "Loaded existing groups");
 
-    // Create crypto provider
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
         .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
         .expect("cipher suite should be available");
 
-    // Create external client for MLS
     let external_client = ExternalClient::builder()
         .crypto_provider(crypto)
         .identity_provider(BasicIdentityProvider::new())
         .build();
 
-    // Create the iroh endpoint (needed before registry for learning actors)
     let mut endpoint_builder = Endpoint::builder()
         .secret_key(secret_key.clone())
         .alpns(vec![PAXOS_ALPN.to_vec()]);
@@ -93,19 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let endpoint = endpoint_builder.bind().await?;
 
-    // Create the registry (needs endpoint for learning actors)
     let registry =
         AcceptorRegistry::new(external_client, cipher_suite, state_store, endpoint.clone());
 
     let addr = endpoint.addr();
     info!(?addr, "Acceptor server listening");
 
-    // Print the address for easy copy/paste to proposer REPL
     let addr_bytes = postcard::to_allocvec(&addr).expect("serialization should not fail");
     let addr_str = bs58::encode(addr_bytes).into_string();
     println!("Endpoint address (base58): {addr_str}");
 
-    // Accept connections
     info!("Ready to accept connections");
     while let Some(incoming) = endpoint.accept().await {
         info!("Incoming connection");

@@ -6,9 +6,7 @@ use futures::stream::FusedStream;
 use pin_project_lite::pin_project;
 
 pin_project! {
-    /// A stream that yields `None` forever after the underlying stream yields `None` once.
-    ///
-    /// This is useful for streams that may not be fused by default.
+    /// A stream that yields `None` forever after the underlying stream ends.
     #[derive(Debug)]
     #[must_use = "streams do nothing unless polled"]
     pub(crate) struct Fuse<S> {
@@ -18,14 +16,12 @@ pin_project! {
 }
 
 impl<S> Fuse<S> {
-    /// Creates a new fused stream.
     pub(crate) fn new(stream: S) -> Self {
         Self {
             stream: Some(stream),
         }
     }
 
-    /// Returns whether the underlying stream has finished.
     pub(crate) fn terminated() -> Self {
         Self { stream: None }
     }

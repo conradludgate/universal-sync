@@ -1,12 +1,4 @@
-//! Universal Sync Acceptor - server/federation-side group membership
-//!
-//! This crate provides the acceptor (server/federation) implementation for
-//! Universal Sync, including:
-//!
-//! - [`GroupAcceptor`] - External group observer that validates proposals
-//! - [`FjallStateStore`] / [`GroupStateStore`] - Persistent state storage
-//! - [`AcceptorRegistry`] - Multi-group management
-//! - Connection handling via iroh
+//! Server/federation-side acceptor for Universal Sync groups.
 
 #![warn(clippy::pedantic)]
 

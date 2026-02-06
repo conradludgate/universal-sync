@@ -1,7 +1,4 @@
-//! Postcard codec for length-delimited framing with serde serialization
-//!
-//! This module provides [`PostcardCodec`] which combines length-delimited framing
-//! with postcard serialization for efficient binary encoding of Rust types.
+//! Postcard codec for length-delimited framing with serde serialization.
 
 use std::io;
 use std::marker::PhantomData;
@@ -10,26 +7,7 @@ use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
-/// A codec that combines length-delimited framing with postcard serialization.
-///
-/// This wraps [`LengthDelimitedCodec`] and adds automatic postcard serialization
-/// for any type implementing [`Serialize`] (encoding) or [`Deserialize`] (decoding).
-///
-/// # Type Parameters
-/// - `D`: The type to decode (must implement `Deserialize`)
-/// - `E`: The type to encode (must implement `Serialize`)
-///
-/// # Example
-///
-/// ```ignore
-/// use tokio_util::codec::{FramedRead, FramedWrite};
-/// use universal_sync_core::codec::PostcardCodec;
-///
-/// // Create a codec for AcceptorRequest/AcceptorMessage
-/// let codec = PostcardCodec::<AcceptorRequest, AcceptorMessage>::new();
-/// let reader = FramedRead::new(recv, codec.clone());
-/// let writer = FramedWrite::new(send, codec);
-/// ```
+/// Wraps [`LengthDelimitedCodec`] with automatic postcard serialization.
 #[derive(Debug)]
 pub struct PostcardCodec<T> {
     inner: LengthDelimitedCodec,
@@ -54,9 +32,7 @@ impl<T> Default for PostcardCodec<T> {
 }
 
 impl<T> PostcardCodec<T> {
-    /// Create a new postcard codec with default settings.
-    ///
-    /// Uses a max frame length of 16 MB.
+    /// Max frame length: 16 MB.
     #[must_use]
     pub fn new() -> Self {
         Self {

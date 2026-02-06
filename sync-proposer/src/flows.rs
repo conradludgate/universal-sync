@@ -1,33 +1,8 @@
-//! Helper functions for group operations
-
 use iroh::EndpointAddr;
 use mls_rs::ExtensionList;
 use universal_sync_core::{AcceptorsExt, CrdtSnapshotExt};
 
-/// Create a group info extension list for a welcome message.
-///
-/// Includes:
-/// - The acceptor addresses so the joiner knows who to connect to
-/// - The CRDT state snapshot so the joiner has the current application state
-///
-/// # Panics
-/// Panics if encoding extensions fails (should never happen).
-///
-/// # Example
-///
-/// ```ignore
-/// let ext = welcome_group_info_extensions(
-///     learner.acceptors().values().cloned(),
-///     crdt_snapshot,
-/// );
-/// let commit = group
-///     .commit_builder()
-///     .add_member(key_package)
-///     .unwrap()
-///     .set_group_info_ext(ext)
-///     .build()
-///     .unwrap();
-/// ```
+/// Build GroupInfo extensions for a welcome message (acceptor addresses + CRDT snapshot).
 #[must_use]
 pub(crate) fn welcome_group_info_extensions(
     acceptors: impl IntoIterator<Item = EndpointAddr>,

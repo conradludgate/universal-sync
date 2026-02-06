@@ -1,7 +1,4 @@
-//! Bidirectional stream/sink combinators
-//!
-//! This module provides [`SinkStream`] for combining a sink and stream into
-//! a single bidirectional connection, and [`Mapped`] for error mapping.
+//! Bidirectional stream/sink combinators.
 
 use std::io;
 use std::marker::PhantomData;
@@ -12,16 +9,11 @@ use error_stack::Report;
 use futures::{Sink, Stream};
 use pin_project_lite::pin_project;
 
-/// Trait for converting `io::Error` to a target error type.
-///
-/// This is like `From<io::Error>` but can be implemented for foreign types
-/// like `Report<E>` without orphan rule issues.
+/// Like `From<io::Error>` but implementable for foreign types (e.g. `Report<E>`).
 pub trait FromIoError {
-    /// Convert an IO error to this type.
     fn from_io_error(err: io::Error) -> Self;
 }
 
-// Impl for Report<E> where E is any error context type
 impl<E: std::error::Error + Send + Sync + Default + 'static> FromIoError for Report<E> {
     fn from_io_error(err: io::Error) -> Self {
         Report::new(err).change_context(E::default())
@@ -29,9 +21,7 @@ impl<E: std::error::Error + Send + Sync + Default + 'static> FromIoError for Rep
 }
 
 pin_project! {
-    /// A bidirectional connection combining a sink and stream
-    ///
-    /// Implements both `Sink<Item>` and `Stream<Item = StreamItem>`.
+    /// Combines a `Sink` and `Stream` into a single bidirectional type.
     pub struct SinkStream<Si, St> {
         #[pin]
         sink: Si,
@@ -41,7 +31,6 @@ pin_project! {
 }
 
 impl<Si, St> SinkStream<Si, St> {
-    /// Create a new `SinkStream` from a sink and stream
     pub fn new(sink: Si, stream: St) -> Self {
         Self { sink, stream }
     }
@@ -82,10 +71,7 @@ where
 }
 
 pin_project! {
-    /// A sink/stream wrapper that maps `io::Error` to a custom error type
-    ///
-    /// This is useful when working with codecs that return `io::Error` but
-    /// you need a different error type for your protocol.
+    /// Maps `io::Error` to a custom error type via [`FromIoError`].
     pub struct Mapped<S, E> {
         #[pin]
         inner: S,
@@ -94,7 +80,6 @@ pin_project! {
 }
 
 impl<S, E> Mapped<S, E> {
-    /// Create a new mapped sink/stream
     pub fn new(inner: S) -> Self {
         Self {
             inner,

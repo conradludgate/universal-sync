@@ -1,35 +1,7 @@
-//! `GroupAcceptor` - implements paxos Acceptor for federated servers
+//! Paxos Acceptor for federated servers.
 //!
-//! # Consensus vs Acceptance
-//!
-//! An important distinction in Paxos is between *acceptance* and *consensus*:
-//!
-//! - **Acceptance**: A single acceptor has received and persisted a value
-//! - **Consensus**: A quorum of acceptors have accepted the same value
-//!
-//! Only when consensus is reached should the value be considered committed.
-//! The MLS state should only be updated with committed values.
-//!
-//! # Single Acceptor Deployment
-//!
-//! With a single acceptor, acceptance equals consensus (quorum of 1).
-//! The current implementation supports this case: when a value is accepted,
-//! it's stored in the state store and later "learned" when the acceptor
-//! is recreated for a new connection.
-//!
-//! # Multi-Acceptor Deployment
-//!
-//! For multiple acceptors, each acceptor server should:
-//!
-//! 1. Run the acceptor protocol (handle incoming Accept requests)
-//! 2. Run a **learner process** that connects to all acceptors
-//! 3. The learner tracks which values have reached quorum
-//! 4. Only when quorum is confirmed should `apply()` be called
-//!
-//! The learner for an acceptor only needs `(quorum - 1)` confirmations from
-//! other acceptors since it counts itself. For 3 acceptors with quorum 2,
-//! an acceptor that has accepted a value only needs 1 confirmation from
-//! another acceptor before applying.
+//! Wraps an MLS `ExternalGroup` to validate proposals without decrypting messages.
+//! Only applies values after consensus (quorum), not mere acceptance.
 
 use error_stack::{Report, ResultExt};
 use iroh::{EndpointAddr, PublicKey, SecretKey, Signature};
@@ -43,8 +15,6 @@ use universal_sync_core::{
 };
 
 /// Error marker for `GroupAcceptor` operations.
-///
-/// Use `error_stack::Report<AcceptorError>` with context attachments for detailed errors.
 #[derive(Debug, Default)]
 pub struct AcceptorError;
 
@@ -56,60 +26,26 @@ impl std::fmt::Display for AcceptorError {
 
 impl std::error::Error for AcceptorError {}
 
-/// Event emitted when the acceptor set changes during apply
 #[derive(Debug, Clone)]
 pub(crate) enum AcceptorChangeEvent {
-    /// An acceptor was added
-    Added {
-        /// The acceptor ID
-        id: AcceptorId,
-        // /// The endpoint address
-        // addr: EndpointAddr,
-    },
-    /// An acceptor was removed
-    Removed {
-        /// The acceptor ID
-        id: AcceptorId,
-    },
+    Added { id: AcceptorId },
+    Removed { id: AcceptorId },
 }
 
-/// A federated server that validates and orders group operations
+/// Validates and orders group operations via Paxos.
 ///
-/// Wraps an MLS `ExternalGroup` to verify signatures without being
-/// able to decrypt private messages. Implements paxos `Acceptor`.
-///
-/// Acceptors receive signed proposals from devices, validate the signatures
-/// against the group roster, and store the accepted (proposal, message) pairs.
-/// Acceptors do NOT create or sign their own proposals.
-///
-/// The list of acceptors is tracked separately and updated when
-/// commits containing [`AcceptorAdd`](universal_sync_core::AcceptorAdd) or
-/// [`AcceptorRemove`](universal_sync_core::AcceptorRemove) extensions are applied.
+/// Wraps an MLS `ExternalGroup` to verify signatures without decrypting messages.
+/// Tracks the acceptor set via `AcceptorAdd`/`AcceptorRemove` extensions in commits.
 pub struct GroupAcceptor<C, CS>
 where
     C: ExternalMlsConfig + Clone,
     CS: CipherSuiteProvider,
 {
-    /// The MLS external group state (can verify signatures, track membership)
     external_group: ExternalGroup<C>,
-
-    /// Cipher suite provider for MLS signature verification
     cipher_suite: CS,
-
-    /// This acceptor's iroh secret key (for signing sync proposals)
     secret_key: SecretKey,
-
-    /// Map of known acceptors: ID -> endpoint address
-    ///
-    /// This is updated when commits containing `AcceptorAdd`/`AcceptorRemove`
-    /// are applied.
     acceptors: std::collections::BTreeMap<AcceptorId, EndpointAddr>,
-
-    /// Optional state store for epoch roster lookups
-    ///
-    /// When set, this allows looking up member public keys from historical epochs
-    /// instead of just the current roster. This is needed because member indices
-    /// can change across epochs (e.g., when members are removed).
+    /// Enables epoch roster lookups for validating proposals from past epochs.
     state_store: Option<crate::state_store::GroupStateStore>,
 }
 
@@ -118,13 +54,6 @@ where
     C: ExternalMlsConfig + Clone,
     CS: CipherSuiteProvider,
 {
-    /// Create a new acceptor from an external group
-    ///
-    /// # Arguments
-    /// * `external_group` - The MLS external group
-    /// * `cipher_suite` - Cipher suite for MLS signature verification
-    /// * `secret_key` - This acceptor's iroh secret key (for signing sync proposals)
-    /// * `acceptors` - Initial set of known acceptors with addresses (from `GroupInfo` extensions)
     pub(crate) fn new(
         external_group: ExternalGroup<C>,
         cipher_suite: CS,
@@ -146,7 +75,6 @@ where
         }
     }
 
-    /// Set the state store for epoch roster lookups
     #[must_use]
     pub(crate) fn with_state_store(
         mut self,
@@ -156,12 +84,10 @@ where
         self
     }
 
-    /// Get the acceptor addresses
     pub(crate) fn acceptor_addrs(&self) -> impl Iterator<Item = (&AcceptorId, &EndpointAddr)> {
         self.acceptors.iter()
     }
 
-    /// Get a member's public signing key from the current roster
     fn get_member_public_key(&self, member_id: MemberId) -> Option<SignaturePublicKey> {
         self.external_group
             .roster()
@@ -170,16 +96,13 @@ where
             .ok()
     }
 
-    /// Get a member's public signing key for a specific epoch
-    ///
-    /// First tries to look up from stored epoch rosters (if state store is set),
-    /// then falls back to the current roster if the epoch matches or no roster is found.
+    /// Looks up the signing key for a member at a specific epoch,
+    /// falling back to the current roster if no historical data is available.
     fn get_member_public_key_for_epoch(
         &self,
         member_id: MemberId,
         epoch: Epoch,
     ) -> Option<SignaturePublicKey> {
-        // If we have a state store, try to look up from epoch rosters
         if let Some(ref store) = self.state_store
             && let Some(roster) = store.get_epoch_roster_at_or_before(epoch)
             && let Some(key_bytes) = roster.get_member_key(member_id)
@@ -187,23 +110,19 @@ where
             return Some(SignaturePublicKey::new_slice(key_bytes));
         }
 
-        // Fall back to current roster if epoch matches current or no epoch roster found
         let current_epoch = Epoch(self.external_group.group_context().epoch);
         if epoch == current_epoch {
             return self.get_member_public_key(member_id);
         }
 
-        // No way to validate this proposal - member may have been removed
         None
     }
 
-    /// Check if an acceptor ID is in the known set
     fn is_known_acceptor(&self, id: &AcceptorId) -> bool {
         self.acceptors.contains_key(id)
     }
 }
 
-// Implement Learner trait for GroupAcceptor
 impl<C, CS> universal_sync_paxos::Learner for GroupAcceptor<C, CS>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
@@ -215,8 +134,6 @@ where
     type AcceptorId = AcceptorId;
 
     fn node_id(&self) -> MemberId {
-        // Acceptors don't have an MLS member ID - use a sentinel value
-        // Sync proposals from acceptors use this ID
         MemberId(u32::MAX)
     }
 
@@ -229,20 +146,11 @@ where
     }
 
     fn propose(&self, attempt: Attempt) -> GroupProposal {
-        // Create a signed sync proposal for the learning process
-        //
-        // For sync proposals (node_id == MemberId(u32::MAX)):
-        // - message_hash = iroh public key (32 bytes)
-        // - signature = iroh ed25519 signature over unsigned proposal bytes
-        //
-        // Other acceptors validate by checking:
-        // 1. The public key is in the known acceptor set
-        // 2. The signature is valid for that public key
         let unsigned = UnsignedProposal::new(
             MemberId(u32::MAX),
             Epoch(self.external_group.group_context().epoch),
             attempt,
-            *self.secret_key.public().as_bytes(), // Store our public key in message_hash
+            *self.secret_key.public().as_bytes(),
         );
         let data = unsigned.to_bytes();
         let signature = self.secret_key.sign(&data);
@@ -264,14 +172,9 @@ where
             "validating proposal"
         );
 
-        // Sync proposals from acceptors have sentinel MemberId
-        // The message_hash contains the acceptor's iroh public key
-        // We validate by checking the public key is known and signature is valid
         if proposal.member_id == MemberId(u32::MAX) {
-            // Extract acceptor's public key from message_hash
             let acceptor_id = AcceptorId::from_bytes(proposal.message_hash);
 
-            // Check this is a known acceptor
             if !self.is_known_acceptor(&acceptor_id) {
                 tracing::debug!(?acceptor_id, "sync proposal from unknown acceptor");
                 return Err(Report::new(ValidationError)
@@ -279,13 +182,11 @@ where
                     .attach(format!("acceptor_id: {acceptor_id:?}")));
             }
 
-            // Verify the iroh ed25519 signature
             let public_key = PublicKey::from_bytes(&proposal.message_hash).map_err(|_| {
                 tracing::debug!("invalid public key in message_hash");
                 Report::new(ValidationError).attach("invalid public key in message_hash")
             })?;
 
-            // Signature must be exactly 64 bytes (ed25519)
             let sig_bytes: [u8; Signature::LENGTH] =
                 proposal.signature.as_slice().try_into().map_err(|_| {
                     tracing::debug!("invalid signature length");
@@ -309,8 +210,6 @@ where
             return Ok(Validated::assert_valid());
         }
 
-        // Regular proposals from MLS group members
-        // Look up the public key for the epoch the proposal was created in
         let public_key = self
             .get_member_public_key_for_epoch(proposal.member_id, proposal.epoch)
             .ok_or_else(|| {
@@ -342,31 +241,16 @@ where
         _proposal: GroupProposal,
         message: GroupMessage,
     ) -> Result<(), Report<AcceptorError>> {
-        // Apply a LEARNED value to the MLS state.
-        //
-        // This should only be called when the value has reached consensus
-        // (quorum of acceptors have accepted). The caller is responsible
-        // for confirming quorum before calling this.
-        //
-        // For a single-acceptor deployment, acceptance = consensus, so
-        // this is called immediately after accept.
-        //
-        // For multi-acceptor deployments, a background learner process
-        // should track quorum and call this when consensus is reached.
-
-        // Process the MLS message from GroupMessage
         let result = self
             .external_group
             .process_incoming_message(message.mls_message)
             .change_context(AcceptorError)?;
 
-        // Log what we processed and store epoch roster for commits
         match result {
             ExternalReceivedMessage::Commit(commit_desc) => {
                 let new_epoch = Epoch(self.external_group.group_context().epoch);
                 tracing::debug!(epoch = ?new_epoch, "learned commit");
 
-                // Process acceptor changes from the commit
                 let changes = self.process_commit_acceptor_changes(&commit_desc);
                 for change in &changes {
                     match change {
@@ -379,7 +263,6 @@ where
                     }
                 }
 
-                // Store the epoch roster for future signature validation
                 self.store_current_epoch_roster(new_epoch);
             }
             ExternalReceivedMessage::Proposal(_) => {
@@ -399,19 +282,12 @@ where
     }
 }
 
-// Private helper methods
 impl<C, CS> GroupAcceptor<C, CS>
 where
     C: ExternalMlsConfig + Clone,
     CS: CipherSuiteProvider,
 {
-    /// Process acceptor changes from a commit
-    ///
-    /// Extracts `AcceptorAdd`/`AcceptorRemove` from the applied proposals
-    /// and updates the acceptor set accordingly.
-    ///
-    /// Returns a list of change events for the caller to handle (e.g., to
-    /// spawn or close peer connections).
+    /// Extracts `AcceptorAdd`/`AcceptorRemove` from applied proposals and updates the acceptor set.
     fn process_commit_acceptor_changes(
         &mut self,
         commit_desc: &mls_rs::group::CommitMessageDescription,
@@ -421,18 +297,15 @@ where
 
         let mut changes = Vec::new();
 
-        // Get the applied proposals from the commit effect
         let applied_proposals = match &commit_desc.effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
                 &new_epoch.applied_proposals
             }
-            CommitEffect::ReInit(_) => return changes, // No proposals to process
+            CommitEffect::ReInit(_) => return changes,
         };
 
-        // Iterate through applied proposals looking for GroupContextExtensions
         for proposal_info in applied_proposals {
             if let MlsProposal::GroupContextExtensions(extensions) = &proposal_info.proposal {
-                // Check for AcceptorAdd
                 if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
                     let id = add.acceptor_id();
                     let addr = add.0.clone();
@@ -440,7 +313,6 @@ where
                     changes.push(AcceptorChangeEvent::Added { id });
                 }
 
-                // Check for AcceptorRemove
                 if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
                     let id = remove.acceptor_id();
                     self.acceptors.remove(&id);
@@ -452,12 +324,10 @@ where
         changes
     }
 
-    /// Store the current roster as an epoch snapshot
     fn store_current_epoch_roster(&self, epoch: Epoch) {
         if let Some(ref store) = self.state_store {
             use crate::epoch_roster::EpochRoster;
 
-            // Collect member public keys from the current roster
             let members: Vec<_> = self
                 .external_group
                 .roster()
@@ -480,10 +350,6 @@ where
         }
     }
 
-    /// Store the initial epoch roster for the current epoch.
-    ///
-    /// This should be called after creating or loading a group to ensure
-    /// the epoch roster is available for signature validation.
     pub(crate) fn store_initial_epoch_roster(&self) {
         let epoch = Epoch(self.external_group.group_context().epoch);
         self.store_current_epoch_roster(epoch);
