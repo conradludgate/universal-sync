@@ -10,7 +10,7 @@ use mls_rs::external_client::{ExternalClient, ExternalGroup};
 use mls_rs::mls_rs_codec::MlsDecode;
 use mls_rs::{CipherSuiteProvider, ExtensionList, MlsMessage};
 use tokio::sync::watch;
-use universal_sync_core::{AcceptorId, Epoch, GroupId, SYNC_EXTENSION_TYPE, SyncExt};
+use universal_sync_core::{AcceptorId, Epoch, GroupContextExt, GroupId, SYNC_EXTENSION_TYPE};
 use universal_sync_paxos::Learner;
 
 #[derive(Debug)]
@@ -89,24 +89,17 @@ where
     fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<EndpointAddr> {
         for ext in extensions.iter() {
             if ext.extension_type == SYNC_EXTENSION_TYPE
-                && let Ok(sync_ext) =
-                    SyncExt::mls_decode(&mut ext.extension_data.as_slice())
-                && let Some(acceptors) = sync_ext.acceptors()
+                && let Ok(ctx) = GroupContextExt::mls_decode(&mut ext.extension_data.as_slice())
             {
-                return acceptors.to_vec();
+                tracing::debug!(crdt_type_id = %ctx.crdt_type_id, "found group context ext");
             }
         }
+        // Acceptors are populated via AcceptorAdd proposals, not group context.
         vec![]
     }
 
     fn extract_acceptors_from_group(external_group: &ExternalGroup<C>) -> Vec<EndpointAddr> {
-        let ctx_acceptors =
-            Self::extract_acceptors_from_extensions(&external_group.group_context().extensions);
-        if !ctx_acceptors.is_empty() {
-            return ctx_acceptors;
-        }
-
-        vec![]
+        Self::extract_acceptors_from_extensions(&external_group.group_context().extensions)
     }
 
     fn create_acceptor_from_bytes(

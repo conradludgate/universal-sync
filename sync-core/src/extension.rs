@@ -1,8 +1,13 @@
 //! Custom MLS extensions and proposals for the sync protocol.
 //!
-//! All protocol-specific extensions share a single [`SYNC_EXTENSION_TYPE`],
-//! with variant tags encoded in the payload. Similarly, all custom proposals
-//! share a single [`SYNC_PROPOSAL_TYPE`] via the [`SyncProposal`] enum.
+//! All protocol-specific extensions share a single [`SYNC_EXTENSION_TYPE`].
+//! Each MLS context (group context, key package, group info) uses a different
+//! struct — [`GroupContextExt`], [`KeyPackageExt`], [`GroupInfoExt`] — but they
+//! all return the same extension type. This works because each struct only
+//! appears in its own extension list and never alongside the others.
+//!
+//! All custom proposals share a single [`SYNC_PROPOSAL_TYPE`] via the
+//! [`SyncProposal`] enum.
 
 use std::collections::BTreeMap;
 
@@ -16,163 +21,171 @@ use serde::{Deserialize, Serialize};
 use crate::proposal::AcceptorId;
 use crate::protocol::MemberFingerprint;
 
-/// Single extension type for all sync protocol extensions (private use range).
+/// Single extension type shared by all sync protocol extensions (private use range).
 ///
-/// The variant is encoded inside the extension data, so different MLS
-/// contexts (group context, key package, group info) can each carry their
-/// own [`SyncExt`] variant without type-ID collisions.
-pub const SYNC_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF795);
+/// Each MLS context (group context, key package, group info) carries its own
+/// struct but they all use this type ID. No collisions because the structs
+/// live in separate extension lists.
+pub const SYNC_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF796);
 
 /// Single proposal type for all sync protocol custom proposals (private use range).
 pub const SYNC_PROPOSAL_TYPE: ProposalType = ProposalType::new(0xF796);
 
 // ---------------------------------------------------------------------------
-// SyncExt — unified extension enum
+// GroupContextExt — group context extension
 // ---------------------------------------------------------------------------
 
-/// Unified extension for all sync protocol data.
+/// CRDT type registration (group context extension).
 ///
-/// Each MLS context (group context, key package, group info) stores one
-/// instance. The variant tag disambiguates.
+/// Set at group creation. Joiners check this to select the right CRDT factory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SyncExt {
-    /// Group context: acceptor addresses + CRDT type registration.
-    GroupContext {
-        acceptors: Vec<EndpointAddr>,
-        crdt_type_id: String,
-    },
-    /// Key package: member's endpoint address + supported CRDT types.
-    KeyPackage {
-        addr: EndpointAddr,
-        supported_crdts: Vec<String>,
-    },
-    /// Group info (welcome): current acceptor list + optional CRDT snapshot.
-    GroupInfo {
-        acceptors: Vec<EndpointAddr>,
-        snapshot: Option<Vec<u8>>,
-    },
+pub struct GroupContextExt {
+    pub crdt_type_id: String,
 }
 
-impl SyncExt {
+impl GroupContextExt {
     #[must_use]
-    pub fn group_context(
-        acceptors: impl IntoIterator<Item = EndpointAddr>,
-        crdt_type_id: impl Into<String>,
-    ) -> Self {
-        Self::GroupContext {
-            acceptors: acceptors.into_iter().collect(),
+    pub fn new(crdt_type_id: impl Into<String>) -> Self {
+        Self {
             crdt_type_id: crdt_type_id.into(),
         }
     }
+}
 
+impl MlsSize for GroupContextExt {
+    fn mls_encoded_len(&self) -> usize {
+        postcard::to_allocvec(self).map_or(4, |v| 4 + v.len())
+    }
+}
+
+impl MlsEncode for GroupContextExt {
+    fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+        postcard_encode(self, writer)
+    }
+}
+
+impl MlsDecode for GroupContextExt {
+    fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
+        postcard_decode(reader)
+    }
+}
+
+impl MlsCodecExtension for GroupContextExt {
+    fn extension_type() -> ExtensionType {
+        SYNC_EXTENSION_TYPE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KeyPackageExt — key package extension
+// ---------------------------------------------------------------------------
+
+/// Member endpoint address and supported CRDTs (key package extension).
+///
+/// Included in key packages so the group leader can send the Welcome
+/// directly and verify CRDT compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageExt {
+    pub addr: EndpointAddr,
+    pub supported_crdts: Vec<String>,
+}
+
+impl KeyPackageExt {
     #[must_use]
-    pub fn key_package(
+    pub fn new(
         addr: EndpointAddr,
         supported_crdts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        Self::KeyPackage {
+        Self {
             addr,
             supported_crdts: supported_crdts.into_iter().map(Into::into).collect(),
         }
     }
 
     #[must_use]
-    pub fn group_info(
+    pub fn supports(&self, type_id: &str) -> bool {
+        self.supported_crdts.iter().any(|id| id == type_id)
+    }
+}
+
+impl MlsSize for KeyPackageExt {
+    fn mls_encoded_len(&self) -> usize {
+        postcard::to_allocvec(self).map_or(4, |v| 4 + v.len())
+    }
+}
+
+impl MlsEncode for KeyPackageExt {
+    fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
+        postcard_encode(self, writer)
+    }
+}
+
+impl MlsDecode for KeyPackageExt {
+    fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
+        postcard_decode(reader)
+    }
+}
+
+impl MlsCodecExtension for KeyPackageExt {
+    fn extension_type() -> ExtensionType {
+        SYNC_EXTENSION_TYPE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GroupInfoExt — group info extension (welcome)
+// ---------------------------------------------------------------------------
+
+/// Current acceptor list and optional CRDT snapshot (group info extension).
+///
+/// Sent in Welcome messages so joiners can discover acceptors and optionally
+/// bootstrap their CRDT state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInfoExt {
+    pub acceptors: Vec<EndpointAddr>,
+    pub snapshot: Option<Vec<u8>>,
+}
+
+impl GroupInfoExt {
+    #[must_use]
+    pub fn new(
         acceptors: impl IntoIterator<Item = EndpointAddr>,
         snapshot: Option<Vec<u8>>,
     ) -> Self {
-        Self::GroupInfo {
+        Self {
             acceptors: acceptors.into_iter().collect(),
             snapshot,
         }
     }
 
     #[must_use]
-    pub fn acceptors(&self) -> Option<&[EndpointAddr]> {
-        match self {
-            Self::GroupContext { acceptors, .. } | Self::GroupInfo { acceptors, .. } => {
-                Some(acceptors)
-            }
-            _ => None,
-        }
-    }
-
-    #[must_use]
     pub fn acceptor_ids(&self) -> Vec<AcceptorId> {
-        self.acceptors().map_or_else(Vec::new, |addrs| {
-            addrs
-                .iter()
-                .map(|addr| AcceptorId::from_bytes(*addr.id.as_bytes()))
-                .collect()
-        })
-    }
-
-    #[must_use]
-    pub fn crdt_type_id(&self) -> Option<&str> {
-        match self {
-            Self::GroupContext { crdt_type_id, .. } => Some(crdt_type_id),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn member_addr(&self) -> Option<&EndpointAddr> {
-        match self {
-            Self::KeyPackage { addr, .. } => Some(addr),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn supports_crdt(&self, type_id: &str) -> bool {
-        match self {
-            Self::KeyPackage {
-                supported_crdts, ..
-            } => supported_crdts.iter().any(|id| id == type_id),
-            _ => false,
-        }
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> Option<&[u8]> {
-        match self {
-            Self::GroupInfo {
-                snapshot: Some(s), ..
-            } => Some(s),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn supported_crdts(&self) -> Option<&[String]> {
-        match self {
-            Self::KeyPackage {
-                supported_crdts, ..
-            } => Some(supported_crdts),
-            _ => None,
-        }
+        self.acceptors
+            .iter()
+            .map(|addr| AcceptorId::from_bytes(*addr.id.as_bytes()))
+            .collect()
     }
 }
 
-impl MlsSize for SyncExt {
+impl MlsSize for GroupInfoExt {
     fn mls_encoded_len(&self) -> usize {
         postcard::to_allocvec(self).map_or(4, |v| 4 + v.len())
     }
 }
 
-impl MlsEncode for SyncExt {
+impl MlsEncode for GroupInfoExt {
     fn mls_encode(&self, writer: &mut Vec<u8>) -> Result<(), mls_rs_codec::Error> {
         postcard_encode(self, writer)
     }
 }
 
-impl MlsDecode for SyncExt {
+impl MlsDecode for GroupInfoExt {
     fn mls_decode(reader: &mut &[u8]) -> Result<Self, mls_rs_codec::Error> {
         postcard_decode(reader)
     }
 }
 
-impl MlsCodecExtension for SyncExt {
+impl MlsCodecExtension for GroupInfoExt {
     fn extension_type() -> ExtensionType {
         SYNC_EXTENSION_TYPE
     }
@@ -309,71 +322,59 @@ mod tests {
     }
 
     #[test]
-    fn sync_ext_group_context_roundtrip() {
-        let addrs = vec![test_addr(1), test_addr(2), test_addr(3)];
-        let ext = SyncExt::group_context(addrs, "yjs");
+    fn group_context_ext_roundtrip() {
+        let ext = GroupContextExt::new("yjs");
 
         let encoded = ext.mls_encode_to_vec().unwrap();
-        let decoded = SyncExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        let decoded = GroupContextExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert_eq!(decoded.acceptors().unwrap().len(), 3);
-        assert_eq!(decoded.crdt_type_id().unwrap(), "yjs");
+        assert_eq!(decoded.crdt_type_id, "yjs");
     }
 
     #[test]
-    fn sync_ext_group_context_empty_acceptors() {
-        let ext = SyncExt::group_context(Vec::<EndpointAddr>::new(), "none");
-
-        let encoded = ext.mls_encode_to_vec().unwrap();
-        let decoded = SyncExt::mls_decode(&mut encoded.as_slice()).unwrap();
-        assert_eq!(ext, decoded);
-        assert!(decoded.acceptors().unwrap().is_empty());
-    }
-
-    #[test]
-    fn sync_ext_key_package_roundtrip() {
+    fn key_package_ext_roundtrip() {
         let addr = test_addr(42);
-        let ext = SyncExt::key_package(addr.clone(), ["yjs", "automerge"]);
+        let ext = KeyPackageExt::new(addr.clone(), ["yjs", "automerge"]);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
-        let decoded = SyncExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        let decoded = KeyPackageExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert_eq!(decoded.member_addr().unwrap(), &addr);
-        assert!(decoded.supports_crdt("yjs"));
-        assert!(decoded.supports_crdt("automerge"));
-        assert!(!decoded.supports_crdt("unknown"));
+        assert_eq!(decoded.addr, addr);
+        assert!(decoded.supports("yjs"));
+        assert!(decoded.supports("automerge"));
+        assert!(!decoded.supports("unknown"));
     }
 
     #[test]
-    fn sync_ext_group_info_roundtrip() {
+    fn group_info_ext_roundtrip() {
         let addrs = vec![test_addr(1), test_addr(2)];
-        let ext = SyncExt::group_info(addrs, Some(b"crdt snapshot data".to_vec()));
+        let ext = GroupInfoExt::new(addrs, Some(b"crdt snapshot data".to_vec()));
 
         let encoded = ext.mls_encode_to_vec().unwrap();
-        let decoded = SyncExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert_eq!(decoded.snapshot().unwrap(), b"crdt snapshot data");
-        assert_eq!(decoded.acceptors().unwrap().len(), 2);
+        assert_eq!(decoded.snapshot.as_deref().unwrap(), b"crdt snapshot data");
+        assert_eq!(decoded.acceptors.len(), 2);
     }
 
     #[test]
-    fn sync_ext_group_info_no_snapshot() {
-        let ext = SyncExt::group_info(Vec::<EndpointAddr>::new(), None);
+    fn group_info_ext_no_snapshot() {
+        let ext = GroupInfoExt::new(Vec::<EndpointAddr>::new(), None);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
-        let decoded = SyncExt::mls_decode(&mut encoded.as_slice()).unwrap();
+        let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert!(decoded.snapshot().is_none());
+        assert!(decoded.snapshot.is_none());
     }
 
     #[test]
-    fn sync_ext_acceptor_ids() {
+    fn group_info_ext_acceptor_ids() {
         let addr1 = test_addr(1);
         let addr2 = test_addr(2);
         let expected_id1 = AcceptorId::from_bytes(*addr1.id.as_bytes());
         let expected_id2 = AcceptorId::from_bytes(*addr2.id.as_bytes());
 
-        let ext = SyncExt::group_context(vec![addr1, addr2], "none");
+        let ext = GroupInfoExt::new(vec![addr1, addr2], None);
         let ids = ext.acceptor_ids();
 
         assert_eq!(ids.len(), 2);

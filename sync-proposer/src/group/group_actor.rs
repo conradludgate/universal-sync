@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorId, CompactionConfig, CrdtFactory, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
-    GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, SyncProposal, PAXOS_ALPN,
-    StateVector,
+    GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN, StateVector,
+    SyncProposal,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -1259,8 +1259,7 @@ where
                     "received CompactionClaim"
                 );
 
-                let is_ours =
-                    committer_fingerprint.is_some_and(|fp| fp == self.own_fingerprint);
+                let is_ours = committer_fingerprint.is_some_and(|fp| fp == self.own_fingerprint);
 
                 let active_claim = ActiveCompactionClaim {
                     claimer: committer_fingerprint.unwrap_or(self.own_fingerprint),

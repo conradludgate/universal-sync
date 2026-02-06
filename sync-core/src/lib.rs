@@ -17,7 +17,10 @@ pub use crdt::{CompactionConfig, Crdt, CrdtError, CrdtFactory, NoCrdt, NoCrdtFac
 pub use error::{
     AcceptorContext, ConnectorError, EpochContext, GroupContext, MemberContext, OperationContext,
 };
-pub use extension::{SyncExt, SyncProposal, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
+pub use extension::{
+    GroupContextExt, GroupInfoExt, KeyPackageExt, SyncProposal, SYNC_EXTENSION_TYPE,
+    SYNC_PROPOSAL_TYPE,
+};
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub use protocol::{
     EncryptedAppMessage, GroupId, GroupMessage, Handshake, HandshakeResponse, MemberFingerprint,

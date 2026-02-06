@@ -8,11 +8,10 @@ use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
 use mls_rs::group::{CommitEffect, ReceivedMessage};
-use universal_sync_core::SyncProposal;
 use mls_rs::{CipherSuiteProvider, Group};
 use universal_sync_core::{
     AcceptorId, Attempt, Epoch, GroupMessage, GroupProposal, MemberFingerprint, MemberId,
-    UnsignedProposal,
+    SyncProposal, UnsignedProposal,
 };
 
 /// Error marker for `GroupLearner` operations.

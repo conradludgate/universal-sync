@@ -14,9 +14,7 @@ use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
-use universal_sync_core::{
-    NoCrdtFactory, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
-};
+use universal_sync_core::{NoCrdtFactory, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use universal_sync_proposer::{GroupClient, ReplContext};
 pub use yrs_crdt::{YrsCrdt, YrsCrdtFactory};
 

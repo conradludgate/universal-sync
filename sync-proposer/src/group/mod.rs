@@ -24,8 +24,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorId, CompactionConfig, Crdt, CrdtFactory, EncryptedAppMessage, Epoch, GroupId,
-    Handshake, MessageId, SyncExt,
+    AcceptorId, CompactionConfig, Crdt, CrdtFactory, EncryptedAppMessage, Epoch, GroupContextExt,
+    GroupId, GroupInfoExt, Handshake, KeyPackageExt, MessageId,
 };
 
 use crate::connection::ConnectionManager;
@@ -56,8 +56,8 @@ pub(crate) fn welcome_group_info_extensions(
 ) -> mls_rs::ExtensionList {
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
-        .set_from(SyncExt::group_info(acceptors, None))
-        .expect("SyncExt encoding should not fail");
+        .set_from(GroupInfoExt::new(acceptors, None))
+        .expect("GroupInfoExt encoding should not fail");
     extensions
 }
 
@@ -243,10 +243,7 @@ where
         let (learner, group_id, group_info_bytes) = blocking(|| {
             let mut group_context_extensions = mls_rs::ExtensionList::default();
             group_context_extensions
-                .set_from(SyncExt::group_context(
-                    acceptors.iter().cloned(),
-                    &crdt_type_id,
-                ))
+                .set_from(GroupContextExt::new(&crdt_type_id))
                 .change_context(GroupError)
                 .attach(OperationContext::CREATING_GROUP)?;
 
@@ -337,33 +334,24 @@ where
 
             let group_info_ext = info
                 .group_info_extensions
-                .get_as::<SyncExt>()
+                .get_as::<GroupInfoExt>()
                 .change_context(GroupError)
                 .attach(OperationContext::JOINING_GROUP)?;
 
             let acceptors = group_info_ext
                 .as_ref()
-                .and_then(SyncExt::acceptors)
-                .unwrap_or_default()
-                .to_vec();
+                .map(|e| e.acceptors.clone())
+                .unwrap_or_default();
 
-            let crdt_snapshot_opt = group_info_ext
-                .as_ref()
-                .and_then(SyncExt::snapshot)
-                .map(|s| s.to_vec());
+            let crdt_snapshot_opt = group_info_ext.and_then(|e| e.snapshot);
 
-            let group_ctx_ext = group
+            let crdt_type_id = group
                 .context()
                 .extensions
-                .get_as::<SyncExt>()
+                .get_as::<GroupContextExt>()
                 .change_context(GroupError)
-                .attach(OperationContext::JOINING_GROUP)?;
-
-            let crdt_type_id = group_ctx_ext
-                .as_ref()
-                .and_then(SyncExt::crdt_type_id)
-                .unwrap_or("none")
-                .to_owned();
+                .attach(OperationContext::JOINING_GROUP)?
+                .map_or_else(|| "none".to_owned(), |e| e.crdt_type_id);
 
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
 
@@ -453,30 +441,23 @@ where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Send + Sync + 'static,
 {
-    /// Add a member. Welcome is sent directly via the key package's [`SyncExt::KeyPackage`].
+    /// Add a member. Welcome is sent directly via the key package's [`KeyPackageExt`].
     /// Blocks until consensus is reached.
     ///
     /// The new member starts with an empty CRDT and catches up via compaction
     /// and backfill from acceptors.
     pub async fn add_member(&mut self, key_package: MlsMessage) -> Result<(), Report<GroupError>> {
-        let kp_ext = key_package
+        let member_addr = key_package
             .as_key_package()
             .ok_or_else(|| Report::new(GroupError).attach("message is not a key package"))?
             .extensions
-            .get_as::<SyncExt>()
+            .get_as::<KeyPackageExt>()
             .change_context(GroupError)?
             .ok_or_else(|| {
                 Report::new(GroupError)
-                    .attach("key package missing SyncExt extension with member's endpoint address")
-            })?;
-
-        let member_addr = kp_ext
-            .member_addr()
-            .ok_or_else(|| {
-                Report::new(GroupError)
-                    .attach("SyncExt is not a KeyPackage variant with member address")
+                    .attach("key package missing KeyPackageExt with member's endpoint address")
             })?
-            .clone();
+            .addr;
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx

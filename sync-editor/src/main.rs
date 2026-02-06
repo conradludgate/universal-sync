@@ -15,9 +15,7 @@ use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tokio::sync::mpsc;
 use tracing::info;
-use universal_sync_core::{
-    NoCrdtFactory, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
-};
+use universal_sync_core::{NoCrdtFactory, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use universal_sync_proposer::GroupClient;
 use universal_sync_testing::YrsCrdtFactory;
 
