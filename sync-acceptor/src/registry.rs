@@ -5,12 +5,12 @@ use std::sync::{Arc, RwLock};
 
 use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
+use mls_rs::external_client::ExternalClient;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
-use mls_rs::external_client::{ExternalClient, ExternalGroup};
 use mls_rs::mls_rs_codec::MlsDecode;
 use mls_rs::{CipherSuiteProvider, ExtensionList, MlsMessage};
 use tokio::sync::watch;
-use universal_sync_core::{AcceptorId, Epoch, GroupContextExt, GroupId, SYNC_EXTENSION_TYPE};
+use universal_sync_core::{AcceptorId, Epoch, GroupId, GroupInfoExt, SYNC_EXTENSION_TYPE};
 use universal_sync_paxos::Learner;
 
 #[derive(Debug)]
@@ -89,17 +89,12 @@ where
     fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<EndpointAddr> {
         for ext in extensions.iter() {
             if ext.extension_type == SYNC_EXTENSION_TYPE
-                && let Ok(ctx) = GroupContextExt::mls_decode(&mut ext.extension_data.as_slice())
+                && let Ok(info) = GroupInfoExt::mls_decode(&mut ext.extension_data.as_slice())
             {
-                tracing::debug!(crdt_type_id = %ctx.crdt_type_id, "found group context ext");
+                return info.acceptors;
             }
         }
-        // Acceptors are populated via AcceptorAdd proposals, not group context.
         vec![]
-    }
-
-    fn extract_acceptors_from_group(external_group: &ExternalGroup<C>) -> Vec<EndpointAddr> {
-        Self::extract_acceptors_from_extensions(&external_group.group_context().extensions)
     }
 
     fn create_acceptor_from_bytes(
@@ -110,13 +105,16 @@ where
             .change_context(RegistryError)
             .attach("failed to parse MLS message")?;
 
+        let acceptors = mls_message
+            .as_group_info()
+            .map(|gi| Self::extract_acceptors_from_extensions(gi.extensions()))
+            .unwrap_or_default();
+
         let external_group = self
             .external_client
             .observe_group(mls_message, None, None)
             .change_context(RegistryError)
             .attach("failed to observe group")?;
-
-        let acceptors = Self::extract_acceptors_from_group(&external_group);
 
         Ok(GroupAcceptor::new(
             external_group,
@@ -171,6 +169,11 @@ where
             .change_context(RegistryError)
             .attach("failed to parse MLS message")?;
 
+        let acceptors = mls_message
+            .as_group_info()
+            .map(|gi| Self::extract_acceptors_from_extensions(gi.extensions()))
+            .unwrap_or_default();
+
         let external_group = self
             .external_client
             .observe_group(mls_message, None, None)
@@ -179,7 +182,6 @@ where
 
         let mls_group_id = external_group.group_context().group_id.clone();
         let group_id = GroupId::from_slice(&mls_group_id);
-        let acceptors = Self::extract_acceptors_from_group(&external_group);
 
         let acceptor = GroupAcceptor::new(
             external_group,

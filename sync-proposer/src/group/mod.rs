@@ -45,13 +45,9 @@ impl fmt::Display for GroupError {
 
 impl std::error::Error for GroupError {}
 
-/// Build `GroupInfo` extensions for a welcome message (acceptor addresses).
-///
-/// Note: CRDT snapshot is no longer included in the welcome. New members
-/// start with an empty CRDT and catch up via compaction + backfill from
-/// acceptors.
+/// Build `GroupInfo` extensions containing the acceptor list.
 #[must_use]
-pub(crate) fn welcome_group_info_extensions(
+pub(crate) fn group_info_ext_list(
     acceptors: impl IntoIterator<Item = EndpointAddr>,
 ) -> mls_rs::ExtensionList {
     let mut extensions = mls_rs::ExtensionList::default();
@@ -59,6 +55,18 @@ pub(crate) fn welcome_group_info_extensions(
         .set_from(GroupInfoExt::new(acceptors, None))
         .expect("GroupInfoExt encoding should not fail");
     extensions
+}
+
+/// Create a serialised `GroupInfo` message with a [`GroupInfoExt`] extension.
+pub(crate) fn group_info_with_ext<C: mls_rs::client_builder::MlsConfig>(
+    group: &mls_rs::Group<C>,
+    acceptors: impl IntoIterator<Item = EndpointAddr>,
+) -> Result<Vec<u8>, Report<GroupError>> {
+    let extensions = group_info_ext_list(acceptors);
+    let msg = group
+        .group_info_message_internal(extensions, true)
+        .change_context(GroupError)?;
+    msg.to_bytes().change_context(GroupError)
 }
 
 enum GroupRequest<C, CS>
@@ -263,15 +271,8 @@ where
             let group_info_bytes = if acceptors.is_empty() {
                 None
             } else {
-                let group_info_msg = learner
-                    .group()
-                    .group_info_message(true)
-                    .change_context(GroupError)
-                    .attach(OperationContext::CREATING_GROUP)?;
                 Some(
-                    group_info_msg
-                        .to_bytes()
-                        .change_context(GroupError)
+                    group_info_with_ext(learner.group(), acceptors.iter().cloned())
                         .attach(OperationContext::CREATING_GROUP)?,
                 )
             };

@@ -21,7 +21,8 @@ use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
 use super::acceptor_actor::AcceptorActor;
 use super::{
     AcceptorInbound, AcceptorOutbound, GroupContext, GroupError, GroupEvent, GroupRequest,
-    MAX_MESSAGE_ATTEMPTS, MemberInfo, PendingMessage, blocking, welcome_group_info_extensions,
+    MAX_MESSAGE_ATTEMPTS, MemberInfo, PendingMessage, blocking, group_info_ext_list,
+    group_info_with_ext,
 };
 use crate::connection::ConnectionManager;
 use crate::connector::{ProposalRequest, ProposalResponse};
@@ -333,14 +334,8 @@ where
     ) -> Result<(), Report<GroupError>> {
         use crate::connector::register_group_with_addr;
 
-        let group_info_bytes = blocking(|| {
-            let group_info = self
-                .learner
-                .group()
-                .group_info_message(true)
-                .change_context(GroupError)?;
-            group_info.to_bytes().change_context(GroupError)
-        })?;
+        let acceptors = self.learner.acceptors().values().cloned();
+        let group_info_bytes = blocking(|| group_info_with_ext(self.learner.group(), acceptors))?;
 
         register_group_with_addr(
             self.connection_manager.endpoint(),
@@ -440,8 +435,7 @@ where
         }
 
         let result = blocking(|| {
-            let group_info_ext =
-                welcome_group_info_extensions(self.learner.acceptors().values().cloned());
+            let group_info_ext = group_info_ext_list(self.learner.acceptors().values().cloned());
 
             let commit_output = self
                 .learner
