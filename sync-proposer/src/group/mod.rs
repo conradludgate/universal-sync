@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorId, AcceptorsExt, Crdt, CrdtFactory, CrdtRegistrationExt, CrdtSnapshotExt,
-    EncryptedAppMessage, Epoch, GroupId, Handshake, MessageId,
+    AcceptorId, AcceptorsExt, CompactionConfig, Crdt, CrdtFactory, CrdtRegistrationExt,
+    CrdtSnapshotExt, EncryptedAppMessage, Epoch, GroupId, Handshake, MessageId,
 };
 
 use crate::connection::ConnectionManager;
@@ -138,6 +138,8 @@ pub enum GroupEvent {
     ExternalInit,
     ExtensionsUpdated,
     EpochAdvanced { epoch: u64 },
+    CompactionClaimed { level: u8 },
+    CompactionCompleted { level: u8 },
     Unknown,
 }
 
@@ -285,6 +287,7 @@ where
             connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
+        let compaction_config = crdt_factory.compaction_config();
         let crdt = crdt_factory.create();
 
         Ok(Self::spawn_actors(
@@ -293,6 +296,7 @@ where
             endpoint.clone(),
             connection_manager.clone(),
             crdt,
+            compaction_config,
         ))
     }
 
@@ -375,6 +379,7 @@ where
             connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
+        let compaction_config = crdt_factory.compaction_config();
         let crdt = crdt_factory
             .from_snapshot(crdt_snapshot.snapshot())
             .map_err(|e| {
@@ -388,6 +393,7 @@ where
             connection_manager.endpoint().clone(),
             connection_manager.clone(),
             crdt,
+            compaction_config,
         ))
     }
 
@@ -397,6 +403,7 @@ where
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
         crdt: Box<dyn Crdt>,
+        compaction_config: CompactionConfig,
     ) -> Self {
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
@@ -412,6 +419,7 @@ where
             app_message_tx,
             event_tx.clone(),
             cancel_token.clone(),
+            compaction_config,
         );
 
         let actor_handle = tokio::spawn(actor.run());

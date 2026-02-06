@@ -10,8 +10,8 @@ use mls_rs::crypto::SignaturePublicKey;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::external_client::{ExternalGroup, ExternalReceivedMessage};
 use universal_sync_core::{
-    AcceptorAdd, AcceptorId, AcceptorRemove, Attempt, Epoch, GroupMessage, GroupProposal, MemberId,
-    UnsignedProposal,
+    AcceptorAdd, AcceptorId, AcceptorRemove, Attempt, CompactionComplete, Epoch, GroupMessage,
+    GroupProposal, MemberId, UnsignedProposal,
 };
 
 /// Error marker for `GroupAcceptor` operations.
@@ -30,6 +30,7 @@ impl std::error::Error for AcceptorError {}
 pub(crate) enum AcceptorChangeEvent {
     Added { id: AcceptorId },
     Removed { id: AcceptorId },
+    CompactionCompleted { level: u8, deleted: usize },
 }
 
 /// Validates and orders group operations via Paxos.
@@ -260,6 +261,12 @@ where
                         AcceptorChangeEvent::Removed { id } => {
                             tracing::debug!(?id, "acceptor removed");
                         }
+                        AcceptorChangeEvent::CompactionCompleted { level, deleted } => {
+                            tracing::info!(
+                                level, deleted,
+                                "compaction completed — messages deleted"
+                            );
+                        }
                     }
                 }
 
@@ -287,13 +294,13 @@ where
     C: ExternalMlsConfig + Clone,
     CS: CipherSuiteProvider,
 {
-    /// Extracts `AcceptorAdd`/`AcceptorRemove` from applied proposals and updates the acceptor set.
+    /// Extracts `AcceptorAdd`/`AcceptorRemove` and `CompactionComplete` from applied proposals.
     fn process_commit_acceptor_changes(
         &mut self,
         commit_desc: &mls_rs::group::CommitMessageDescription,
     ) -> Vec<AcceptorChangeEvent> {
         use mls_rs::group::CommitEffect;
-        use mls_rs::group::proposal::Proposal as MlsProposal;
+        use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
 
         let mut changes = Vec::new();
 
@@ -305,19 +312,54 @@ where
         };
 
         for proposal_info in applied_proposals {
-            if let MlsProposal::GroupContextExtensions(extensions) = &proposal_info.proposal {
-                if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
-                    let id = add.acceptor_id();
-                    let addr = add.0.clone();
-                    self.acceptors.insert(id, addr.clone());
-                    changes.push(AcceptorChangeEvent::Added { id });
-                }
+            match &proposal_info.proposal {
+                MlsProposal::GroupContextExtensions(extensions) => {
+                    if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
+                        let id = add.acceptor_id();
+                        let addr = add.0.clone();
+                        self.acceptors.insert(id, addr.clone());
+                        changes.push(AcceptorChangeEvent::Added { id });
+                    }
 
-                if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
-                    let id = remove.acceptor_id();
-                    self.acceptors.remove(&id);
-                    changes.push(AcceptorChangeEvent::Removed { id });
+                    if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
+                        let id = remove.acceptor_id();
+                        self.acceptors.remove(&id);
+                        changes.push(AcceptorChangeEvent::Removed { id });
+                    }
                 }
+                MlsProposal::Custom(custom) => {
+                    if let Ok(complete) = CompactionComplete::from_custom_proposal(custom) {
+                        tracing::info!(
+                            level = complete.level,
+                            watermark_entries = complete.watermark.len(),
+                            "processing CompactionComplete proposal"
+                        );
+
+                        if let Some(ref store) = self.state_store {
+                            match store.delete_before_watermark(&complete.watermark) {
+                                Ok(deleted) => {
+                                    tracing::info!(
+                                        deleted,
+                                        level = complete.level,
+                                        "deleted messages for compaction"
+                                    );
+                                    changes.push(AcceptorChangeEvent::CompactionCompleted {
+                                        level: complete.level,
+                                        deleted,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        ?e,
+                                        level = complete.level,
+                                        "failed to delete messages for compaction"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

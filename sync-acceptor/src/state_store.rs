@@ -568,6 +568,15 @@ impl GroupStateStore {
         self.inner
             .get_epoch_roster_at_or_before_sync(&self.group_id, epoch)
     }
+
+    /// Delete all messages for this group whose (sender, seq) is covered by the watermark.
+    pub(crate) fn delete_before_watermark(
+        &self,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        self.inner
+            .delete_before_watermark(&self.group_id, watermark)
+    }
 }
 
 pub struct GroupReceiver {

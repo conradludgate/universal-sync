@@ -3,16 +3,16 @@ use std::collections::{HashMap, HashSet};
 use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::MlsConfig;
-use mls_rs::group::proposal::Proposal as MlsProposal;
+use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
 use mls_rs::group::{CommitEffect, ReceivedMessage};
 use mls_rs::{CipherSuiteProvider, MlsMessage};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorAdd, AcceptorId, AcceptorRemove, CrdtRegistrationExt, EncryptedAppMessage, Epoch,
-    GroupId, GroupMessage, GroupProposal, Handshake, MemberId, MemberFingerprint, MessageId,
-    StateVector, PAXOS_ALPN,
+    AcceptorAdd, AcceptorId, AcceptorRemove, CompactionClaim, CompactionComplete,
+    CompactionConfig, CrdtRegistrationExt, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
+    GroupProposal, Handshake, MemberId, MemberFingerprint, MessageId, StateVector, PAXOS_ALPN,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -54,6 +54,8 @@ where
     pending_messages: Vec<PendingMessage>,
     join_epoch: Epoch,
     active_proposal: Option<ActiveProposal>,
+    compaction_state: CompactionState,
+    compaction_config: CompactionConfig,
 }
 
 struct ActiveProposal {
@@ -80,8 +82,59 @@ struct WelcomeToSend {
     reply: oneshot::Sender<Result<(), Report<GroupError>>>,
 }
 
+/// Tracks an active compaction claim at a given level.
+#[derive(Debug, Clone)]
+struct ActiveCompactionClaim {
+    /// Who claimed the compaction.
+    claimer: MemberFingerprint,
+    /// The level being compacted.
+    level: u8,
+    /// The watermark (state vector) at the time of the claim.
+    watermark: StateVector,
+    /// When the claim expires (unix seconds).
+    deadline: u64,
+    /// Whether this is our own claim.
+    is_ours: bool,
+}
+
+/// Tracks compaction state for the group.
+#[derive(Debug, Default)]
+struct CompactionState {
+    /// Active claim per level (only one compaction at a time per level).
+    active_claims: HashMap<u8, ActiveCompactionClaim>,
+    /// Number of L0 messages since the last compaction.
+    l0_count_since_compaction: u64,
+    /// The watermark that was last compacted (messages at or below this are compacted).
+    last_compacted_watermark: StateVector,
+}
+
+impl CompactionState {
+    /// Returns true if there is an active, non-expired claim at the given level.
+    fn has_active_claim(&self, level: u8) -> bool {
+        self.active_claims.get(&level).is_some_and(|claim| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            now < claim.deadline
+        })
+    }
+
+    /// Remove expired claims.
+    fn prune_expired_claims(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.active_claims.retain(|_, claim| now < claim.deadline);
+    }
+}
+
 const MAX_PROPOSAL_RETRIES: u32 = 3;
 const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Default deadline for compaction claims (seconds from now).
+const COMPACTION_DEADLINE_SECS: u64 = 120;
 
 impl<C, CS> GroupActor<C, CS>
 where
@@ -98,6 +151,7 @@ where
         app_message_tx: mpsc::Sender<Vec<u8>>,
         event_tx: broadcast::Sender<GroupEvent>,
         cancel_token: CancellationToken,
+        compaction_config: CompactionConfig,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
         let join_epoch = learner.mls_epoch();
@@ -127,6 +181,8 @@ where
             pending_messages: Vec::new(),
             join_epoch,
             active_proposal: None,
+            compaction_state: CompactionState::default(),
+            compaction_config,
         }
     }
 
@@ -496,6 +552,8 @@ where
                 });
             }
         }
+
+        self.compaction_state.l0_count_since_compaction += 1;
 
         let _ = reply.send(Ok(()));
     }
@@ -1072,7 +1130,12 @@ where
         });
 
         if let Some(effect) = effect {
-            let (events, new_acceptors) = self.process_commit_effect(&effect);
+            let committer_index = if proposal.member_id.0 != u32::MAX {
+                Some(proposal.member_id.0)
+            } else {
+                None
+            };
+            let (events, new_acceptors) = self.process_commit_effect(&effect, committer_index);
             for event in events {
                 let _ = self.event_tx.send(event);
             }
@@ -1096,6 +1159,7 @@ where
     fn process_commit_effect(
         &mut self,
         effect: &CommitEffect,
+        committer_index: Option<u32>,
     ) -> (Vec<GroupEvent>, Vec<(AcceptorId, EndpointAddr)>) {
         let applied_proposals = match effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
@@ -1108,6 +1172,17 @@ where
 
         let mut events = Vec::new();
         let mut new_acceptors = Vec::new();
+
+        // Determine the committer's fingerprint for compaction claim tracking
+        let committer_fingerprint = committer_index.and_then(|idx| {
+            self.learner
+                .group()
+                .roster()
+                .members()
+                .iter()
+                .find(|m| m.index == idx)
+                .map(|m| MemberFingerprint::from_signing_key(&m.signing_identity.signature_key))
+        });
 
         for proposal_info in applied_proposals {
             let event = match &proposal_info.proposal {
@@ -1137,6 +1212,67 @@ where
                         GroupEvent::AcceptorRemoved { id }
                     } else {
                         GroupEvent::ExtensionsUpdated
+                    }
+                }
+                MlsProposal::Custom(custom) => {
+                    if let Ok(claim) = CompactionClaim::from_custom_proposal(custom) {
+                        tracing::info!(
+                            level = claim.level,
+                            deadline = claim.deadline,
+                            watermark_entries = claim.watermark.len(),
+                            "received CompactionClaim"
+                        );
+
+                        let is_ours = committer_fingerprint
+                            .is_some_and(|fp| fp == self.own_fingerprint);
+
+                        self.compaction_state.active_claims.insert(
+                            claim.level,
+                            ActiveCompactionClaim {
+                                claimer: committer_fingerprint
+                                    .unwrap_or(self.own_fingerprint),
+                                level: claim.level,
+                                watermark: claim.watermark,
+                                deadline: claim.deadline,
+                                is_ours,
+                            },
+                        );
+
+                        GroupEvent::CompactionClaimed {
+                            level: claim.level,
+                        }
+                    } else if let Ok(complete) =
+                        CompactionComplete::from_custom_proposal(custom)
+                    {
+                        tracing::info!(
+                            level = complete.level,
+                            watermark_entries = complete.watermark.len(),
+                            "received CompactionComplete"
+                        );
+
+                        // Remove the active claim for this level
+                        self.compaction_state.active_claims.remove(&complete.level);
+
+                        // Update the compacted watermark
+                        for (fp, &seq) in &complete.watermark {
+                            let hw = self
+                                .compaction_state
+                                .last_compacted_watermark
+                                .entry(*fp)
+                                .or_insert(0);
+                            if seq > *hw {
+                                *hw = seq;
+                            }
+                        }
+
+                        // Reset L0 count since we just compacted
+                        self.compaction_state.l0_count_since_compaction = 0;
+
+                        GroupEvent::CompactionCompleted {
+                            level: complete.level,
+                        }
+                    } else {
+                        GroupEvent::Unknown
                     }
                 }
                 _ => GroupEvent::Unknown,
@@ -1235,6 +1371,8 @@ where
         if seq > *hw {
             *hw = seq;
         }
+
+        self.compaction_state.l0_count_since_compaction += 1;
 
         let _ = self.app_message_tx.try_send(app_msg.data().to_vec());
     }
