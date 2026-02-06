@@ -51,7 +51,7 @@ pub fn load_secret_key(path: impl AsRef<Path>) -> Result<[u8; 32], Report<KeyLoa
     let path = path.as_ref();
     let contents = std::fs::read(path)
         .change_context(KeyLoadError)
-        .attach_opaque_with(|| format!("reading key file: {}", path.display()))?;
+        .attach_with(|| format!("reading key file: {}", path.display()))?;
 
     // Try parsing as raw bytes first
     if let Ok(bytes) = contents.as_slice().try_into() {

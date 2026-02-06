@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use error_stack::{Report, ResultExt};
 use futures::{FutureExt, SinkExt, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
@@ -51,7 +52,10 @@ impl ConnectionManager {
         self.address_hints.write().await.insert(acceptor_id, addr);
     }
 
-    async fn get_connection(&self, acceptor_id: &AcceptorId) -> Result<Connection, ConnectorError> {
+    async fn get_connection(
+        &self,
+        acceptor_id: &AcceptorId,
+    ) -> Result<Connection, Report<ConnectorError>> {
         {
             let connections = self.connections.read().await;
             if let Some(conn) = connections.get(acceptor_id)
@@ -77,7 +81,7 @@ impl ConnectionManager {
             .endpoint
             .connect(addr, PAXOS_ALPN)
             .await
-            .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+            .change_context(ConnectorError)?;
 
         self.connections
             .write()
@@ -91,12 +95,10 @@ impl ConnectionManager {
         &self,
         acceptor_id: &AcceptorId,
         group_id: GroupId,
-    ) -> Result<(SendStream, RecvStream), ConnectorError> {
+    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
         let conn = self.get_connection(acceptor_id).await?;
-        let (send, recv) = self
-            .open_stream_with_handshake(&conn, Handshake::JoinProposals(group_id))
-            .await?;
-        Ok((send, recv))
+        self.open_stream_with_handshake(&conn, Handshake::JoinProposals(group_id))
+            .await
     }
 
     /// Creates a new (uncached) connection because the server handles one stream per connection.
@@ -104,15 +106,16 @@ impl ConnectionManager {
         &self,
         acceptor_id: &AcceptorId,
         group_id: GroupId,
-    ) -> Result<(SendStream, RecvStream), ConnectorError> {
+    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
         let conn = self.new_connection(acceptor_id).await?;
-        let (send, recv) = self
-            .open_stream_with_handshake(&conn, Handshake::JoinMessages(group_id))
-            .await?;
-        Ok((send, recv))
+        self.open_stream_with_handshake(&conn, Handshake::JoinMessages(group_id))
+            .await
     }
 
-    async fn new_connection(&self, acceptor_id: &AcceptorId) -> Result<Connection, ConnectorError> {
+    async fn new_connection(
+        &self,
+        acceptor_id: &AcceptorId,
+    ) -> Result<Connection, Report<ConnectorError>> {
         let addr = self
             .address_hints
             .read()
@@ -128,18 +131,15 @@ impl ConnectionManager {
         self.endpoint
             .connect(addr, PAXOS_ALPN)
             .await
-            .map_err(|e| ConnectorError::Connect(e.to_string()))
+            .change_context(ConnectorError)
     }
 
     async fn open_stream_with_handshake(
         &self,
         conn: &Connection,
         handshake: Handshake,
-    ) -> Result<(SendStream, RecvStream), ConnectorError> {
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
+        let (send, recv) = conn.open_bi().await.change_context(ConnectorError)?;
 
         let codec = LengthDelimitedCodec::builder()
             .max_frame_length(16 * 1024 * 1024)
@@ -147,36 +147,32 @@ impl ConnectionManager {
         let mut reader = FramedRead::new(recv, codec.clone());
         let mut writer = FramedWrite::new(send, codec);
 
-        let handshake_bytes =
-            postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+        let handshake_bytes = postcard::to_allocvec(&handshake).change_context(ConnectorError)?;
         writer
             .send(handshake_bytes.into())
             .await
-            .map_err(ConnectorError::Io)?;
+            .change_context(ConnectorError)?;
 
         let response_bytes = reader
             .next()
             .await
-            .ok_or_else(|| {
-                ConnectorError::Handshake("connection closed before response".to_string())
-            })?
-            .map_err(ConnectorError::Io)?;
+            .ok_or_else(|| Report::new(ConnectorError).attach("connection closed before response"))?
+            .change_context(ConnectorError)?;
 
         let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
-            .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
+            .change_context(ConnectorError)
+            .attach("invalid handshake response")?;
 
         match response {
             HandshakeResponse::Ok => {}
             HandshakeResponse::GroupNotFound => {
-                return Err(ConnectorError::Handshake("group not found".to_string()));
+                return Err(Report::new(ConnectorError).attach("group not found"));
             }
             HandshakeResponse::InvalidGroupInfo(e) => {
-                return Err(ConnectorError::Handshake(format!(
-                    "invalid group info: {e}"
-                )));
+                return Err(Report::new(ConnectorError).attach(format!("invalid group info: {e}")));
             }
             HandshakeResponse::Error(e) => {
-                return Err(ConnectorError::Handshake(e));
+                return Err(Report::new(ConnectorError).attach(e));
             }
         }
 

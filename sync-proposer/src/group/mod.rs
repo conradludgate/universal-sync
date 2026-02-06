@@ -235,11 +235,8 @@ where
             let mut group_context_extensions = mls_rs::ExtensionList::default();
             group_context_extensions
                 .set_from(CrdtRegistrationExt::new(&crdt_type_id))
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::CREATING_GROUP)
-                        .attach(format!("failed to set CRDT extension: {e:?}"))
-                })?;
+                .change_context(GroupError)
+                .attach(OperationContext::CREATING_GROUP)?;
 
             let group = client
                 .create_group(
@@ -247,11 +244,8 @@ where
                     mls_rs::ExtensionList::default(),
                     None,
                 )
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::CREATING_GROUP)
-                        .attach(format!("MLS group creation failed: {e:?}"))
-                })?;
+                .change_context(GroupError)
+                .attach(OperationContext::CREATING_GROUP)?;
 
             let mls_group_id = group.context().group_id.clone();
             let group_id = GroupId::from_slice(&mls_group_id);
@@ -260,16 +254,17 @@ where
             let group_info_bytes = if acceptors.is_empty() {
                 None
             } else {
-                let group_info_msg = learner.group().group_info_message(true).map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::CREATING_GROUP)
-                        .attach(format!("failed to create group info: {e:?}"))
-                })?;
-                Some(group_info_msg.to_bytes().map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::CREATING_GROUP)
-                        .attach(format!("failed to serialize group info: {e:?}"))
-                })?)
+                let group_info_msg = learner
+                    .group()
+                    .group_info_message(true)
+                    .change_context(GroupError)
+                    .attach(OperationContext::CREATING_GROUP)?;
+                Some(
+                    group_info_msg
+                        .to_bytes()
+                        .change_context(GroupError)
+                        .attach(OperationContext::CREATING_GROUP)?,
+                )
             };
 
             Ok::<_, Report<GroupError>>((learner, group_id, group_info_bytes))
@@ -281,10 +276,7 @@ where
             for addr in acceptors {
                 register_group_with_addr(endpoint, addr.clone(), &group_info_bytes)
                     .await
-                    .map_err(|e| {
-                        Report::new(GroupError)
-                            .attach(format!("failed to register with acceptor: {e:?}"))
-                    })?;
+                    .change_context(GroupError)?;
             }
         }
 
@@ -319,17 +311,14 @@ where
         CS: Clone,
     {
         let (learner, group_id, crdt_type_id, crdt_snapshot_opt) = blocking(|| {
-            let welcome = MlsMessage::from_bytes(welcome_bytes).map_err(|e| {
-                Report::new(GroupError)
-                    .attach(OperationContext::JOINING_GROUP)
-                    .attach(format!("invalid welcome message: {e:?}"))
-            })?;
+            let welcome = MlsMessage::from_bytes(welcome_bytes)
+                .change_context(GroupError)
+                .attach(OperationContext::JOINING_GROUP)?;
 
-            let (group, info) = client.join_group(None, &welcome, None).map_err(|e| {
-                Report::new(GroupError)
-                    .attach(OperationContext::JOINING_GROUP)
-                    .attach(format!("MLS join failed: {e:?}"))
-            })?;
+            let (group, info) = client
+                .join_group(None, &welcome, None)
+                .change_context(GroupError)
+                .attach(OperationContext::JOINING_GROUP)?;
 
             let mls_group_id = group.context().group_id.clone();
             let group_id = GroupId::from_slice(&mls_group_id);
@@ -337,11 +326,8 @@ where
             let acceptors = info
                 .group_info_extensions
                 .get_as::<AcceptorsExt>()
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::JOINING_GROUP)
-                        .attach(format!("failed to read acceptors extension: {e:?}"))
-                })?
+                .change_context(GroupError)
+                .attach(OperationContext::JOINING_GROUP)?
                 .map(|ext| ext.0)
                 .unwrap_or_default();
 
@@ -350,21 +336,15 @@ where
             let crdt_snapshot_opt = info
                 .group_info_extensions
                 .get_as::<CrdtSnapshotExt>()
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::JOINING_GROUP)
-                        .attach(format!("failed to read CRDT snapshot extension: {e:?}"))
-                })?;
+                .change_context(GroupError)
+                .attach(OperationContext::JOINING_GROUP)?;
 
             let crdt_type_id = group
                 .context()
                 .extensions
                 .get_as::<CrdtRegistrationExt>()
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(OperationContext::JOINING_GROUP)
-                        .attach(format!("failed to read CRDT extension: {e:?}"))
-                })?
+                .change_context(GroupError)
+                .attach(OperationContext::JOINING_GROUP)?
                 .map_or_else(|| "none".to_owned(), |ext| ext.type_id);
 
             let learner = GroupLearner::new(group, signer, cipher_suite, acceptors);
@@ -386,10 +366,7 @@ where
         let crdt = if let Some(snapshot_ext) = crdt_snapshot_opt {
             crdt_factory
                 .from_snapshot(snapshot_ext.snapshot())
-                .map_err(|e| {
-                    Report::new(GroupError)
-                        .attach(format!("failed to create CRDT from snapshot: {e:?}"))
-                })?
+                .change_context(GroupError)?
         } else {
             // No snapshot in welcome — start with an empty CRDT.
             // The member will catch up via backfill from acceptors after
@@ -462,10 +439,7 @@ where
             .ok_or_else(|| Report::new(GroupError).attach("message is not a key package"))?
             .extensions
             .get_as::<MemberAddrExt>()
-            .map_err(|e| {
-                Report::new(GroupError)
-                    .attach(format!("failed to read member address extension: {e:?}"))
-            })?
+            .change_context(GroupError)?
             .ok_or_else(|| {
                 Report::new(GroupError).attach(
                     "key package missing MemberAddrExt extension with member's endpoint address",
@@ -529,10 +503,7 @@ where
 
     /// Flush local CRDT changes and broadcast. No-op if no pending changes.
     pub async fn send_update(&mut self) -> Result<(), Report<GroupError>> {
-        let update = self
-            .crdt
-            .flush_update()
-            .map_err(|e| Report::new(GroupError).attach(format!("CRDT flush failed: {e:?}")))?;
+        let update = self.crdt.flush_update().change_context(GroupError)?;
 
         let Some(data) = update else {
             return Ok(());

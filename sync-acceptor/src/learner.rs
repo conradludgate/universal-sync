@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use error_stack::{Report, ResultExt};
 use futures::{SinkExt, StreamExt};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::sync::{mpsc, watch};
@@ -234,59 +235,51 @@ async fn run_peer_connection(
     acceptor_id: AcceptorId,
     current_round: Epoch,
     tx: &mpsc::Sender<PeerEvent>,
-) -> Result<Epoch, ConnectorError> {
+) -> Result<Epoch, Report<ConnectorError>> {
     use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
     use universal_sync_core::codec::PostcardCodec;
     use universal_sync_core::{Handshake, HandshakeResponse};
 
     tracing::debug!(?acceptor_id, "connecting to peer acceptor");
 
-    // Connect to the peer acceptor
     let conn = endpoint
         .connect(addr.clone(), PAXOS_ALPN)
         .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+        .change_context(ConnectorError)?;
 
-    // Open a bidirectional stream
-    let (send, recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+    let (send, recv) = conn.open_bi().await.change_context(ConnectorError)?;
 
-    // Handshake
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(16 * 1024 * 1024)
         .new_codec();
     let mut reader = FramedRead::new(recv, codec.clone());
     let mut writer = FramedWrite::new(send, codec);
 
-    // Send Join handshake
     let handshake = Handshake::JoinProposals(group_id);
-    let handshake_bytes =
-        postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+    let handshake_bytes = postcard::to_allocvec(&handshake).change_context(ConnectorError)?;
     writer
         .send(handshake_bytes.into())
         .await
-        .map_err(ConnectorError::Io)?;
+        .change_context(ConnectorError)?;
 
-    // Read response
     let response_bytes = reader
         .next()
         .await
-        .ok_or_else(|| ConnectorError::Handshake("connection closed".to_string()))?
-        .map_err(ConnectorError::Io)?;
+        .ok_or_else(|| Report::new(ConnectorError).attach("connection closed before response"))?
+        .change_context(ConnectorError)?;
 
     let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
-        .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
+        .change_context(ConnectorError)
+        .attach("invalid handshake response")?;
 
     match response {
         HandshakeResponse::Ok => {}
         other => {
-            return Err(ConnectorError::Handshake(format!("{other:?}")));
+            return Err(Report::new(ConnectorError)
+                .attach(format!("unexpected handshake response: {other:?}")));
         }
     }
 
-    // Extract streams and create protocol readers/writers
     let recv = reader.into_inner();
     let send = writer.into_inner();
 
@@ -295,32 +288,30 @@ async fn run_peer_connection(
     let mut writer: FramedWrite<iroh::endpoint::SendStream, PostcardCodec<ProposalRequest>> =
         FramedWrite::new(send, PostcardCodec::new());
 
-    // Send a sync Prepare to initiate the learning stream
-    // Use attempt=0 to indicate this is a learning request
     let sync_proposal = GroupProposal {
         member_id: universal_sync_core::MemberId(u32::MAX),
         epoch: current_round,
         attempt: universal_sync_core::Attempt::default(),
-        message_hash: [0u8; 32], // Will be filled by actual proposer
+        message_hash: [0u8; 32],
         signature: vec![],
     };
 
     writer
         .send(ProposalRequest::Prepare(sync_proposal))
         .await
-        .map_err(|e| ConnectorError::Io(std::io::Error::other(e)))?;
+        .map_err(std::io::Error::other)
+        .change_context(ConnectorError)?;
 
     tracing::debug!(?acceptor_id, "learning stream established");
 
-    // Track the last epoch we saw for resumption
     let mut last_epoch = current_round;
 
-    // Read accepted values and forward to learning actor
     while let Some(result) = reader.next().await {
-        let response = result.map_err(|e| ConnectorError::Io(std::io::Error::other(e)))?;
+        let response = result
+            .map_err(std::io::Error::other)
+            .change_context(ConnectorError)?;
 
         if let Some((proposal, message)) = response.accepted {
-            // Update last epoch for resumption
             if proposal.epoch > last_epoch {
                 last_epoch = proposal.epoch;
             }
@@ -331,7 +322,8 @@ async fn run_peer_connection(
                 message: Box::new(message),
             })
             .await
-            .map_err(|_| ConnectorError::Io(std::io::Error::other("channel closed")))?;
+            .map_err(|_| std::io::Error::other("channel closed"))
+            .change_context(ConnectorError)?;
         }
     }
 

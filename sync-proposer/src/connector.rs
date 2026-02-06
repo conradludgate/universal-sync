@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use error_stack::{Report, ResultExt};
 use futures::{SinkExt, StreamExt};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -43,7 +44,7 @@ where
     L::Error: From<ConnectorError> + universal_sync_core::FromIoError,
 {
     type Connection = IrohConnection<L, L::Error>;
-    type Error = ConnectorError;
+    type Error = Report<ConnectorError>;
     type ConnectFuture =
         Pin<Box<dyn Future<Output = Result<Self::Connection, Self::Error>> + Send>>;
 
@@ -65,12 +66,9 @@ where
             let conn = endpoint
                 .connect(addr, PAXOS_ALPN)
                 .await
-                .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+                .change_context(ConnectorError)?;
 
-            let (send, recv) = conn
-                .open_bi()
-                .await
-                .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+            let (send, recv) = conn.open_bi().await.change_context(ConnectorError)?;
 
             let codec = LengthDelimitedCodec::builder()
                 .max_frame_length(16 * 1024 * 1024)
@@ -79,36 +77,37 @@ where
             let mut writer = FramedWrite::new(send, codec);
 
             let handshake = Handshake::JoinProposals(group_id);
-            let handshake_bytes = postcard::to_allocvec(&handshake)
-                .map_err(|e| ConnectorError::Codec(e.to_string()))?;
+            let handshake_bytes =
+                postcard::to_allocvec(&handshake).change_context(ConnectorError)?;
             writer
                 .send(handshake_bytes.into())
                 .await
-                .map_err(ConnectorError::Io)?;
+                .change_context(ConnectorError)?;
 
             let response_bytes = reader
                 .next()
                 .await
                 .ok_or_else(|| {
-                    ConnectorError::Handshake("connection closed before response".to_string())
+                    Report::new(ConnectorError).attach("connection closed before response")
                 })?
-                .map_err(ConnectorError::Io)?;
+                .change_context(ConnectorError)?;
 
             let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
-                .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
+                .change_context(ConnectorError)
+                .attach("invalid handshake response")?;
 
             match response {
                 HandshakeResponse::Ok => {}
                 HandshakeResponse::GroupNotFound => {
-                    return Err(ConnectorError::Handshake("group not found".to_string()));
+                    return Err(Report::new(ConnectorError).attach("group not found"));
                 }
                 HandshakeResponse::InvalidGroupInfo(e) => {
-                    return Err(ConnectorError::Handshake(format!(
-                        "invalid group info: {e}"
-                    )));
+                    return Err(
+                        Report::new(ConnectorError).attach(format!("invalid group info: {e}"))
+                    );
                 }
                 HandshakeResponse::Error(e) => {
-                    return Err(ConnectorError::Handshake(e));
+                    return Err(Report::new(ConnectorError).attach(e));
                 }
             }
 
@@ -125,16 +124,13 @@ pub(crate) async fn register_group_with_addr(
     endpoint: &Endpoint,
     addr: impl Into<iroh::EndpointAddr>,
     group_info: &[u8],
-) -> Result<GroupId, ConnectorError> {
+) -> Result<GroupId, Report<ConnectorError>> {
     let conn = endpoint
         .connect(addr, PAXOS_ALPN)
         .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+        .change_context(ConnectorError)?;
 
-    let (send, recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+    let (send, recv) = conn.open_bi().await.change_context(ConnectorError)?;
 
     let codec = LengthDelimitedCodec::builder()
         .max_frame_length(16 * 1024 * 1024)
@@ -143,31 +139,31 @@ pub(crate) async fn register_group_with_addr(
     let mut writer = FramedWrite::new(send, codec);
 
     let handshake = Handshake::CreateGroup(group_info.to_vec());
-    let handshake_bytes =
-        postcard::to_allocvec(&handshake).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+    let handshake_bytes = postcard::to_allocvec(&handshake).change_context(ConnectorError)?;
     writer
         .send(handshake_bytes.into())
         .await
-        .map_err(ConnectorError::Io)?;
+        .change_context(ConnectorError)?;
 
     let response_bytes = reader
         .next()
         .await
-        .ok_or_else(|| ConnectorError::Handshake("connection closed before response".to_string()))?
-        .map_err(ConnectorError::Io)?;
+        .ok_or_else(|| Report::new(ConnectorError).attach("connection closed before response"))?
+        .change_context(ConnectorError)?;
 
     let response: HandshakeResponse = postcard::from_bytes(&response_bytes)
-        .map_err(|e| ConnectorError::Codec(format!("invalid response: {e}")))?;
+        .change_context(ConnectorError)
+        .attach("invalid handshake response")?;
 
     match response {
         HandshakeResponse::Ok => Ok(GroupId::from_slice(group_info)),
-        HandshakeResponse::GroupNotFound => Err(ConnectorError::Handshake(
-            "unexpected: group not found".to_string(),
-        )),
-        HandshakeResponse::InvalidGroupInfo(e) => Err(ConnectorError::Handshake(format!(
-            "invalid group info: {e}"
-        ))),
-        HandshakeResponse::Error(e) => Err(ConnectorError::Handshake(e)),
+        HandshakeResponse::GroupNotFound => {
+            Err(Report::new(ConnectorError).attach("unexpected: group not found"))
+        }
+        HandshakeResponse::InvalidGroupInfo(e) => {
+            Err(Report::new(ConnectorError).attach(format!("invalid group info: {e}")))
+        }
+        HandshakeResponse::Error(e) => Err(Report::new(ConnectorError).attach(e)),
     }
 }
 

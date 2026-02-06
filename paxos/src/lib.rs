@@ -146,7 +146,7 @@ pub trait Learner: Send + Sync + 'static {
 /// Implementations should handle backoff/retry logic internally.
 pub trait Connector<L: Learner>: Clone + Send + 'static {
     type Connection: AcceptorConn<L> + Send;
-    type Error: std::error::Error;
+    type Error: fmt::Debug + fmt::Display + Send + 'static;
     type ConnectFuture: Future<Output = Result<Self::Connection, Self::Error>> + Send;
 
     fn connect(&mut self, acceptor_id: &L::AcceptorId) -> Self::ConnectFuture;

@@ -5,48 +5,16 @@ use std::fmt;
 use crate::{AcceptorId, Epoch, GroupId, MemberId};
 
 /// Network connection error.
-#[derive(Debug)]
-pub enum ConnectorError {
-    Connect(String),
-    Codec(String),
-    Io(std::io::Error),
-    Handshake(String),
-}
+#[derive(Debug, Default)]
+pub struct ConnectorError;
 
 impl fmt::Display for ConnectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConnectorError::Connect(e) => write!(f, "connection failed: {e}"),
-            ConnectorError::Codec(e) => write!(f, "codec error: {e}"),
-            ConnectorError::Io(e) => write!(f, "IO error: {e}"),
-            ConnectorError::Handshake(e) => write!(f, "handshake failed: {e}"),
-        }
+        f.write_str("connection failed")
     }
 }
 
-impl std::error::Error for ConnectorError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            ConnectorError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for ConnectorError {
-    fn from(e: std::io::Error) -> Self {
-        ConnectorError::Io(e)
-    }
-}
-
-impl From<ConnectorError> for std::io::Error {
-    fn from(e: ConnectorError) -> Self {
-        match e {
-            ConnectorError::Io(io_err) => io_err,
-            other => std::io::Error::other(other),
-        }
-    }
-}
+impl std::error::Error for ConnectorError {}
 
 /// Error context: group.
 #[derive(Debug, Clone)]

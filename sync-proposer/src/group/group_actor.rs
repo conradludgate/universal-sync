@@ -334,10 +334,11 @@ where
         use crate::connector::register_group_with_addr;
 
         let group_info_bytes = blocking(|| {
-            let group_info =
-                self.learner.group().group_info_message(true).map_err(|e| {
-                    Report::new(GroupError).attach(format!("group info failed: {e:?}"))
-                })?;
+            let group_info = self
+                .learner
+                .group()
+                .group_info_message(true)
+                .change_context(GroupError)?;
             group_info.to_bytes().change_context(GroupError)
         })?;
 
@@ -457,9 +458,7 @@ where
                 .first()
                 .ok_or_else(|| Report::new(GroupError).attach("no welcome message generated"))?
                 .to_bytes()
-                .map_err(|e| {
-                    Report::new(GroupError).attach(format!("welcome serialization failed: {e:?}"))
-                })?;
+                .change_context(GroupError)?;
 
             Ok::<_, Report<GroupError>>((commit_output, welcome_bytes))
         });
@@ -541,22 +540,18 @@ where
                 .encrypt_application_message(data, authenticated_data)
         });
 
-        let mls_message = match result {
+        let mls_message = match result.change_context(GroupError) {
             Ok(msg) => msg,
             Err(e) => {
-                let _ = reply.send(Err(
-                    Report::new(GroupError).attach(format!("encrypt failed: {e:?}"))
-                ));
+                let _ = reply.send(Err(e));
                 return;
             }
         };
 
-        let ciphertext = match mls_message.to_bytes() {
+        let ciphertext = match mls_message.to_bytes().change_context(GroupError) {
             Ok(bytes) => bytes,
             Err(e) => {
-                let _ = reply.send(Err(
-                    Report::new(GroupError).attach(format!("serialize failed: {e:?}"))
-                ));
+                let _ = reply.send(Err(e));
                 return;
             }
         };
@@ -914,24 +909,19 @@ where
             .endpoint
             .connect(member_addr.clone(), PAXOS_ALPN)
             .await
-            .map_err(|e| {
-                Report::new(GroupError).attach(format!("failed to connect to new member: {e:?}"))
-            })?;
+            .change_context(GroupError)?;
 
-        let (send, _recv) = conn.open_bi().await.map_err(|e| {
-            Report::new(GroupError).attach(format!("failed to open stream to new member: {e:?}"))
-        })?;
+        let (send, _recv) = conn.open_bi().await.change_context(GroupError)?;
 
         let mut framed = FramedWrite::new(send, LengthDelimitedCodec::new());
 
         let handshake = Handshake::SendWelcome(welcome.to_vec());
-        let handshake_bytes = postcard::to_stdvec(&handshake).map_err(|e| {
-            Report::new(GroupError).attach(format!("failed to serialize handshake: {e:?}"))
-        })?;
+        let handshake_bytes = postcard::to_stdvec(&handshake).change_context(GroupError)?;
 
-        framed.send(handshake_bytes.into()).await.map_err(|e| {
-            Report::new(GroupError).attach(format!("failed to send welcome: {e:?}"))
-        })?;
+        framed
+            .send(handshake_bytes.into())
+            .await
+            .change_context(GroupError)?;
 
         let mut send = framed.into_inner();
         send.finish().change_context(GroupError)?;

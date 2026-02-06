@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::SignatureSecretKey;
@@ -85,21 +85,18 @@ where
     pub fn generate_key_package(&self) -> Result<MlsMessage, Report<GroupError>> {
         let member_addr_ext = MemberAddrExt::new(self.connection_manager.endpoint().addr());
         let mut kp_extensions = ExtensionList::default();
-        kp_extensions.set_from(member_addr_ext).map_err(|e| {
-            Report::new(GroupError).attach(format!("failed to set member address extension: {e:?}"))
-        })?;
+        kp_extensions
+            .set_from(member_addr_ext)
+            .change_context(GroupError)?;
 
         let supported_crdts = SupportedCrdtsExt::new(self.crdt_factories.keys().cloned());
-        kp_extensions.set_from(supported_crdts).map_err(|e| {
-            Report::new(GroupError)
-                .attach(format!("failed to set supported CRDTs extension: {e:?}"))
-        })?;
+        kp_extensions
+            .set_from(supported_crdts)
+            .change_context(GroupError)?;
 
         self.client
             .generate_key_package_message(kp_extensions, ExtensionList::default(), None)
-            .map_err(|e| {
-                Report::new(GroupError).attach(format!("failed to generate key package: {e:?}"))
-            })
+            .change_context(GroupError)
     }
 
     /// Create a new group, optionally registering with acceptors.

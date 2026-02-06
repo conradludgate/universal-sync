@@ -1,5 +1,6 @@
 //! Server-side connection handling for acceptors.
 
+use error_stack::{Report, ResultExt};
 use futures::{SinkExt, StreamExt};
 use iroh::endpoint::{Incoming, RecvStream, SendStream};
 use mls_rs::CipherSuiteProvider;
@@ -57,31 +58,28 @@ pub(crate) fn new_message_connection(send: SendStream, recv: RecvStream) -> Iroh
 pub async fn accept_connection<C, CS>(
     incoming: Incoming,
     registry: AcceptorRegistry<C, CS>,
-) -> Result<(), ConnectorError>
+) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
     let conn = incoming
         .accept()
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?
+        .change_context(ConnectorError)?
         .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+        .change_context(ConnectorError)?;
 
     let alpn = conn.alpn();
     if alpn != PAXOS_ALPN {
         warn!(?alpn, "unexpected ALPN, closing connection");
-        return Err(ConnectorError::Connect("unexpected ALPN".to_string()));
+        return Err(Report::new(ConnectorError).attach("unexpected ALPN"));
     }
 
     let remote_id = conn.remote_id();
     debug!(?remote_id, "accepted connection");
 
     loop {
-        let (send, recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+        let (send, recv) = conn.accept_bi().await.change_context(ConnectorError)?;
 
         tokio::spawn(handle_stream(send, recv, registry.clone()));
     }
@@ -92,7 +90,7 @@ async fn handle_stream<C, CS>(
     send: SendStream,
     recv: RecvStream,
     registry: AcceptorRegistry<C, CS>,
-) -> Result<(), ConnectorError>
+) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
@@ -106,11 +104,12 @@ where
     let handshake_bytes = reader
         .next()
         .await
-        .ok_or_else(|| ConnectorError::Connect("stream closed before handshake".to_string()))?
-        .map_err(ConnectorError::Io)?;
+        .ok_or_else(|| Report::new(ConnectorError).attach("stream closed before handshake"))?
+        .change_context(ConnectorError)?;
 
     let handshake: Handshake = postcard::from_bytes(&handshake_bytes)
-        .map_err(|e| ConnectorError::Codec(format!("invalid handshake: {e}")))?;
+        .change_context(ConnectorError)
+        .attach("invalid handshake")?;
 
     match handshake {
         Handshake::JoinProposals(group_id) => {
@@ -129,9 +128,9 @@ where
         Handshake::JoinMessages(group_id) => {
             handle_message_stream(group_id, reader, writer, registry).await
         }
-        Handshake::SendWelcome(_) => Err(ConnectorError::Handshake(
-            "acceptors do not handle welcome messages".to_string(),
-        )),
+        Handshake::SendWelcome(_) => {
+            Err(Report::new(ConnectorError).attach("acceptors do not handle welcome messages"))
+        }
     }
 }
 
@@ -142,7 +141,7 @@ async fn handle_proposal_stream<C, CS>(
     reader: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
     registry: AcceptorRegistry<C, CS>,
-) -> Result<(), ConnectorError>
+) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
@@ -154,17 +153,16 @@ where
                 (acceptor, state)
             }
             Err(e) => {
-                warn!(%e, "failed to create group from GroupInfo");
-                let response = HandshakeResponse::InvalidGroupInfo(e.clone());
-                let response_bytes = postcard::to_allocvec(&response)
-                    .map_err(|e| ConnectorError::Codec(e.to_string()))?;
+                warn!(?e, "failed to create group from GroupInfo");
+                let msg = format!("{e:?}");
+                let response = HandshakeResponse::InvalidGroupInfo(msg);
+                let response_bytes =
+                    postcard::to_allocvec(&response).change_context(ConnectorError)?;
                 writer
                     .send(response_bytes.into())
                     .await
-                    .map_err(ConnectorError::Io)?;
-                return Err(ConnectorError::Connect(format!(
-                    "failed to create group: {e}"
-                )));
+                    .change_context(ConnectorError)?;
+                return Err(e.change_context(ConnectorError));
             }
         }
     } else if let Some((acceptor, state)) = registry.get_group(&group_id) {
@@ -172,31 +170,29 @@ where
     } else {
         warn!(?group_id, "group not found for proposal stream");
         let response = HandshakeResponse::GroupNotFound;
-        let response_bytes =
-            postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+        let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
         writer
             .send(response_bytes.into())
             .await
-            .map_err(ConnectorError::Io)?;
-        return Err(ConnectorError::Connect("group not found".to_string()));
+            .change_context(ConnectorError)?;
+        return Err(Report::new(ConnectorError).attach("group not found"));
     };
 
     debug!(?group_id, "proposal stream handshake complete");
 
     let response = HandshakeResponse::Ok;
-    let response_bytes =
-        postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
     writer
         .send(response_bytes.into())
         .await
-        .map_err(ConnectorError::Io)?;
+        .change_context(ConnectorError)?;
 
     let recv = reader.into_inner();
     let send = writer.into_inner();
 
     let connection = new_acceptor_connection::<
         GroupAcceptor<C, CS>,
-        error_stack::Report<crate::acceptor::AcceptorError>,
+        Report<crate::acceptor::AcceptorError>,
     >(send, recv);
 
     let handler = AcceptorHandler::new(acceptor, state);
@@ -208,7 +204,7 @@ where
 
     run_acceptor_with_epoch_waiter(handler, connection, proposer_id, epoch_rx, current_epoch_fn)
         .await
-        .map_err(|e| ConnectorError::Connect(e.to_string()))?;
+        .change_context(ConnectorError)?;
 
     debug!(?group_id, "proposal stream closed");
     Ok(())
@@ -220,7 +216,7 @@ async fn handle_message_stream<C, CS>(
     reader: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
     registry: AcceptorRegistry<C, CS>,
-) -> Result<(), ConnectorError>
+) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
@@ -228,24 +224,22 @@ where
     if registry.get_group(&group_id).is_none() {
         warn!("group not found for message stream");
         let response = HandshakeResponse::GroupNotFound;
-        let response_bytes =
-            postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+        let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
         writer
             .send(response_bytes.into())
             .await
-            .map_err(ConnectorError::Io)?;
-        return Err(ConnectorError::Connect("group not found".to_string()));
+            .change_context(ConnectorError)?;
+        return Err(Report::new(ConnectorError).attach("group not found"));
     }
 
     debug!("message stream handshake complete");
 
     let response = HandshakeResponse::Ok;
-    let response_bytes =
-        postcard::to_allocvec(&response).map_err(|e| ConnectorError::Codec(e.to_string()))?;
+    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
     writer
         .send(response_bytes.into())
         .await
-        .map_err(ConnectorError::Io)?;
+        .change_context(ConnectorError)?;
 
     let recv = reader.into_inner();
     let send = writer.into_inner();
@@ -260,7 +254,7 @@ where
                     break;
                 };
 
-                let request = request?;
+                let request = request.change_context(ConnectorError)?;
                 handle_message_request(&group_id, request, &mut connection, &registry).await?;
             }
 
@@ -268,7 +262,7 @@ where
                 match msg {
                     Ok((id, message)) => {
                         let response = MessageResponse::Message { id, message };
-                        connection.send(response).await?;
+                        connection.send(response).await.change_context(ConnectorError)?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -286,7 +280,7 @@ async fn handle_message_request<C, CS>(
     request: MessageRequest,
     connection: &mut IrohMessageConnection,
     registry: &AcceptorRegistry<C, CS>,
-) -> Result<(), ConnectorError>
+) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
@@ -295,10 +289,16 @@ where
         MessageRequest::Send { id, message } => {
             match registry.store_message(group_id, &id, &message) {
                 Ok(()) => {
-                    connection.send(MessageResponse::Stored).await?;
+                    connection
+                        .send(MessageResponse::Stored)
+                        .await
+                        .change_context(ConnectorError)?;
                 }
                 Err(e) => {
-                    connection.send(MessageResponse::Error(e)).await?;
+                    connection
+                        .send(MessageResponse::Error(format!("{e:?}")))
+                        .await
+                        .change_context(ConnectorError)?;
                 }
             }
         }
@@ -308,25 +308,23 @@ where
         MessageRequest::Backfill {
             state_vector,
             limit,
-        } => match registry.get_messages_after(group_id, &state_vector) {
-            Ok(messages) => {
-                let has_more = messages.len() > limit as usize;
-                let messages: Vec<_> = messages.into_iter().take(limit as usize).collect();
+        } => {
+            let messages = registry.get_messages_after(group_id, &state_vector);
+            let has_more = messages.len() > limit as usize;
+            let messages: Vec<_> = messages.into_iter().take(limit as usize).collect();
 
-                for (id, message) in messages {
-                    connection
-                        .send(MessageResponse::Message { id, message })
-                        .await?;
-                }
-
+            for (id, message) in messages {
                 connection
-                    .send(MessageResponse::BackfillComplete { has_more })
-                    .await?;
+                    .send(MessageResponse::Message { id, message })
+                    .await
+                    .change_context(ConnectorError)?;
             }
-            Err(e) => {
-                connection.send(MessageResponse::Error(e)).await?;
-            }
-        },
+
+            connection
+                .send(MessageResponse::BackfillComplete { has_more })
+                .await
+                .change_context(ConnectorError)?;
+        }
     }
 
     Ok(())

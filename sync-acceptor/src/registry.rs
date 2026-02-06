@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use error_stack::{Report, ResultExt};
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::external_client::{ExternalClient, ExternalGroup};
@@ -11,6 +12,17 @@ use mls_rs::{CipherSuiteProvider, ExtensionList, MlsMessage};
 use tokio::sync::watch;
 use universal_sync_core::{ACCEPTORS_EXTENSION_TYPE, AcceptorId, AcceptorsExt, Epoch, GroupId};
 use universal_sync_paxos::Learner;
+
+#[derive(Debug)]
+pub struct RegistryError;
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("registry operation failed")
+    }
+}
+
+impl std::error::Error for RegistryError {}
 
 use crate::acceptor::GroupAcceptor;
 use crate::learner::GroupLearningActor;
@@ -99,14 +111,16 @@ where
     fn create_acceptor_from_bytes(
         &self,
         group_info_bytes: &[u8],
-    ) -> Result<GroupAcceptor<C, CS>, String> {
+    ) -> Result<GroupAcceptor<C, CS>, Report<RegistryError>> {
         let mls_message = MlsMessage::from_bytes(group_info_bytes)
-            .map_err(|e| format!("failed to parse MLS message: {e}"))?;
+            .change_context(RegistryError)
+            .attach("failed to parse MLS message")?;
 
         let external_group = self
             .external_client
             .observe_group(mls_message, None, None)
-            .map_err(|e| format!("failed to observe group: {e}"))?;
+            .change_context(RegistryError)
+            .attach("failed to observe group")?;
 
         let acceptors = Self::extract_acceptors_from_group(&external_group);
 
@@ -158,14 +172,16 @@ where
     pub fn create_group(
         &self,
         group_info_bytes: &[u8],
-    ) -> Result<(GroupId, GroupAcceptor<C, CS>, GroupStateStore), String> {
+    ) -> Result<(GroupId, GroupAcceptor<C, CS>, GroupStateStore), Report<RegistryError>> {
         let mls_message = MlsMessage::from_bytes(group_info_bytes)
-            .map_err(|e| format!("failed to parse MLS message: {e}"))?;
+            .change_context(RegistryError)
+            .attach("failed to parse MLS message")?;
 
         let external_group = self
             .external_client
             .observe_group(mls_message, None, None)
-            .map_err(|e| format!("failed to observe group: {e}"))?;
+            .change_context(RegistryError)
+            .attach("failed to observe group")?;
 
         let mls_group_id = external_group.group_context().group_id.clone();
         let group_id = GroupId::from_slice(&mls_group_id);
@@ -180,7 +196,8 @@ where
 
         self.state_store
             .store_group(&group_id, group_info_bytes)
-            .map_err(|e| format!("failed to persist group: {e}"))?;
+            .change_context(RegistryError)
+            .attach("failed to persist group")?;
 
         let state = self.state_store.for_group(group_id);
 
@@ -202,24 +219,22 @@ where
         group_id: &GroupId,
         id: &universal_sync_core::MessageId,
         msg: &universal_sync_core::EncryptedAppMessage,
-    ) -> Result<(), String> {
+    ) -> Result<(), Report<RegistryError>> {
         self.state_store
             .store_app_message(group_id, id, msg)
-            .map_err(|e| format!("failed to store message: {e}"))
+            .change_context(RegistryError)
+            .attach("failed to store message")
     }
 
     pub fn get_messages_after(
         &self,
         group_id: &GroupId,
         state_vector: &universal_sync_core::StateVector,
-    ) -> Result<
-        Vec<(
-            universal_sync_core::MessageId,
-            universal_sync_core::EncryptedAppMessage,
-        )>,
-        String,
-    > {
-        Ok(self.state_store.get_messages_after(group_id, state_vector))
+    ) -> Vec<(
+        universal_sync_core::MessageId,
+        universal_sync_core::EncryptedAppMessage,
+    )> {
+        self.state_store.get_messages_after(group_id, state_vector)
     }
 
     pub fn subscribe_messages(

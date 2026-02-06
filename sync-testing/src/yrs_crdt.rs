@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use error_stack::{Report, ResultExt};
 use universal_sync_core::{CompactionConfig, Crdt, CrdtError, CrdtFactory};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
@@ -48,7 +49,7 @@ impl YrsCrdt {
         self.doc.transact().state_vector()
     }
 
-    pub fn encode_diff(&self, sv: &StateVector) -> Result<Vec<u8>, CrdtError> {
+    pub fn encode_diff(&self, sv: &StateVector) -> Result<Vec<u8>, Report<CrdtError>> {
         let txn = self.doc.transact();
         Ok(txn.encode_diff_v1(sv))
     }
@@ -73,29 +74,27 @@ impl Crdt for YrsCrdt {
         self
     }
 
-    fn apply(&mut self, operation: &[u8]) -> Result<(), CrdtError> {
-        let update = Update::decode_v1(operation)
-            .map_err(|e| CrdtError::new(format!("decode error: {e}")))?;
+    fn apply(&mut self, operation: &[u8]) -> Result<(), Report<CrdtError>> {
+        let update = Update::decode_v1(operation).change_context(CrdtError)?;
 
         self.doc
             .transact_mut()
             .apply_update(update)
-            .map_err(|e| CrdtError::new(format!("apply error: {e}")))?;
+            .change_context(CrdtError)?;
 
         Ok(())
     }
 
-    fn merge(&mut self, snapshot: &[u8]) -> Result<(), CrdtError> {
-        // In Yrs, merging a snapshot is the same as applying a full-state update
+    fn merge(&mut self, snapshot: &[u8]) -> Result<(), Report<CrdtError>> {
         self.apply(snapshot)
     }
 
-    fn snapshot(&self) -> Result<Vec<u8>, CrdtError> {
+    fn snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
         let txn = self.doc.transact();
         Ok(txn.encode_state_as_update_v1(&StateVector::default()))
     }
 
-    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, CrdtError> {
+    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
         let txn = self.doc.transact();
         let current_sv = txn.state_vector();
         if current_sv == self.last_flushed_sv {
@@ -172,7 +171,7 @@ impl CrdtFactory for YrsCrdtFactory {
         Box::new(crdt)
     }
 
-    fn from_snapshot(&self, snapshot: &[u8]) -> Result<Box<dyn Crdt>, CrdtError> {
+    fn from_snapshot(&self, snapshot: &[u8]) -> Result<Box<dyn Crdt>, Report<CrdtError>> {
         let mut crdt = if let Some(ref generator) = self.client_id {
             YrsCrdt::with_client_id(generator())
         } else {

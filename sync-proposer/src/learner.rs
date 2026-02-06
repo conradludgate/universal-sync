@@ -342,11 +342,9 @@ where
         }
 
         // Verify the signature
-        self.verify_proposal(proposal).map_err(|e| {
-            Report::new(ValidationError)
-                .attach("signature verification failed")
-                .attach(format!("{e:?}"))
-        })?;
+        self.verify_proposal(proposal)
+            .change_context(ValidationError)
+            .attach("signature verification failed")?;
 
         Ok(Validated::assert_valid())
     }
