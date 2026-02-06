@@ -59,6 +59,10 @@ where
     compaction_state: CompactionState,
     compaction_config: CompactionConfig,
     crdt_factory: Arc<dyn CrdtFactory>,
+    /// Raw CRDT update bytes accumulated since the last compaction.
+    /// Used by the compaction executor to merge updates without re-fetching
+    /// from acceptors.
+    update_buffer: Vec<Vec<u8>>,
 }
 
 struct ActiveProposal {
@@ -100,6 +104,15 @@ struct ActiveCompactionClaim {
     is_ours: bool,
 }
 
+/// A compaction that we've claimed and need to execute.
+#[derive(Debug, Clone)]
+struct PendingCompaction {
+    /// The level to compact into.
+    level: u8,
+    /// The watermark (state vector) up to which we're compacting.
+    watermark: StateVector,
+}
+
 /// Tracks compaction state for the group.
 #[derive(Debug, Default)]
 struct CompactionState {
@@ -109,6 +122,8 @@ struct CompactionState {
     l0_count_since_compaction: u64,
     /// The watermark that was last compacted (messages at or below this are compacted).
     last_compacted_watermark: StateVector,
+    /// Compactions we've claimed and need to execute.
+    pending_executions: Vec<PendingCompaction>,
 }
 
 impl CompactionState {
@@ -190,6 +205,7 @@ where
             compaction_state: CompactionState::default(),
             compaction_config,
             crdt_factory,
+            update_buffer: Vec::new(),
         }
     }
 
@@ -230,6 +246,10 @@ where
                     self.maybe_trigger_compaction().await;
                 }
             }
+
+            // After processing any event, check for pending compaction executions
+            // (outside select! to avoid recursive async issues)
+            self.execute_pending_compactions().await;
         }
 
         for (_, handle) in self.acceptor_handles.drain() {
@@ -517,6 +537,9 @@ where
         let seq = self.message_seq;
         self.message_seq += 1;
         self.state_vector.insert(self.own_fingerprint, seq);
+
+        // Buffer the raw CRDT update for compaction
+        self.update_buffer.push(data.to_vec());
 
         let authenticated_data = seq.to_be_bytes().to_vec();
 
@@ -1241,17 +1264,28 @@ where
                         let is_ours = committer_fingerprint
                             .is_some_and(|fp| fp == self.own_fingerprint);
 
-                        self.compaction_state.active_claims.insert(
-                            claim.level,
-                            ActiveCompactionClaim {
-                                claimer: committer_fingerprint
-                                    .unwrap_or(self.own_fingerprint),
-                                level: claim.level,
-                                watermark: claim.watermark,
-                                deadline: claim.deadline,
-                                is_ours,
-                            },
-                        );
+                        let active_claim = ActiveCompactionClaim {
+                            claimer: committer_fingerprint
+                                .unwrap_or(self.own_fingerprint),
+                            level: claim.level,
+                            watermark: claim.watermark.clone(),
+                            deadline: claim.deadline,
+                            is_ours,
+                        };
+
+                        self.compaction_state
+                            .active_claims
+                            .insert(claim.level, active_claim);
+
+                        // If this is our claim, schedule compaction execution
+                        if is_ours {
+                            self.compaction_state.pending_executions.push(
+                                PendingCompaction {
+                                    level: claim.level,
+                                    watermark: claim.watermark,
+                                },
+                            );
+                        }
 
                         GroupEvent::CompactionClaimed {
                             level: claim.level,
@@ -1282,6 +1316,9 @@ where
 
                         // Reset L0 count since we just compacted
                         self.compaction_state.l0_count_since_compaction = 0;
+
+                        // Clear the update buffer — these updates are now compacted
+                        self.update_buffer.clear();
 
                         GroupEvent::CompactionCompleted {
                             level: complete.level,
@@ -1389,7 +1426,11 @@ where
 
         self.compaction_state.l0_count_since_compaction += 1;
 
-        let _ = self.app_message_tx.try_send(app_msg.data().to_vec());
+        // Buffer the raw CRDT update for compaction
+        let data = app_msg.data().to_vec();
+        self.update_buffer.push(data.clone());
+
+        let _ = self.app_message_tx.try_send(data);
     }
 
     // ---- Compaction coordination ----
@@ -1441,6 +1482,162 @@ where
 
             // Only trigger one level at a time
             break;
+        }
+    }
+
+    /// Execute all pending compactions that we've claimed.
+    async fn execute_pending_compactions(&mut self) {
+        let pending = std::mem::take(&mut self.compaction_state.pending_executions);
+
+        for compaction in pending {
+            self.execute_compaction(compaction).await;
+        }
+    }
+
+    /// Execute a single compaction: merge buffered updates, encrypt the result,
+    /// send to acceptors at the appropriate replication level, and submit
+    /// a CompactionComplete commit.
+    async fn execute_compaction(&mut self, compaction: PendingCompaction) {
+        if self.update_buffer.is_empty() {
+            tracing::debug!(level = compaction.level, "no updates to compact, skipping");
+            return;
+        }
+
+        tracing::info!(
+            level = compaction.level,
+            update_count = self.update_buffer.len(),
+            "executing compaction"
+        );
+
+        // Merge all buffered updates into a single snapshot
+        let update_refs: Vec<&[u8]> = self.update_buffer.iter().map(|v| v.as_slice()).collect();
+        let compacted = match self.crdt_factory.compact(None, &update_refs) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(?e, level = compaction.level, "compaction merge failed");
+                return;
+            }
+        };
+
+        tracing::info!(
+            level = compaction.level,
+            original_updates = self.update_buffer.len(),
+            compacted_size = compacted.len(),
+            "compaction merge complete"
+        );
+
+        // Send the compacted snapshot as an encrypted app message to acceptors.
+        // Use the level-specific replication factor.
+        let seq = self.message_seq;
+        self.message_seq += 1;
+        self.state_vector.insert(self.own_fingerprint, seq);
+
+        let authenticated_data = seq.to_be_bytes().to_vec();
+        let mls_message = match blocking(|| {
+            self.learner
+                .encrypt_application_message(&compacted, authenticated_data)
+        }) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::warn!(?e, "failed to encrypt compacted message");
+                return;
+            }
+        };
+
+        let ciphertext = match mls_message.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(?e, "failed to serialize compacted message");
+                return;
+            }
+        };
+
+        let encrypted_msg = EncryptedAppMessage {
+            ciphertext,
+        };
+
+        let message_id = MessageId {
+            group_id: self.group_id,
+            sender: self.own_fingerprint,
+            seq,
+        };
+
+        // Determine replication count for this level
+        let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
+        let replication = self
+            .compaction_config
+            .replication
+            .get(compaction.level as usize)
+            .copied()
+            .unwrap_or(0);
+        let delivery_count = if replication == 0 {
+            acceptor_ids.len()
+        } else {
+            crate::rendezvous::delivery_count_for_level(acceptor_ids.len(), replication)
+        };
+
+        let selected =
+            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
+
+        tracing::info!(
+            level = compaction.level,
+            delivery_count,
+            total_acceptors = acceptor_ids.len(),
+            "sending compacted message to acceptors"
+        );
+
+        for acceptor_id in selected {
+            if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
+                let _ = tx.try_send(AcceptorOutbound::AppMessage {
+                    id: message_id,
+                    msg: encrypted_msg.clone(),
+                });
+            }
+        }
+
+        // Now submit CompactionComplete to tell acceptors to delete old messages
+        self.submit_compaction_complete(compaction.level, compaction.watermark)
+            .await;
+    }
+
+    /// Build and submit a CompactionComplete commit through Paxos consensus.
+    async fn submit_compaction_complete(&mut self, level: u8, watermark: StateVector) {
+        let complete = CompactionComplete { level, watermark };
+
+        let custom_proposal = match complete.to_custom_proposal() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(?e, "failed to encode CompactionComplete proposal");
+                return;
+            }
+        };
+
+        let result = blocking(|| {
+            self.learner
+                .group_mut()
+                .commit_builder()
+                .custom_proposal(custom_proposal)
+                .build()
+                .change_context(GroupError)
+        });
+
+        match result {
+            Ok(commit_output) => {
+                let message = GroupMessage::new(commit_output.commit_message);
+                let (reply_tx, reply_rx) = oneshot::channel();
+                self.start_proposal(message, reply_tx).await;
+
+                tokio::spawn(async move {
+                    match reply_rx.await {
+                        Ok(Ok(())) => tracing::info!("compaction complete commit accepted"),
+                        Ok(Err(e)) => tracing::warn!(?e, "compaction complete commit failed"),
+                        Err(_) => tracing::debug!("compaction complete reply dropped"),
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to build compaction complete commit");
+            }
         }
     }
 
