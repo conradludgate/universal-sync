@@ -136,10 +136,7 @@ pub struct GroupInfoExt {
 
 impl GroupInfoExt {
     #[must_use]
-    pub fn new(
-        acceptors: impl IntoIterator<Item = EndpointAddr>,
-        snapshot: Vec<u8>,
-    ) -> Self {
+    pub fn new(acceptors: impl IntoIterator<Item = EndpointAddr>, snapshot: Vec<u8>) -> Self {
         Self {
             acceptors: acceptors.into_iter().collect(),
             snapshot,

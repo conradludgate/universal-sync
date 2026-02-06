@@ -362,6 +362,15 @@ mod tests {
     }
 
     #[test]
+    fn test_from_snapshot_empty_bytes_fails() {
+        let factory = YrsCrdtFactory::new();
+        assert!(
+            factory.from_snapshot(&[]).is_err(),
+            "empty bytes should fail to decode as a yrs update"
+        );
+    }
+
+    #[test]
     fn test_concurrent_edits() {
         let mut crdt1 = YrsCrdt::with_client_id(1);
         let mut crdt2 = YrsCrdt::with_client_id(2);

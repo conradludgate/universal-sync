@@ -2226,3 +2226,165 @@ async fn test_compaction_after_member_removal() {
     carol_group.shutdown().await;
     acceptor_task.abort();
 }
+
+/// Test: `crdt_type_id` set at group creation survives the welcome and is
+/// readable by the joining member.
+#[tokio::test]
+async fn test_crdt_type_id_survives_join() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Bob joins
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob kp");
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    // Bob successfully joined with a Yrs CRDT — if the crdt_type_id
+    // were lost, join_group would fail with "CRDT type not registered".
+    let bob_ctx = bob_group.context().await.expect("bob context");
+    assert_eq!(bob_ctx.acceptors.len(), 1);
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}
+
+/// Test: acceptor receives the acceptor list via GroupInfoExt in the
+/// GroupInfo message, and a second member joining also gets the list.
+#[tokio::test]
+async fn test_acceptor_list_in_group_info() {
+    init_tracing();
+
+    let (acceptor1_task, acceptor1_addr, _dir1) = spawn_acceptor().await;
+    let (acceptor2_task, acceptor2_addr, _dir2) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+    let mut alice_group = alice
+        .create_group(&[acceptor1_addr.clone(), acceptor2_addr.clone()], "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let alice_ctx = alice_group.context().await.expect("alice context");
+    assert_eq!(alice_ctx.acceptors.len(), 2, "alice should see 2 acceptors");
+
+    // Bob joins — should receive both acceptors from the welcome GroupInfoExt
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob kp");
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    let bob_ctx = bob_group.context().await.expect("bob context");
+    assert_eq!(bob_ctx.acceptors.len(), 2, "bob should see 2 acceptors");
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    drop(_dir1);
+    drop(_dir2);
+    acceptor1_task.abort();
+    acceptor2_task.abort();
+}
+
+/// Test: messages reach the correct subset of acceptors when multiple
+/// acceptors are present, and a joiner can still sync via backfill.
+#[tokio::test]
+async fn test_multi_acceptor_message_delivery() {
+    init_tracing();
+
+    let (acceptor1_task, acceptor1_addr, _dir1) = spawn_acceptor().await;
+    let (acceptor2_task, acceptor2_addr, _dir2) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let config = test_compaction_config(4);
+    let alice = test_yrs_group_client_with_config("alice", test_endpoint().await, config.clone());
+    let mut alice_group = alice
+        .create_group(&[acceptor1_addr.clone(), acceptor2_addr.clone()], "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Alice writes a few messages (below compaction threshold)
+    yrs_insert_and_send(&mut alice_group, 0, "hello").await;
+    yrs_insert_and_send(&mut alice_group, 5, " world").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bob joins and should sync the data via backfill from acceptors
+    let mut bob = test_yrs_group_client_with_config("bob", test_endpoint().await, config);
+    let bob_kp = bob.generate_key_package().expect("bob kp");
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    let expected = yrs_get_text(&alice_group);
+    assert!(!expected.is_empty(), "alice should have text");
+    wait_for_sync(&mut bob_group, &expected, 10).await;
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor1_task.abort();
+    acceptor2_task.abort();
+}
+
+/// Test: `YrsCrdt::from_snapshot` with empty bytes behaves like a fresh CRDT
+/// (the join path treats an empty snapshot as "no snapshot").
+#[tokio::test]
+async fn test_empty_snapshot_join() {
+    init_tracing();
+
+    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let alice = test_yrs_group_client("alice", test_endpoint().await);
+    let mut alice_group = alice
+        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Alice writes some data
+    yrs_insert_and_send(&mut alice_group, 0, "data").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Bob joins — welcome has empty snapshot (vec![]), join should succeed
+    // and start with an empty CRDT, then catch up via backfill
+    let mut bob = test_yrs_group_client("bob", test_endpoint().await);
+    let bob_kp = bob.generate_key_package().expect("bob kp");
+    alice_group.add_member(bob_kp).await.expect("add bob");
+
+    let welcome = bob.recv_welcome().await.expect("bob welcome");
+    let mut bob_group = bob.join_group(&welcome).await.expect("bob join");
+
+    // Bob should start empty
+    let bob_text = yrs_get_text(&bob_group);
+    assert!(
+        bob_text.is_empty(),
+        "bob should start empty, got: {bob_text}"
+    );
+
+    // Wait for backfill
+    wait_for_sync(&mut bob_group, "data", 10).await;
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}

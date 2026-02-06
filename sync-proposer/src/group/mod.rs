@@ -370,16 +370,14 @@ where
         }
 
         let compaction_config = crdt_factory.compaction_config();
-        let crdt = if let Some(snapshot) = crdt_snapshot_opt {
-            crdt_factory
+        let crdt = match crdt_snapshot_opt {
+            Some(snapshot) if !snapshot.is_empty() => crdt_factory
                 .from_snapshot(&snapshot)
-                .change_context(GroupError)?
-        } else {
-            // No snapshot in welcome — start with an empty CRDT.
-            // The member will catch up via backfill from acceptors after
-            // the leader triggers a compaction.
-            tracing::info!("joining group without CRDT snapshot, will catch up via backfill");
-            crdt_factory.create()
+                .change_context(GroupError)?,
+            _ => {
+                tracing::info!("joining group without CRDT snapshot, will catch up via backfill");
+                crdt_factory.create()
+            }
         };
 
         Ok(Self::spawn_actors(
