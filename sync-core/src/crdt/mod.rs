@@ -170,4 +170,46 @@ mod tests {
         let crdt2 = factory.from_snapshot(b"ignored").unwrap();
         assert_eq!(Crdt::type_id(&*crdt2), "none");
     }
+
+    #[test]
+    fn test_compaction_config_default() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.levels, 3);
+        assert_eq!(config.thresholds.len(), 2); // levels - 1
+        assert_eq!(config.replication.len(), 3); // levels
+        assert_eq!(config.replication[2], 0); // L(max) → all acceptors
+    }
+
+    #[test]
+    fn test_compaction_config_two_level() {
+        let config = CompactionConfig {
+            levels: 2,
+            thresholds: vec![5],
+            replication: vec![1, 0],
+        };
+        assert_eq!(config.thresholds.len(), 1); // levels - 1
+        assert_eq!(config.replication.len(), 2);
+    }
+
+    #[test]
+    fn test_no_crdt_factory_compact() {
+        let factory = NoCrdtFactory;
+        let result = factory.compact(None, &[b"a", b"b"]).unwrap();
+        // NoCrdt compact produces an empty snapshot
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_config_roundtrip() {
+        let config = CompactionConfig {
+            levels: 4,
+            thresholds: vec![100, 50, 10],
+            replication: vec![1, 2, 3, 0],
+        };
+        let bytes = postcard::to_allocvec(&config).unwrap();
+        let decoded: CompactionConfig = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.levels, 4);
+        assert_eq!(decoded.thresholds, vec![100, 50, 10]);
+        assert_eq!(decoded.replication, vec![1, 2, 3, 0]);
+    }
 }

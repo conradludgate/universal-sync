@@ -140,4 +140,36 @@ mod tests {
         let selected = select_acceptors(&acceptors, &msg_id, 10);
         assert_eq!(selected.len(), 3);
     }
+
+    #[test]
+    fn test_select_zero_count() {
+        let acceptors: Vec<_> = (0..5).map(make_acceptor).collect();
+        let msg_id = make_message_id(0);
+
+        let selected = select_acceptors(&acceptors, &msg_id, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_delivery_count_for_level_all() {
+        // replication_factor == 0 means all acceptors
+        assert_eq!(delivery_count_for_level(5, 0), 5);
+        assert_eq!(delivery_count_for_level(10, 0), 10);
+        assert_eq!(delivery_count_for_level(1, 0), 1);
+    }
+
+    #[test]
+    fn test_delivery_count_for_level_specific() {
+        // replication_factor capped at num_acceptors
+        assert_eq!(delivery_count_for_level(5, 2), 2);
+        assert_eq!(delivery_count_for_level(5, 5), 5);
+        assert_eq!(delivery_count_for_level(5, 10), 5); // capped at 5
+        assert_eq!(delivery_count_for_level(3, 1), 1);
+    }
+
+    #[test]
+    fn test_delivery_count_for_level_zero_acceptors() {
+        assert_eq!(delivery_count_for_level(0, 0), 0);
+        assert_eq!(delivery_count_for_level(0, 3), 0);
+    }
 }

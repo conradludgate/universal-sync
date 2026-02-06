@@ -292,6 +292,75 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_multiple_updates() {
+        let factory = YrsCrdtFactory::with_fixed_client_id(1);
+        let mut crdt = factory.create();
+
+        let mut updates = Vec::new();
+        let insert_and_flush = |crdt: &mut Box<dyn Crdt>, pos: u32, text: &str| {
+            let yrs = crdt.as_any_mut().downcast_mut::<YrsCrdt>().unwrap();
+            let t = yrs.doc().get_or_insert_text("doc");
+            let mut txn = yrs.doc().transact_mut();
+            t.insert(&mut txn, pos, text);
+            drop(txn);
+            drop(t);
+            crdt.flush_update().unwrap().unwrap()
+        };
+
+        updates.push(insert_and_flush(&mut crdt, 0, "aaa"));
+        updates.push(insert_and_flush(&mut crdt, 3, "bbb"));
+        updates.push(insert_and_flush(&mut crdt, 6, "ccc"));
+
+        let refs: Vec<&[u8]> = updates.iter().map(|u| u.as_slice()).collect();
+        let compacted = factory.compact(None, &refs).unwrap();
+
+        let fresh = factory.from_snapshot(&compacted).unwrap();
+        let yrs = fresh.as_any().downcast_ref::<YrsCrdt>().unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "aaabbbccc");
+    }
+
+    #[test]
+    fn test_compact_with_base_snapshot() {
+        let factory = YrsCrdtFactory::with_fixed_client_id(1);
+        let mut crdt = factory.create();
+
+        // Create base content
+        {
+            let yrs = crdt.as_any_mut().downcast_mut::<YrsCrdt>().unwrap();
+            let t = yrs.doc().get_or_insert_text("doc");
+            let mut txn = yrs.doc().transact_mut();
+            t.insert(&mut txn, 0, "base");
+        }
+        let base = crdt.snapshot().unwrap();
+
+        // Create an incremental update
+        {
+            let yrs = crdt.as_any_mut().downcast_mut::<YrsCrdt>().unwrap();
+            let t = yrs.doc().get_or_insert_text("doc");
+            let mut txn = yrs.doc().transact_mut();
+            t.insert(&mut txn, 4, "+inc");
+        }
+        let inc = crdt.flush_update().unwrap().unwrap();
+
+        let compacted = factory.compact(Some(&base), &[&inc]).unwrap();
+
+        let fresh = factory.from_snapshot(&compacted).unwrap();
+        let yrs = fresh.as_any().downcast_ref::<YrsCrdt>().unwrap();
+        let text = yrs.doc().get_or_insert_text("doc");
+        let txn = yrs.doc().transact();
+        assert_eq!(text.get_string(&txn), "base+inc");
+    }
+
+    #[test]
+    fn test_compact_empty_updates() {
+        let factory = YrsCrdtFactory::new();
+        let compacted = factory.compact(None, &[]).unwrap();
+        let _fresh = factory.from_snapshot(&compacted).unwrap();
+    }
+
+    #[test]
     fn test_concurrent_edits() {
         let mut crdt1 = YrsCrdt::with_client_id(1);
         let mut crdt2 = YrsCrdt::with_client_id(2);

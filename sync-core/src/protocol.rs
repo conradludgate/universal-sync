@@ -156,6 +156,109 @@ pub enum MessageResponse {
     Error(String),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_member_fingerprint_deterministic() {
+        let key = b"some signing public key";
+        let fp1 = MemberFingerprint::from_signing_key(key);
+        let fp2 = MemberFingerprint::from_signing_key(key);
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_member_fingerprint_different_keys() {
+        let fp1 = MemberFingerprint::from_signing_key(b"key1");
+        let fp2 = MemberFingerprint::from_signing_key(b"key2");
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn test_member_fingerprint_empty_key() {
+        let fp = MemberFingerprint::from_signing_key(b"");
+        // SHA-256 of empty input is a known value
+        assert_ne!(fp.0, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_group_id_from_slice_exact() {
+        let bytes = [42u8; 32];
+        let id = GroupId::from_slice(&bytes);
+        assert_eq!(id.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn test_group_id_from_slice_short() {
+        let bytes = [1u8, 2, 3];
+        let id = GroupId::from_slice(&bytes);
+        let mut expected = [0u8; 32];
+        expected[..3].copy_from_slice(&bytes);
+        assert_eq!(id.as_bytes(), &expected);
+    }
+
+    #[test]
+    fn test_group_id_from_slice_long() {
+        let bytes = [99u8; 64];
+        let id = GroupId::from_slice(&bytes);
+        assert_eq!(id.as_bytes(), &[99u8; 32]);
+    }
+
+    #[test]
+    fn test_group_id_from_slice_empty() {
+        let id = GroupId::from_slice(&[]);
+        assert_eq!(id.as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_message_id_roundtrip() {
+        let id = MessageId {
+            group_id: GroupId::new([1u8; 32]),
+            sender: MemberFingerprint([2u8; 32]),
+            seq: 42,
+        };
+        let bytes = postcard::to_allocvec(&id).unwrap();
+        let decoded: MessageId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn test_encrypted_app_message_roundtrip() {
+        let msg = EncryptedAppMessage {
+            ciphertext: vec![1, 2, 3, 4, 5],
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        let decoded: EncryptedAppMessage = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_message_request_variants_roundtrip() {
+        let send = MessageRequest::Send {
+            id: MessageId {
+                group_id: GroupId::new([0u8; 32]),
+                sender: MemberFingerprint([1u8; 32]),
+                seq: 1,
+            },
+            message: EncryptedAppMessage {
+                ciphertext: vec![10, 20],
+            },
+        };
+        let bytes = postcard::to_allocvec(&send).unwrap();
+        let decoded: MessageRequest = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, MessageRequest::Send { .. }));
+
+        let backfill = MessageRequest::Backfill {
+            state_vector: Default::default(),
+            limit: 100,
+        };
+        let bytes = postcard::to_allocvec(&backfill).unwrap();
+        let decoded: MessageRequest = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, MessageRequest::Backfill { limit: 100, .. }));
+    }
+}
+
 mod mls_bytes {
     use mls_rs::mls_rs_codec::{MlsDecode, MlsEncode};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

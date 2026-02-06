@@ -755,4 +755,98 @@ mod tests {
         assert_eq!(decoded.get_member_key(MemberId(1)), Some(&[5, 6, 7, 8][..]));
         assert_eq!(decoded.get_member_key(MemberId(2)), None);
     }
+
+    #[test]
+    fn test_store_and_get_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([1u8; 32]);
+        let sender = MemberFingerprint([2u8; 32]);
+
+        let id1 = MessageId { group_id: gid, sender, seq: 1 };
+        let id2 = MessageId { group_id: gid, sender, seq: 2 };
+        let msg = EncryptedAppMessage { ciphertext: vec![10, 20] };
+
+        store.store_app_message(&gid, &id1, &msg).unwrap();
+        store.store_app_message(&gid, &id2, &msg).unwrap();
+
+        // Empty state vector → get all
+        let all = store.get_messages_after(&gid, &StateVector::default());
+        assert_eq!(all.len(), 2);
+
+        // State vector covering seq 1 → only seq 2 returned
+        let mut sv = StateVector::default();
+        sv.insert(sender, 1);
+        let after = store.get_messages_after(&gid, &sv);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0.seq, 2);
+    }
+
+    #[test]
+    fn test_delete_before_watermark_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([3u8; 32]);
+
+        let sender_a = MemberFingerprint([10u8; 32]);
+        let sender_b = MemberFingerprint([20u8; 32]);
+        let msg = EncryptedAppMessage { ciphertext: vec![1] };
+
+        // Store messages from two senders
+        for seq in 1..=5 {
+            let id = MessageId { group_id: gid, sender: sender_a, seq };
+            store.store_app_message(&gid, &id, &msg).unwrap();
+        }
+        for seq in 1..=3 {
+            let id = MessageId { group_id: gid, sender: sender_b, seq };
+            store.store_app_message(&gid, &id, &msg).unwrap();
+        }
+
+        // Delete sender_a up to seq 3, sender_b up to seq 1
+        let mut watermark = StateVector::default();
+        watermark.insert(sender_a, 3);
+        watermark.insert(sender_b, 1);
+
+        let deleted = store.delete_before_watermark(&gid, &watermark).unwrap();
+        assert_eq!(deleted, 4); // 3 from sender_a + 1 from sender_b
+
+        let remaining = store.get_messages_after(&gid, &StateVector::default());
+        assert_eq!(remaining.len(), 4); // sender_a: 4,5 + sender_b: 2,3
+    }
+
+    #[test]
+    fn test_delete_before_watermark_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([4u8; 32]);
+
+        let deleted = store.delete_before_watermark(&gid, &StateVector::default()).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_message_key_ordering() {
+        let gid = GroupId::new([1u8; 32]);
+        let sender = MemberFingerprint([2u8; 32]);
+
+        let key1 = FjallStateStore::build_message_key(&gid, &sender, 1);
+        let key2 = FjallStateStore::build_message_key(&gid, &sender, 2);
+        let key3 = FjallStateStore::build_message_key(&gid, &sender, 100);
+
+        assert!(key1 < key2);
+        assert!(key2 < key3);
+    }
+
+    #[test]
+    fn test_message_id_from_key_roundtrip() {
+        let gid = GroupId::new([5u8; 32]);
+        let sender = MemberFingerprint([6u8; 32]);
+
+        let key = FjallStateStore::build_message_key(&gid, &sender, 42);
+        let id = FjallStateStore::message_id_from_key(&gid, &key).unwrap();
+
+        assert_eq!(id.group_id, gid);
+        assert_eq!(id.sender, sender);
+        assert_eq!(id.seq, 42);
+    }
 }
