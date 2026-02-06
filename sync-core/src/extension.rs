@@ -16,11 +16,11 @@ use crate::protocol::MemberFingerprint;
 /// Extension type for the full acceptor list (group context extension)
 pub const ACCEPTORS_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF795);
 
-/// Extension type for adding an acceptor (private use range: 0xF000-0xFFFF)
-pub const ACCEPTOR_ADD_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF796);
+/// Proposal type for adding a federated acceptor (private use range)
+pub const ACCEPTOR_ADD_PROPOSAL_TYPE: ProposalType = ProposalType::new(0xF796);
 
-/// Extension type for removing an acceptor (private use range: 0xF000-0xFFFF)
-pub const ACCEPTOR_REMOVE_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF797);
+/// Proposal type for removing a federated acceptor (private use range)
+pub const ACCEPTOR_REMOVE_PROPOSAL_TYPE: ProposalType = ProposalType::new(0xF797);
 
 /// Extension type for member's endpoint address (key package extension)
 pub const MEMBER_ADDR_EXTENSION_TYPE: ExtensionType = ExtensionType::new(0xF798);
@@ -129,7 +129,7 @@ impl MlsCodecExtension for AcceptorsExt {
     }
 }
 
-/// Signal to add a federated acceptor (group context extension).
+/// Signal to add a federated acceptor (MLS custom proposal, unencrypted but signed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptorAdd(pub EndpointAddr);
 
@@ -168,13 +168,13 @@ impl MlsDecode for AcceptorAdd {
     }
 }
 
-impl MlsCodecExtension for AcceptorAdd {
-    fn extension_type() -> ExtensionType {
-        ACCEPTOR_ADD_EXTENSION_TYPE
+impl MlsCustomProposal for AcceptorAdd {
+    fn proposal_type() -> ProposalType {
+        ACCEPTOR_ADD_PROPOSAL_TYPE
     }
 }
 
-/// Signal to remove a federated acceptor (group context extension).
+/// Signal to remove a federated acceptor (MLS custom proposal, unencrypted but signed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptorRemove(pub AcceptorId);
 
@@ -215,9 +215,9 @@ impl MlsDecode for AcceptorRemove {
     }
 }
 
-impl MlsCodecExtension for AcceptorRemove {
-    fn extension_type() -> ExtensionType {
-        ACCEPTOR_REMOVE_EXTENSION_TYPE
+impl MlsCustomProposal for AcceptorRemove {
+    fn proposal_type() -> ProposalType {
+        ACCEPTOR_REMOVE_PROPOSAL_TYPE
     }
 }
 
@@ -523,45 +523,43 @@ mod tests {
     #[test]
     fn test_acceptor_add_roundtrip() {
         let addr = test_addr(42);
-        let ext = AcceptorAdd::new(addr.clone());
+        let add = AcceptorAdd::new(addr.clone());
 
-        let encoded = ext.mls_encode_to_vec().unwrap();
+        let custom = add.to_custom_proposal().unwrap();
+        assert_eq!(custom.proposal_type(), ACCEPTOR_ADD_PROPOSAL_TYPE);
 
-        let decoded = AcceptorAdd::mls_decode(&mut encoded.as_slice()).unwrap();
-        assert_eq!(ext, decoded);
+        let decoded = AcceptorAdd::from_custom_proposal(&custom).unwrap();
+        assert_eq!(add, decoded);
         assert_eq!(decoded.addr(), &addr);
     }
 
     #[test]
     fn test_acceptor_remove_roundtrip() {
         let id = AcceptorId::from_bytes([42u8; 32]);
-        let ext = AcceptorRemove::new(id);
+        let remove = AcceptorRemove::new(id);
 
-        let encoded = ext.mls_encode_to_vec().unwrap();
-        assert_eq!(encoded.len(), 32);
+        let custom = remove.to_custom_proposal().unwrap();
+        assert_eq!(custom.proposal_type(), ACCEPTOR_REMOVE_PROPOSAL_TYPE);
 
-        let decoded = AcceptorRemove::mls_decode(&mut encoded.as_slice()).unwrap();
-        assert_eq!(ext, decoded);
+        let decoded = AcceptorRemove::from_custom_proposal(&custom).unwrap();
+        assert_eq!(remove, decoded);
         assert_eq!(decoded.acceptor_id(), id);
     }
 
     #[test]
-    fn test_extension_types_are_different() {
+    fn test_proposal_and_extension_types_are_different() {
+        assert_ne!(ACCEPTOR_ADD_PROPOSAL_TYPE, ACCEPTOR_REMOVE_PROPOSAL_TYPE);
         assert_ne!(
-            AcceptorAdd::extension_type(),
-            AcceptorRemove::extension_type()
-        );
-        assert_ne!(
-            AcceptorsExt::extension_type(),
-            AcceptorAdd::extension_type()
+            ACCEPTOR_ADD_PROPOSAL_TYPE,
+            COMPACTION_CLAIM_PROPOSAL_TYPE
         );
     }
 
     #[test]
     fn test_extension_types_in_private_range() {
         assert!(AcceptorsExt::extension_type().raw_value() >= 0xF000);
-        assert!(AcceptorAdd::extension_type().raw_value() >= 0xF000);
-        assert!(AcceptorRemove::extension_type().raw_value() >= 0xF000);
+        assert!(ACCEPTOR_ADD_PROPOSAL_TYPE.raw_value() >= 0xF000);
+        assert!(ACCEPTOR_REMOVE_PROPOSAL_TYPE.raw_value() >= 0xF000);
         assert!(CrdtRegistrationExt::extension_type().raw_value() >= 0xF000);
         assert!(SupportedCrdtsExt::extension_type().raw_value() >= 0xF000);
         assert!(CrdtSnapshotExt::extension_type().raw_value() >= 0xF000);

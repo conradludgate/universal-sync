@@ -6,7 +6,7 @@ use error_stack::{Report, ResultExt};
 use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
-use mls_rs::group::proposal::Proposal as MlsProposal;
+use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
 use mls_rs::group::{CommitEffect, ReceivedMessage};
 use mls_rs::{CipherSuiteProvider, Group};
 use universal_sync_core::{
@@ -161,27 +161,24 @@ where
 
     /// Process a commit effect to update the acceptor set
     ///
-    /// Checks for `AcceptorAdd` and `AcceptorRemove` extensions in any
-    /// `GroupContextExtensions` proposals that were applied.
+    /// Checks for `AcceptorAdd` and `AcceptorRemove` custom proposals that
+    /// were applied.
     fn process_commit_effect(&mut self, effect: &CommitEffect) {
         let applied_proposals = match effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
                 &new_epoch.applied_proposals
             }
-            CommitEffect::ReInit(_) => return, // No proposals to process
+            CommitEffect::ReInit(_) => return,
         };
 
-        // Look for GroupContextExtensions proposals
         for proposal_info in applied_proposals {
-            if let MlsProposal::GroupContextExtensions(extensions) = &proposal_info.proposal {
-                // Check for AcceptorAdd
-                if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
+            if let MlsProposal::Custom(custom) = &proposal_info.proposal {
+                if let Ok(add) = AcceptorAdd::from_custom_proposal(custom) {
                     tracing::debug!(acceptor_id = ?add.acceptor_id(), "adding acceptor");
                     self.add_acceptor_addr(add.0.clone());
                 }
 
-                // Check for AcceptorRemove
-                if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
+                if let Ok(remove) = AcceptorRemove::from_custom_proposal(custom) {
                     tracing::debug!(acceptor_id = ?remove.acceptor_id(), "removing acceptor");
                     self.remove_acceptor_id(&remove.acceptor_id());
                 }

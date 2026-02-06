@@ -16,7 +16,7 @@ use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tokio::sync::mpsc;
 use tracing::info;
 use universal_sync_core::{
-    ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
+    ACCEPTOR_ADD_PROPOSAL_TYPE, ACCEPTOR_REMOVE_PROPOSAL_TYPE, ACCEPTORS_EXTENSION_TYPE,
     COMPACTION_CLAIM_PROPOSAL_TYPE, COMPACTION_COMPLETE_PROPOSAL_TYPE,
     CRDT_REGISTRATION_EXTENSION_TYPE, CRDT_SNAPSHOT_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
     NoCrdtFactory, PAXOS_ALPN, SUPPORTED_CRDTS_EXTENSION_TYPE,
@@ -98,12 +98,12 @@ async fn setup_coordinator(
             CipherSuite::CURVE25519_AES128,
         )
         .extension_type(ACCEPTORS_EXTENSION_TYPE)
-        .extension_type(ACCEPTOR_ADD_EXTENSION_TYPE)
-        .extension_type(ACCEPTOR_REMOVE_EXTENSION_TYPE)
         .extension_type(MEMBER_ADDR_EXTENSION_TYPE)
         .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
         .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
         .extension_type(CRDT_SNAPSHOT_EXTENSION_TYPE)
+        .custom_proposal_type(ACCEPTOR_ADD_PROPOSAL_TYPE)
+        .custom_proposal_type(ACCEPTOR_REMOVE_PROPOSAL_TYPE)
         .custom_proposal_type(COMPACTION_CLAIM_PROPOSAL_TYPE)
         .custom_proposal_type(COMPACTION_COMPLETE_PROPOSAL_TYPE)
         .build();

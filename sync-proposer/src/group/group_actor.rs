@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, CompactionClaim, CompactionComplete, CompactionConfig,
-    CrdtFactory, CrdtRegistrationExt, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
+    CrdtFactory, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
     GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN, StateVector,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
@@ -584,31 +584,19 @@ where
         let _ = reply.send(Ok(()));
     }
 
-    /// Persistent extensions only, excluding transient `AcceptorAdd`/`AcceptorRemove`.
-    fn persistent_context_extensions(&self) -> mls_rs::ExtensionList {
-        let current = &self.learner.group().context().extensions;
-        let mut persistent = mls_rs::ExtensionList::default();
-        if let Ok(Some(crdt_reg)) = current.get_as::<CrdtRegistrationExt>() {
-            let _ = persistent.set_from(crdt_reg);
-        }
-        persistent
-    }
-
     async fn handle_add_acceptor(
         &mut self,
         addr: EndpointAddr,
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         let result = blocking(|| {
-            let add_ext = AcceptorAdd::new(addr.clone());
-            let mut extensions = self.persistent_context_extensions();
-            extensions.set_from(add_ext).change_context(GroupError)?;
+            let add = AcceptorAdd::new(addr.clone());
+            let custom = add.to_custom_proposal().change_context(GroupError)?;
 
             self.learner
                 .group_mut()
                 .commit_builder()
-                .set_group_context_ext(extensions)
-                .change_context(GroupError)?
+                .custom_proposal(custom)
                 .build()
                 .change_context(GroupError)
         });
@@ -630,15 +618,13 @@ where
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
         let result = blocking(|| {
-            let remove_ext = AcceptorRemove::new(acceptor_id);
-            let mut extensions = self.persistent_context_extensions();
-            extensions.set_from(remove_ext).change_context(GroupError)?;
+            let remove = AcceptorRemove::new(acceptor_id);
+            let custom = remove.to_custom_proposal().change_context(GroupError)?;
 
             self.learner
                 .group_mut()
                 .commit_builder()
-                .set_group_context_ext(extensions)
-                .change_context(GroupError)?
+                .custom_proposal(custom)
                 .build()
                 .change_context(GroupError)
         });
@@ -1223,27 +1209,9 @@ where
                 },
                 MlsProposal::ReInit(_) => GroupEvent::ReInitiated,
                 MlsProposal::ExternalInit(_) => GroupEvent::ExternalInit,
-                MlsProposal::GroupContextExtensions(extensions) => {
-                    if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
-                        let id = add.acceptor_id();
-                        let addr = add.0.clone();
-                        self.learner.add_acceptor_addr(addr.clone());
-                        new_acceptors.push((id, addr));
-                        GroupEvent::AcceptorAdded { id }
-                    } else if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
-                        let id = remove.acceptor_id();
-                        self.learner.remove_acceptor_id(&id);
-                        if let Some(handle) = self.acceptor_handles.remove(&id) {
-                            handle.abort();
-                        }
-                        self.acceptor_txs.remove(&id);
-                        GroupEvent::AcceptorRemoved { id }
-                    } else {
-                        GroupEvent::ExtensionsUpdated
-                    }
-                }
+                MlsProposal::GroupContextExtensions(_) => GroupEvent::ExtensionsUpdated,
                 MlsProposal::Custom(custom) => {
-                    self.process_custom_proposal(custom, committer_fingerprint)
+                    self.process_custom_proposal(custom, committer_fingerprint, &mut new_acceptors)
                 }
                 _ => GroupEvent::Unknown,
             };
@@ -1258,7 +1226,26 @@ where
         &mut self,
         custom: &mls_rs::group::proposal::CustomProposal,
         committer_fingerprint: Option<MemberFingerprint>,
+        new_acceptors: &mut Vec<(AcceptorId, EndpointAddr)>,
     ) -> GroupEvent {
+        if let Ok(add) = AcceptorAdd::from_custom_proposal(custom) {
+            let id = add.acceptor_id();
+            let addr = add.0.clone();
+            self.learner.add_acceptor_addr(addr.clone());
+            new_acceptors.push((id, addr));
+            return GroupEvent::AcceptorAdded { id };
+        }
+
+        if let Ok(remove) = AcceptorRemove::from_custom_proposal(custom) {
+            let id = remove.acceptor_id();
+            self.learner.remove_acceptor_id(&id);
+            if let Some(handle) = self.acceptor_handles.remove(&id) {
+                handle.abort();
+            }
+            self.acceptor_txs.remove(&id);
+            return GroupEvent::AcceptorRemoved { id };
+        }
+
         if let Ok(claim) = CompactionClaim::from_custom_proposal(custom) {
             tracing::info!(
                 level = claim.level,

@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
 use universal_sync_core::{
-    ACCEPTOR_ADD_EXTENSION_TYPE, ACCEPTOR_REMOVE_EXTENSION_TYPE, ACCEPTORS_EXTENSION_TYPE,
+    ACCEPTOR_ADD_PROPOSAL_TYPE, ACCEPTOR_REMOVE_PROPOSAL_TYPE, ACCEPTORS_EXTENSION_TYPE,
     COMPACTION_CLAIM_PROPOSAL_TYPE, COMPACTION_COMPLETE_PROPOSAL_TYPE,
     CRDT_REGISTRATION_EXTENSION_TYPE, CRDT_SNAPSHOT_EXTENSION_TYPE, MEMBER_ADDR_EXTENSION_TYPE,
     NoCrdtFactory, PAXOS_ALPN, SUPPORTED_CRDTS_EXTENSION_TYPE,
@@ -73,12 +73,12 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
         .identity_provider(test_identity_provider())
         .signing_identity(signing_identity, secret_key.clone(), TEST_CIPHER_SUITE)
         .extension_type(ACCEPTORS_EXTENSION_TYPE)
-        .extension_type(ACCEPTOR_ADD_EXTENSION_TYPE)
-        .extension_type(ACCEPTOR_REMOVE_EXTENSION_TYPE)
         .extension_type(MEMBER_ADDR_EXTENSION_TYPE)
         .extension_type(SUPPORTED_CRDTS_EXTENSION_TYPE)
         .extension_type(CRDT_REGISTRATION_EXTENSION_TYPE)
         .extension_type(CRDT_SNAPSHOT_EXTENSION_TYPE)
+        .custom_proposal_type(ACCEPTOR_ADD_PROPOSAL_TYPE)
+        .custom_proposal_type(ACCEPTOR_REMOVE_PROPOSAL_TYPE)
         .custom_proposal_type(COMPACTION_CLAIM_PROPOSAL_TYPE)
         .custom_proposal_type(COMPACTION_COMPLETE_PROPOSAL_TYPE)
         .build();

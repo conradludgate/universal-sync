@@ -314,22 +314,17 @@ where
 
         for proposal_info in applied_proposals {
             match &proposal_info.proposal {
-                MlsProposal::GroupContextExtensions(extensions) => {
-                    if let Ok(Some(add)) = extensions.get_as::<AcceptorAdd>() {
+                MlsProposal::Custom(custom) => {
+                    if let Ok(add) = AcceptorAdd::from_custom_proposal(custom) {
                         let id = add.acceptor_id();
                         let addr = add.0.clone();
                         self.acceptors.insert(id, addr.clone());
                         changes.push(AcceptorChangeEvent::Added { id });
-                    }
-
-                    if let Ok(Some(remove)) = extensions.get_as::<AcceptorRemove>() {
+                    } else if let Ok(remove) = AcceptorRemove::from_custom_proposal(custom) {
                         let id = remove.acceptor_id();
                         self.acceptors.remove(&id);
                         changes.push(AcceptorChangeEvent::Removed { id });
-                    }
-                }
-                MlsProposal::Custom(custom) => {
-                    if let Ok(complete) = CompactionComplete::from_custom_proposal(custom) {
+                    } else if let Ok(complete) = CompactionComplete::from_custom_proposal(custom) {
                         tracing::info!(
                             level = complete.level,
                             watermark_entries = complete.watermark.len(),
