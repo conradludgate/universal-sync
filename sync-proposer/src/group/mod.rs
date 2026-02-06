@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorId, AcceptorsExt, Crdt, CrdtFactory, CrdtRegistrationExt, CrdtSnapshotExt,
-    EncryptedAppMessage, Epoch, GroupId, Handshake,
+    EncryptedAppMessage, Epoch, GroupId, Handshake, MessageId,
 };
 
 use crate::connection::ConnectionManager;
@@ -123,7 +123,7 @@ const MAX_MESSAGE_ATTEMPTS: u32 = 10;
 #[allow(clippy::large_enum_variant)]
 enum AcceptorOutbound {
     ProposalRequest { request: ProposalRequest },
-    AppMessage { msg: EncryptedAppMessage },
+    AppMessage { id: MessageId, msg: EncryptedAppMessage },
 }
 
 /// Informational events emitted by a Group. Applications don't need to handle these.

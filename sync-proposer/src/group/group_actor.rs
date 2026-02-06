@@ -11,7 +11,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, CrdtRegistrationExt, EncryptedAppMessage, Epoch,
-    GroupId, GroupMessage, GroupProposal, Handshake, MemberId, MessageId, PAXOS_ALPN,
+    GroupId, GroupMessage, GroupProposal, Handshake, MemberId, MemberFingerprint, MessageId,
+    PAXOS_ALPN,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -46,9 +47,9 @@ where
     acceptor_rx: mpsc::Receiver<AcceptorInbound>,
     acceptor_inbound_tx: mpsc::Sender<AcceptorInbound>,
     acceptor_handles: HashMap<AcceptorId, JoinHandle<()>>,
-    message_index: u32,
-    message_epoch: Epoch,
-    seen_messages: HashSet<(MemberId, Epoch, u32)>,
+    own_fingerprint: MemberFingerprint,
+    message_seq: u64,
+    seen_messages: HashSet<(MemberFingerprint, u64)>,
     pending_messages: Vec<PendingMessage>,
     join_epoch: Epoch,
     active_proposal: Option<ActiveProposal>,
@@ -98,8 +99,8 @@ where
         cancel_token: CancellationToken,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
-        let message_epoch = learner.mls_epoch();
-        let join_epoch = message_epoch;
+        let join_epoch = learner.mls_epoch();
+        let own_fingerprint = learner.own_fingerprint();
         let (acceptor_inbound_tx, acceptor_rx) = mpsc::channel(256);
 
         Self {
@@ -118,8 +119,8 @@ where
             acceptor_rx,
             acceptor_inbound_tx,
             acceptor_handles: HashMap::new(),
-            message_index: 0,
-            message_epoch,
+            own_fingerprint,
+            message_seq: 0,
             seen_messages: HashSet::new(),
             pending_messages: Vec::new(),
             join_epoch,
@@ -440,17 +441,10 @@ where
         data: &[u8],
         reply: oneshot::Sender<Result<(), Report<GroupError>>>,
     ) {
-        let current_epoch = self.learner.mls_epoch();
-        if current_epoch != self.message_epoch {
-            self.message_index = 0;
-            self.message_epoch = current_epoch;
-        }
+        let seq = self.message_seq;
+        self.message_seq += 1;
 
-        let sender = MemberId(self.learner.group().current_member_index());
-        let index = self.message_index;
-        self.message_index = self.message_index.wrapping_add(1);
-
-        let authenticated_data = index.to_be_bytes().to_vec();
+        let authenticated_data = seq.to_be_bytes().to_vec();
 
         let result = blocking(|| {
             self.learner
@@ -483,9 +477,8 @@ where
 
         let message_id = MessageId {
             group_id: self.group_id,
-            epoch: current_epoch,
-            sender,
-            index,
+            sender: self.own_fingerprint,
+            seq,
         };
         let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
         let delivery_count = crate::rendezvous::delivery_count(acceptor_ids.len());
@@ -495,6 +488,7 @@ where
         for acceptor_id in selected_acceptors {
             if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
                 let _ = tx.try_send(AcceptorOutbound::AppMessage {
+                    id: message_id,
                     msg: encrypted_msg.clone(),
                 });
             }
@@ -1207,16 +1201,28 @@ where
             return;
         };
 
-        let index = if app_msg.authenticated_data.len() >= 4 {
-            u32::from_be_bytes(app_msg.authenticated_data[..4].try_into().unwrap_or([0; 4]))
+        let seq = if app_msg.authenticated_data.len() >= 8 {
+            u64::from_be_bytes(app_msg.authenticated_data[..8].try_into().unwrap_or([0; 8]))
         } else {
             0
         };
 
-        let sender = MemberId(app_msg.sender_index);
-        let epoch = self.learner.mls_epoch();
+        let sender_member = MemberId(app_msg.sender_index);
+        let signing_key = self
+            .learner
+            .group()
+            .roster()
+            .members()
+            .iter()
+            .find(|m| m.index == sender_member.0)
+            .map(|m| MemberFingerprint::from_signing_key(&m.signing_identity.signature_key));
 
-        let key = (sender, epoch, index);
+        let Some(sender_fp) = signing_key else {
+            tracing::warn!(?sender_member, "sender not found in roster, dropping message");
+            return;
+        };
+
+        let key = (sender_fp, seq);
         if self.seen_messages.contains(&key) {
             return;
         }

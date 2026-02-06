@@ -10,7 +10,10 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use universal_sync_core::{EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal};
+use universal_sync_core::{
+    EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint, MessageId,
+    StateVector,
+};
 use universal_sync_paxos::acceptor::RoundState;
 use universal_sync_paxos::core::decision;
 use universal_sync_paxos::{AcceptorStateStore, Learner, Proposal};
@@ -59,10 +62,9 @@ pub(crate) struct FjallStateStore {
     accepted: Keyspace,
     groups: Keyspace,
     messages: Keyspace,
-    message_seq: Keyspace,
     epoch_rosters: Keyspace,
     broadcasts: GroupBroadcasts,
-    message_broadcasts: RwLock<HashMap<[u8; 32], broadcast::Sender<EncryptedAppMessage>>>,
+    message_broadcasts: RwLock<HashMap<[u8; 32], broadcast::Sender<(MessageId, EncryptedAppMessage)>>>,
 }
 
 impl FjallStateStore {
@@ -80,7 +82,6 @@ impl FjallStateStore {
         let accepted = db.keyspace("accepted", KeyspaceCreateOptions::default)?;
         let groups = db.keyspace("groups", KeyspaceCreateOptions::default)?;
         let messages = db.keyspace("messages", KeyspaceCreateOptions::default)?;
-        let message_seq = db.keyspace("message_seq", KeyspaceCreateOptions::default)?;
         let epoch_rosters = db.keyspace("epoch_rosters", KeyspaceCreateOptions::default)?;
 
         Ok(Self {
@@ -89,7 +90,6 @@ impl FjallStateStore {
             accepted,
             groups,
             messages,
-            message_seq,
             epoch_rosters,
             broadcasts: RwLock::new(HashMap::new()),
             message_broadcasts: RwLock::new(HashMap::new()),
@@ -131,11 +131,27 @@ impl FjallStateStore {
         postcard::from_bytes(bytes).ok()
     }
 
-    fn build_message_key(group_id: &GroupId, seq: u64) -> [u8; 40] {
-        let mut key = [0u8; 40];
+    /// Message key: group_id (32) || sender_fingerprint (32) || seq (8) = 72 bytes.
+    fn build_message_key(group_id: &GroupId, sender: &MemberFingerprint, seq: u64) -> [u8; 72] {
+        let mut key = [0u8; 72];
         key[..32].copy_from_slice(group_id.as_bytes());
-        key[32..].copy_from_slice(&seq.to_be_bytes());
+        key[32..64].copy_from_slice(sender.as_bytes());
+        key[64..72].copy_from_slice(&seq.to_be_bytes());
         key
+    }
+
+    fn message_id_from_key(group_id: &GroupId, key: &[u8]) -> Option<MessageId> {
+        if key.len() < 72 {
+            return None;
+        }
+        let mut fp = [0u8; 32];
+        fp.copy_from_slice(&key[32..64]);
+        let seq = u64::from_be_bytes(key[64..72].try_into().ok()?);
+        Some(MessageId {
+            group_id: *group_id,
+            sender: MemberFingerprint(fp),
+            seq,
+        })
     }
 
     fn serialize_app_message(msg: &EncryptedAppMessage) -> Vec<u8> {
@@ -146,28 +162,13 @@ impl FjallStateStore {
         postcard::from_bytes(bytes).ok()
     }
 
-    fn next_message_seq(&self, group_id: &GroupId) -> Result<u64, fjall::Error> {
-        let key = group_id.as_bytes();
-        let current = self.message_seq.get(key)?.map_or(0, |bytes| {
-            if bytes.len() >= 8 {
-                u64::from_be_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
-            } else {
-                0
-            }
-        });
-
-        self.message_seq.insert(key, (current + 1).to_be_bytes())?;
-
-        Ok(current)
-    }
-
     pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
+        id: &MessageId,
         msg: &EncryptedAppMessage,
-    ) -> Result<u64, fjall::Error> {
-        let seq = self.next_message_seq(group_id)?;
-        let msg_key = Self::build_message_key(group_id, seq);
+    ) -> Result<(), fjall::Error> {
+        let msg_key = Self::build_message_key(group_id, &id.sender, id.seq);
         let msg_bytes = Self::serialize_app_message(msg);
         self.messages.insert(msg_key, &msg_bytes)?;
 
@@ -176,19 +177,19 @@ impl FjallStateStore {
         if let Ok(broadcasts) = self.message_broadcasts.read()
             && let Some(tx) = broadcasts.get(group_id.as_bytes())
         {
-            let _ = tx.send(msg.clone());
+            let _ = tx.send((*id, msg.clone()));
         }
 
-        Ok(seq)
+        Ok(())
     }
 
-    pub(crate) fn get_messages_since(
+    pub(crate) fn get_messages_after(
         &self,
         group_id: &GroupId,
-        since_seq: u64,
-    ) -> Vec<(u64, EncryptedAppMessage)> {
-        let start_key = Self::build_message_key(group_id, since_seq);
+        state_vector: &StateVector,
+    ) -> Vec<(MessageId, EncryptedAppMessage)> {
         let prefix = Self::build_group_prefix(group_id);
+        let start_key = prefix;
 
         let mut messages = Vec::new();
 
@@ -201,10 +202,14 @@ impl FjallStateStore {
                 break;
             }
 
-            if key.len() >= 40 {
-                let seq = u64::from_be_bytes(key[32..40].try_into().unwrap_or([0; 8]));
-                if let Some(msg) = Self::deserialize_app_message(&value) {
-                    messages.push((seq, msg));
+            if let Some(msg_id) = Self::message_id_from_key(group_id, &key) {
+                let covered = state_vector
+                    .get(&msg_id.sender)
+                    .is_some_and(|&hw| msg_id.seq <= hw);
+                if !covered {
+                    if let Some(msg) = Self::deserialize_app_message(&value) {
+                        messages.push((msg_id, msg));
+                    }
                 }
             }
         }
@@ -212,10 +217,45 @@ impl FjallStateStore {
         messages
     }
 
+    pub(crate) fn delete_before_watermark(
+        &self,
+        group_id: &GroupId,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut deleted = 0;
+
+        for guard in self.messages.range(prefix..) {
+            let Ok((key, _)) = guard.into_inner() else {
+                continue;
+            };
+
+            if key.len() < 32 || &key[..32] != prefix.as_slice() {
+                break;
+            }
+
+            if let Some(msg_id) = Self::message_id_from_key(group_id, &key) {
+                if watermark
+                    .get(&msg_id.sender)
+                    .is_some_and(|&hw| msg_id.seq <= hw)
+                {
+                    self.messages.remove(&*key)?;
+                    deleted += 1;
+                }
+            }
+        }
+
+        if deleted > 0 {
+            self.db.persist(PersistMode::SyncAll)?;
+        }
+
+        Ok(deleted)
+    }
+
     pub(crate) fn subscribe_messages(
         &self,
         group_id: &GroupId,
-    ) -> broadcast::Receiver<EncryptedAppMessage> {
+    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
         let mut broadcasts = self.message_broadcasts.write().unwrap();
         let key = *group_id.as_bytes();
 
@@ -471,25 +511,34 @@ impl SharedFjallStateStore {
     pub(crate) fn store_app_message(
         &self,
         group_id: &GroupId,
+        id: &MessageId,
         msg: &EncryptedAppMessage,
-    ) -> Result<u64, fjall::Error> {
-        self.inner.store_app_message(group_id, msg)
+    ) -> Result<(), fjall::Error> {
+        self.inner.store_app_message(group_id, id, msg)
     }
 
     #[must_use]
-    pub(crate) fn get_messages_since(
+    pub(crate) fn get_messages_after(
         &self,
         group_id: &GroupId,
-        since_seq: u64,
-    ) -> Vec<(u64, EncryptedAppMessage)> {
-        self.inner.get_messages_since(group_id, since_seq)
+        state_vector: &StateVector,
+    ) -> Vec<(MessageId, EncryptedAppMessage)> {
+        self.inner.get_messages_after(group_id, state_vector)
+    }
+
+    pub(crate) fn delete_before_watermark(
+        &self,
+        group_id: &GroupId,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        self.inner.delete_before_watermark(group_id, watermark)
     }
 
     #[must_use]
     pub(crate) fn subscribe_messages(
         &self,
         group_id: &GroupId,
-    ) -> broadcast::Receiver<EncryptedAppMessage> {
+    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
         self.inner.subscribe_messages(group_id)
     }
 }

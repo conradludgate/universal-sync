@@ -7059,6 +7059,7 @@ dependencies = [
  "pin-project-lite",
  "postcard",
  "serde",
+ "sha2 0.10.9",
  "tokio",
  "tokio-util",
  "universal-sync-paxos",

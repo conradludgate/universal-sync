@@ -266,11 +266,8 @@ where
 
             msg = subscription.recv() => {
                 match msg {
-                    Ok(msg) => {
-                        let response = MessageResponse::Message {
-                            arrival_seq: 0, // We don't have the seq from broadcast
-                            message: msg,
-                        };
+                    Ok((id, message)) => {
+                        let response = MessageResponse::Message { id, message };
                         connection.send(response).await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -295,43 +292,41 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
     match request {
-        MessageRequest::Send(msg) => match registry.store_message(group_id, &msg) {
-            Ok(arrival_seq) => {
-                let response = MessageResponse::Stored { arrival_seq };
-                connection.send(response).await?;
-            }
-            Err(e) => {
-                let response = MessageResponse::Error(e);
-                connection.send(response).await?;
-            }
-        },
-
-        MessageRequest::Subscribe { since_seq: _ } => {}
-
-        MessageRequest::Backfill { since_seq, limit } => {
-            match registry.get_messages_since(group_id, since_seq) {
-                Ok(messages) => {
-                    let has_more = messages.len() > limit as usize;
-                    let messages: Vec<_> = messages.into_iter().take(limit as usize).collect();
-                    let last_seq = messages.last().map_or(since_seq, |(seq, _)| *seq);
-
-                    for (arrival_seq, msg) in messages {
-                        let response = MessageResponse::Message {
-                            arrival_seq,
-                            message: msg,
-                        };
-                        connection.send(response).await?;
-                    }
-
-                    let response = MessageResponse::BackfillComplete { last_seq, has_more };
-                    connection.send(response).await?;
+        MessageRequest::Send { id, message } => {
+            match registry.store_message(group_id, &id, &message) {
+                Ok(()) => {
+                    connection.send(MessageResponse::Stored).await?;
                 }
                 Err(e) => {
-                    let response = MessageResponse::Error(e);
-                    connection.send(response).await?;
+                    connection.send(MessageResponse::Error(e)).await?;
                 }
             }
         }
+
+        MessageRequest::Subscribe { state_vector: _ } => {}
+
+        MessageRequest::Backfill {
+            state_vector,
+            limit,
+        } => match registry.get_messages_after(group_id, &state_vector) {
+            Ok(messages) => {
+                let has_more = messages.len() > limit as usize;
+                let messages: Vec<_> = messages.into_iter().take(limit as usize).collect();
+
+                for (id, message) in messages {
+                    connection
+                        .send(MessageResponse::Message { id, message })
+                        .await?;
+                }
+
+                connection
+                    .send(MessageResponse::BackfillComplete { has_more })
+                    .await?;
+            }
+            Err(e) => {
+                connection.send(MessageResponse::Error(e)).await?;
+            }
+        },
     }
 
     Ok(())

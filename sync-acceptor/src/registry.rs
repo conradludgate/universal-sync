@@ -200,25 +200,28 @@ where
     pub fn store_message(
         &self,
         group_id: &GroupId,
+        id: &universal_sync_core::MessageId,
         msg: &universal_sync_core::EncryptedAppMessage,
-    ) -> Result<u64, String> {
+    ) -> Result<(), String> {
         self.state_store
-            .store_app_message(group_id, msg)
+            .store_app_message(group_id, id, msg)
             .map_err(|e| format!("failed to store message: {e}"))
     }
 
-    pub fn get_messages_since(
+    pub fn get_messages_after(
         &self,
         group_id: &GroupId,
-        since_seq: u64,
-    ) -> Result<Vec<(u64, universal_sync_core::EncryptedAppMessage)>, String> {
-        Ok(self.state_store.get_messages_since(group_id, since_seq))
+        state_vector: &universal_sync_core::StateVector,
+    ) -> Result<Vec<(universal_sync_core::MessageId, universal_sync_core::EncryptedAppMessage)>, String>
+    {
+        Ok(self.state_store.get_messages_after(group_id, state_vector))
     }
 
     pub fn subscribe_messages(
         &self,
         group_id: &GroupId,
-    ) -> tokio::sync::broadcast::Receiver<universal_sync_core::EncryptedAppMessage> {
+    ) -> tokio::sync::broadcast::Receiver<(universal_sync_core::MessageId, universal_sync_core::EncryptedAppMessage)>
+    {
         self.state_store.subscribe_messages(group_id)
     }
 

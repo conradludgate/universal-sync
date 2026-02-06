@@ -1,10 +1,10 @@
 //! Wire types for the client↔acceptor protocol: handshake, group messages,
 //! and application message delivery.
 
+use std::collections::BTreeMap;
+
 use mls_rs::MlsMessage;
 use serde::{Deserialize, Serialize};
-
-use crate::proposal::{Epoch, MemberId};
 
 /// Group identifier (32 bytes, zero-padded from MLS group ID).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,13 +87,39 @@ impl GroupMessage {
     }
 }
 
-/// Unique identifier for an application message: (group, epoch, sender, index).
+/// SHA-256 of the member's MLS signing public key. Stable across epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct MemberFingerprint(pub [u8; 32]);
+
+impl MemberFingerprint {
+    #[must_use]
+    pub fn from_signing_key(key: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(key);
+        Self(hash.into())
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for MemberFingerprint {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Per-member high-water mark: "I have all messages from this sender up to this seq".
+pub type StateVector = BTreeMap<MemberFingerprint, u64>;
+
+/// Unique identifier for an application message: (group, sender fingerprint, seq).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageId {
     pub group_id: GroupId,
-    pub epoch: Epoch,
-    pub sender: MemberId,
-    pub index: u32,
+    pub sender: MemberFingerprint,
+    pub seq: u64,
 }
 
 /// Encrypted application message (MLS `PrivateMessage` ciphertext).
@@ -104,22 +130,27 @@ pub struct EncryptedAppMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageRequest {
-    Send(EncryptedAppMessage),
-    Subscribe { since_seq: u64 },
-    Backfill { since_seq: u64, limit: u32 },
+    Send {
+        id: MessageId,
+        message: EncryptedAppMessage,
+    },
+    Subscribe {
+        state_vector: StateVector,
+    },
+    Backfill {
+        state_vector: StateVector,
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageResponse {
-    Stored {
-        arrival_seq: u64,
-    },
+    Stored,
     Message {
-        arrival_seq: u64,
+        id: MessageId,
         message: EncryptedAppMessage,
     },
     BackfillComplete {
-        last_seq: u64,
         has_more: bool,
     },
     Error(String),

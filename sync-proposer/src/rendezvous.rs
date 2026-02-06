@@ -9,12 +9,11 @@ use universal_sync_core::{AcceptorId, MessageId};
 use xxhash_rust::xxh3::xxh3_64;
 
 fn compute_score(acceptor_id: &AcceptorId, message_id: &MessageId) -> u64 {
-    let mut buf = [0u8; 80];
+    let mut buf = [0u8; 104];
     buf[..32].copy_from_slice(acceptor_id.as_bytes());
     buf[32..64].copy_from_slice(message_id.group_id.as_bytes());
-    buf[64..72].copy_from_slice(&message_id.epoch.0.to_le_bytes());
-    buf[72..76].copy_from_slice(&message_id.sender.0.to_le_bytes());
-    buf[76..80].copy_from_slice(&message_id.index.to_le_bytes());
+    buf[64..96].copy_from_slice(message_id.sender.as_bytes());
+    buf[96..104].copy_from_slice(&message_id.seq.to_le_bytes());
     xxh3_64(&buf)
 }
 
@@ -66,7 +65,7 @@ pub(crate) fn delivery_count(num_acceptors: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use universal_sync_core::{Epoch, GroupId, MemberId};
+    use universal_sync_core::{GroupId, MemberFingerprint};
 
     use super::*;
 
@@ -76,12 +75,11 @@ mod tests {
         AcceptorId::from_bytes(bytes)
     }
 
-    fn make_message_id(index: u32) -> MessageId {
+    fn make_message_id(seq: u64) -> MessageId {
         MessageId {
             group_id: GroupId::new([1u8; 32]),
-            epoch: Epoch(0),
-            sender: MemberId(0),
-            index,
+            sender: MemberFingerprint([0u8; 32]),
+            seq,
         }
     }
 
@@ -111,12 +109,9 @@ mod tests {
     fn test_select_acceptors_different_messages() {
         let acceptors: Vec<_> = (0..10).map(make_acceptor).collect();
 
-        // Use more varied message indices to ensure different selections
         let selected1 = select_acceptors(&acceptors, &make_message_id(100), 3);
         let selected2 = select_acceptors(&acceptors, &make_message_id(999), 3);
 
-        // Different messages should (usually) select different acceptors
-        // This is probabilistic, but with 10 acceptors and 3 selected, collision is unlikely
         assert_ne!(selected1, selected2);
     }
 

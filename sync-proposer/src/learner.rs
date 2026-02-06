@@ -11,7 +11,7 @@ use mls_rs::group::{CommitEffect, ReceivedMessage};
 use mls_rs::{CipherSuiteProvider, Group};
 use universal_sync_core::{
     AcceptorAdd, AcceptorId, AcceptorRemove, Attempt, Epoch, GroupMessage, GroupProposal, MemberId,
-    UnsignedProposal,
+    MemberFingerprint, UnsignedProposal,
 };
 
 /// Error marker for `GroupLearner` operations.
@@ -111,6 +111,22 @@ where
     /// Remove an acceptor from the set by ID
     pub(crate) fn remove_acceptor_id(&mut self, acceptor_id: &AcceptorId) {
         self.acceptors.remove(acceptor_id);
+    }
+
+    /// Our own signing public key fingerprint (SHA-256).
+    pub(crate) fn own_fingerprint(&self) -> MemberFingerprint {
+        let member_index = self.group.current_member_index();
+        let signing_key = self
+            .group
+            .roster()
+            .members()
+            .iter()
+            .find(|m| m.index == member_index)
+            .expect("own member must be in roster")
+            .signing_identity
+            .signature_key
+            .clone();
+        MemberFingerprint::from_signing_key(&signing_key)
     }
 
     /// Apply a pending commit that this member created

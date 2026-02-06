@@ -25,6 +25,7 @@ mls-rs-core = "0.25"
 mls-rs = { version = "0.52", default-features = false, features = ["std"] }
 yrs = { version = "0.25" }
 zeroize = "1.8"
+sha2 = "0.10"
 
 error-stack = "0.6"
 bs58 = "0.5"

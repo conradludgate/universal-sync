@@ -106,7 +106,9 @@ impl AcceptorActor {
                     FramedWrite::new(message_send, LengthDelimitedCodec::new());
                 let message_reader = FramedRead::new(message_recv, LengthDelimitedCodec::new());
 
-                let subscribe_request = MessageRequest::Subscribe { since_seq: 0 };
+                let subscribe_request = MessageRequest::Subscribe {
+                    state_vector: Default::default(),
+                };
                 if let Ok(request_bytes) = postcard::to_allocvec(&subscribe_request) {
                     if message_writer.send(request_bytes.into()).await.is_ok() {
                         Some((message_writer, message_reader))
@@ -141,9 +143,9 @@ impl AcceptorActor {
                                 return ConnectionResult::Disconnected;
                             }
                         }
-                        AcceptorOutbound::AppMessage { msg } => {
+                        AcceptorOutbound::AppMessage { id, msg } => {
                             if let Some(ref mut writer) = message_writer_opt {
-                                let request = MessageRequest::Send(msg);
+                                let request = MessageRequest::Send { id, message: msg };
                                 if let Ok(request_bytes) = postcard::to_allocvec(&request) {
                                     let _ = writer.send(request_bytes.into()).await;
                                 }
@@ -175,7 +177,7 @@ impl AcceptorActor {
                     }
                 } => {
                     if let Ok(bytes) = result {
-                        if let Ok(MessageResponse::Message { message, .. }) = postcard::from_bytes(&bytes) {
+                        if let Ok(MessageResponse::Message { message, .. }) = postcard::from_bytes::<MessageResponse>(&bytes) {
                             let _ = self.inbound_tx.send(AcceptorInbound::EncryptedMessage {
                                 msg: message,
                             }).await;
