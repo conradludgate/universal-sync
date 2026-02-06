@@ -127,6 +127,18 @@ pub fn test_yrs_group_client(
     client
 }
 
+/// Like [`test_yrs_group_client`] but with a custom `CompactionConfig`.
+#[must_use]
+pub fn test_yrs_group_client_with_config(
+    name: &'static str,
+    endpoint: Endpoint,
+    config: universal_sync_core::CompactionConfig,
+) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
+    let mut client = test_group_client(name, endpoint);
+    client.register_crdt_factory(YrsCrdtFactory::new().with_compaction_config(config));
+    client
+}
+
 /// Safe to call multiple times.
 pub fn init_tracing() {
     let _ = fmt()
