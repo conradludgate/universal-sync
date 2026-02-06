@@ -40,122 +40,73 @@ No mutexes anywhere. All shared state is mediated by mpsc + oneshot channels.
 
 ### 1. Project scaffolding
 
-- [ ] Add `sync-editor/src-tauri` to workspace members in root `Cargo.toml`
-- [ ] Create `sync-editor/src-tauri/Cargo.toml` with dependencies:
-      tauri (v2), tokio, serde/serde_json,
-      universal-sync-proposer, universal-sync-core, universal-sync-testing (for YrsCrdtFactory),
-      yrs, iroh, mls-rs, mls-rs-crypto-rustcrypto, bs58, tracing, tracing-subscriber
-- [ ] Create `sync-editor/src-tauri/build.rs` (tauri codegen build script)
-- [ ] Update `sync-editor/tauri.conf.json` if needed (beforeBuildCommand, etc.)
+- [x] Add `sync-editor` to workspace members in root `Cargo.toml`
+- [x] Create `sync-editor/Cargo.toml` with dependencies
+- [x] Create `sync-editor/build.rs` (tauri codegen build script)
+- [x] Fix `capabilities/default.json` (removed unavailable `shell:allow-open`)
 
-### 2. Request / response types (`sync-editor/src-tauri/src/types.rs`)
+### 2. Request / response types (`sync-editor/src/types.rs`)
 
-- [ ] Define `Delta` enum (serde-tagged: `Insert { position, text }`, `Delete { position, length }`)
-- [ ] Define `DocumentInfo` struct (`group_id: String`, `text: String`, `member_count: usize`)
-- [ ] Define `CoordinatorRequest` enum:
-      - `CreateDocument { reply }`
-      - `GetKeyPackage { reply }`
-      - `RecvWelcome { reply }`
-      - `JoinDocumentBytes { welcome, reply }`
-      - `ForDoc { group_id, request: DocRequest }`
-- [ ] Define `DocRequest` enum:
-      - `ApplyDelta { delta, reply }`
-      - `GetText { reply }`
-      - `AddMember { key_package_b58, reply }`
-      - `AddAcceptor { addr_b58, reply }`
-      - `ListAcceptors { reply }`
-      - `Shutdown`
+- [x] Define `Delta` enum (Insert, Delete, Replace)
+- [x] Define `DocumentInfo` struct
+- [x] Define `DocumentUpdatedPayload` struct
+- [x] Define `AppState` struct (holds `mpsc::Sender<CoordinatorRequest>`)
+- [x] Define `CoordinatorRequest` enum
+- [x] Define `DocRequest` enum
 
-### 3. CoordinatorActor (`sync-editor/src-tauri/src/actor.rs`)
+### 3. CoordinatorActor (`sync-editor/src/actor.rs`)
 
-- [ ] Create `CoordinatorActor` struct:
-      - `group_client: GroupClient<C, CS>`
-      - `doc_actors: HashMap<GroupId, mpsc::Sender<DocRequest>>`
-      - `request_rx: mpsc::Receiver<CoordinatorRequest>`
-      - `app_handle: tauri::AppHandle`
-- [ ] Implement `run()` loop: recv requests, match & dispatch
-- [ ] Implement `create_document()`:
-      - Call `group_client.create_group(&[], "yrs")`
-      - Spawn a `DocumentActor` for the new group
-      - Store its `mpsc::Sender<DocRequest>` in the routing table
-      - Return `DocumentInfo`
-- [ ] Implement `get_key_package()`:
-      - Call `group_client.generate_key_package()`
-      - Serialize to base58
-- [ ] Implement `recv_welcome()`:
-      - Call `group_client.recv_welcome().await`
-      - Call `group_client.join_group(&welcome_bytes)`
-      - Spawn a `DocumentActor` for the joined group
-      - Return `DocumentInfo`
-- [ ] Implement `join_document_bytes(welcome)`:
-      - Call `group_client.join_group(&welcome)`
-      - Spawn a `DocumentActor`
-      - Return `DocumentInfo`
-- [ ] Implement `ForDoc` routing:
-      - Look up `doc_actors[group_id]` and forward the `DocRequest`
+- [x] Create `CoordinatorActor` struct with `welcome_rx` split out via `take_welcome_rx()`
+- [x] Implement `run()` with `select!` over requests + welcome messages (non-blocking)
+- [x] Implement `create_document()` — creates group, spawns DocumentActor
+- [x] Implement `get_key_package()` — generates and base58-encodes
+- [x] Implement `recv_welcome()` — stores pending reply, responds when welcome arrives
+- [x] Implement `join_document_bytes()` — joins from base58 welcome
+- [x] Implement `ForDoc` routing
+- [x] Added `GroupClient::take_welcome_rx()` to `sync-proposer/src/client.rs`
 
-### 4. DocumentActor (`sync-editor/src-tauri/src/document.rs`)
+### 4. DocumentActor (`sync-editor/src/document.rs`)
 
-- [ ] Create `DocumentActor` struct:
-      - `group: Group<C, CS>`
-      - `group_id_b58: String`
-      - `request_rx: mpsc::Receiver<DocRequest>`
-      - `app_handle: tauri::AppHandle`
-- [ ] Implement `run()` select loop:
-      - Branch 1: `request_rx.recv()` → handle DocRequest
-      - Branch 2: `group.wait_for_update()` → read text, emit `document-updated` event
-- [ ] Implement `apply_delta(delta)`:
-      - Downcast `group.crdt_mut()` to `YrsCrdt`
-      - Get `doc.get_or_insert_text("doc")`
-      - Match delta: Insert → `text.insert()`, Delete → `text.remove_range()`
-      - Call `group.send_update().await`
-- [ ] Implement `get_text()`:
-      - Downcast `group.crdt()` to `YrsCrdt`
-      - Read text from `doc.get_or_insert_text("doc")` via `get_string()`
-- [ ] Implement `add_member(key_package_b58)`:
-      - Decode base58 → `MlsMessage::from_bytes`
-      - Call `group.add_member(kp).await`
-- [ ] Implement `add_acceptor(addr_b58)`:
-      - Decode base58 → `EndpointAddr`
-      - Call `group.add_acceptor(addr).await`
-- [ ] Implement `list_acceptors()`:
-      - Call `group.context().await`
-      - Return acceptor IDs as base58 strings
+- [x] Create `DocumentActor` struct
+- [x] Implement `run()` select loop (requests + remote updates)
+- [x] Implement `apply_delta()` with Insert, Delete, and Replace support
+- [x] Implement `get_text()`
+- [x] Implement `add_member()`
+- [x] Implement `add_acceptor()`
+- [x] Implement `list_acceptors()`
+- [x] Implement `emit_text_update()` — emits `document-updated` Tauri event
 
-### 5. Tauri commands (`sync-editor/src-tauri/src/commands.rs`)
+### 5. Tauri commands (`sync-editor/src/commands.rs`)
 
 Each command is a thin async fn that sends a request to the coordinator and awaits the oneshot reply.
 
-- [ ] `create_document(state) → DocumentInfo`
-- [ ] `get_key_package(state) → String`
-- [ ] `recv_welcome(state) → DocumentInfo`
-- [ ] `join_document_bytes(state, welcome) → DocumentInfo`
-- [ ] `apply_delta(state, group_id, delta) → ()`
-- [ ] `get_document_text(state, group_id) → String`
-- [ ] `add_member(state, group_id, key_package_b58) → ()`
-- [ ] `add_acceptor(state, group_id, addr_b58) → ()`
-- [ ] `list_acceptors(state, group_id) → Vec<String>`
+- [x] `create_document(state) → DocumentInfo`
+- [x] `get_key_package(state) → String`
+- [x] `recv_welcome(state) → DocumentInfo`
+- [x] `join_document_bytes(state, welcome_b58) → DocumentInfo`
+- [x] `apply_delta(state, group_id, delta) → ()`
+- [x] `get_document_text(state, group_id) → String`
+- [x] `add_member(state, group_id, key_package_b58) → ()`
+- [x] `add_acceptor(state, group_id, addr_b58) → ()`
+- [x] `list_acceptors(state, group_id) → Vec<String>`
 
-### 6. App entry point (`sync-editor/src-tauri/src/main.rs`)
+### 6. App entry point (`sync-editor/src/main.rs`)
 
-- [ ] Set up tracing
-- [ ] Generate or load iroh secret key
-- [ ] Create MLS client with all extension types registered
-- [ ] Create iroh endpoint
-- [ ] Create `GroupClient`, register `YrsCrdtFactory`
-- [ ] Create `mpsc::channel` for `CoordinatorRequest`
-- [ ] Spawn `CoordinatorActor`
-- [ ] Build Tauri app:
-      - Manage `AppState { coordinator_tx }`
-      - Register all `#[tauri::command]` handlers
-      - Run
+- [x] Set up tracing
+- [x] Generate ephemeral iroh secret key
+- [x] Create MLS client with all extension types registered
+- [x] Create iroh endpoint
+- [x] Create `GroupClient`, register `NoCrdtFactory` + `YrsCrdtFactory`
+- [x] Create `mpsc::channel` eagerly so `AppState` is available immediately
+- [x] Spawn `CoordinatorActor` in `setup()` callback
+- [x] Build and run Tauri app with all command handlers
 
 ### 7. Frontend adjustments (`sync-editor/ui/app.js`)
 
-- [ ] Verify `computeDelta` handles both insert and delete correctly
-      (currently only returns one — acceptable for MVP, note for future improvement)
-- [ ] Verify `document-updated` event handler matches `group_id` (already does)
-- [ ] No other changes expected — existing JS already calls the right command names
+- [x] Fixed `computeDelta` to handle Replace (simultaneous delete + insert)
+- [x] Updated `startWelcomeListener` — `recv_welcome` now returns `DocumentInfo` directly
+- [x] Added echo suppression in `document-updated` handler (skip if text unchanged)
+- [x] Verified `document-updated` event handler matches `group_id`
 
 ### 8. Testing
 
