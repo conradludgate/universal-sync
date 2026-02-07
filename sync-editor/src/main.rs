@@ -98,7 +98,13 @@ async fn setup_coordinator(
 
     info!("MLS client created");
 
+    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(std::time::Duration::from_secs(5))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()))
+        .build();
+
     let endpoint = Endpoint::builder()
+        .transport_config(transport_config)
         .secret_key(iroh_key)
         .alpns(vec![PAXOS_ALPN.to_vec()])
         .bind()

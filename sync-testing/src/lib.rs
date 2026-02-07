@@ -132,7 +132,13 @@ pub fn init_tracing() {
 /// Panics if the endpoint fails to bind.
 pub async fn test_endpoint() -> Endpoint {
     let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(std::time::Duration::from_secs(5))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()))
+        .build();
+
     Endpoint::empty_builder(RelayMode::Disabled)
+        .transport_config(transport_config)
         .alpns(vec![PAXOS_ALPN.to_vec()])
         .bind_addr(bind_addr)
         .expect("valid bind address")

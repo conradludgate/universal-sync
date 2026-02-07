@@ -77,12 +77,6 @@ impl AcceptorActor {
             Ok(streams) => streams,
             Err(e) => {
                 tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to open proposal stream");
-                let _ = self
-                    .inbound_tx
-                    .send(AcceptorInbound::Disconnected {
-                        acceptor_id: self.acceptor_id,
-                    })
-                    .await;
                 return ConnectionResult::Disconnected {
                     was_connected: false,
                 };

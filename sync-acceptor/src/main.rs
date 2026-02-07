@@ -69,7 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .identity_provider(BasicIdentityProvider::new())
         .build();
 
+    let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+        .keep_alive_interval(std::time::Duration::from_secs(5))
+        .max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()))
+        .build();
+
     let mut endpoint_builder = Endpoint::builder()
+        .transport_config(transport_config)
         .secret_key(secret_key.clone())
         .alpns(vec![PAXOS_ALPN.to_vec()]);
 
