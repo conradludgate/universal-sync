@@ -114,8 +114,9 @@ struct ActiveCompactionClaim {
 struct CompactionState {
     /// Active claim per level (only one compaction at a time per level).
     active_claims: HashMap<u8, ActiveCompactionClaim>,
-    /// Number of L0 messages since the last compaction.
-    l0_count_since_compaction: u64,
+    /// Per-level counters: `counts[N]` is the number of entries produced at
+    /// level N-1 since the last compaction *into* level N. Index 0 is unused.
+    counts: Vec<u64>,
     /// The watermark that was last compacted (messages at or below this are compacted).
     last_compacted_watermark: StateVector,
     /// Force immediate compaction on next check (e.g. after adding a member).
@@ -123,6 +124,16 @@ struct CompactionState {
 }
 
 impl CompactionState {
+    /// Create a new `CompactionState` with per-level counters sized to `config`.
+    fn new(config: &CompactionConfig) -> Self {
+        Self {
+            active_claims: HashMap::new(),
+            counts: vec![0; config.len()],
+            last_compacted_watermark: StateVector::new(),
+            force_compaction: false,
+        }
+    }
+
     /// Returns true if there is an active, non-expired claim at the given level.
     fn has_active_claim(&self, level: u8) -> bool {
         self.active_claims.get(&level).is_some_and(|claim| {
@@ -142,6 +153,55 @@ impl CompactionState {
             .as_secs();
 
         self.active_claims.retain(|_, claim| now < claim.deadline);
+    }
+
+    /// Record that one entry was produced at `level` (L0 message sent, or
+    /// compaction completed into level N). Increments `counts[level + 1]`.
+    fn record_entry(&mut self, level: usize) {
+        let next = level + 1;
+        if next < self.counts.len() {
+            self.counts[next] += 1;
+        }
+    }
+
+    /// Determine the highest compaction level that would be triggered by a
+    /// cascade, starting from L1. When L(N) triggers, it would produce one
+    /// entry at L(N), so `counts[N+1]` would increment — if that also meets
+    /// the threshold, we cascade further.
+    ///
+    /// Returns `None` if no level triggers.
+    fn cascade_target(&self, config: &CompactionConfig) -> Option<u8> {
+        let mut target: Option<usize> = None;
+
+        // Start at L1 and walk upward.
+        for (level, level_cfg) in config.iter().enumerate().skip(1) {
+            let count = if target.is_some() {
+                // A lower level already triggered — completing it would bump
+                // this level's counter by 1.
+                self.counts.get(level).copied().unwrap_or(0) + 1
+            } else {
+                self.counts.get(level).copied().unwrap_or(0)
+            };
+
+            let threshold = u64::from(level_cfg.threshold);
+            if threshold > 0 && count >= threshold {
+                target = Some(level);
+            } else if target.is_some() {
+                // Cascade stops here — this level wouldn't trigger.
+                break;
+            }
+        }
+
+        target.map(|l| u8::try_from(l).expect("compaction levels fit in u8"))
+    }
+
+    /// Reset counters for all levels up to and including `level`.
+    fn reset_counts_up_to(&mut self, level: u8) {
+        for i in 1..=usize::from(level) {
+            if i < self.counts.len() {
+                self.counts[i] = 0;
+            }
+        }
     }
 }
 
@@ -200,7 +260,7 @@ where
             pending_messages: Vec::new(),
             join_epoch,
             active_proposal: None,
-            compaction_state: CompactionState::default(),
+            compaction_state: CompactionState::new(&compaction_config),
             compaction_config,
             crdt_factory,
             update_buffer: Vec::new(),
@@ -573,7 +633,7 @@ where
             }
         }
 
-        self.compaction_state.l0_count_since_compaction += 1;
+        self.compaction_state.record_entry(0);
 
         let _ = reply.send(Ok(()));
     }
@@ -1190,8 +1250,13 @@ where
                     // a previously compacted snapshot that needs to be
                     // re-encrypted at the current epoch.
                     if !self.update_buffer.is_empty() || self.last_compacted_snapshot.is_some() {
-                        let max_level = self.compaction_config.levels.saturating_sub(1);
-                        if max_level > 0 && !self.compaction_state.has_active_claim(max_level) {
+                        let max_level = u8::try_from(
+                            self.compaction_config.len().saturating_sub(1),
+                        )
+                        .unwrap_or(0);
+                        if max_level > 0
+                            && !self.compaction_state.has_active_claim(max_level)
+                        {
                             tracing::info!("new member added, forcing compaction for catch-up");
                             self.compaction_state.force_compaction = true;
                         }
@@ -1289,7 +1354,8 @@ where
                     }
                 }
 
-                self.compaction_state.l0_count_since_compaction = 0;
+                self.compaction_state.reset_counts_up_to(level);
+                self.compaction_state.record_entry(usize::from(level));
                 self.update_buffer.clear();
 
                 GroupEvent::CompactionCompleted { level }
@@ -1388,7 +1454,7 @@ where
             *hw = seq;
         }
 
-        self.compaction_state.l0_count_since_compaction += 1;
+        self.compaction_state.record_entry(0);
 
         // Buffer the raw CRDT update for compaction
         let data = app_msg.data().to_vec();
@@ -1427,7 +1493,8 @@ where
             self.compaction_state.force_compaction = false;
 
             // Force an L(max) compaction for new member catch-up
-            let max_level = self.compaction_config.levels.saturating_sub(1);
+            let max_level =
+                u8::try_from(self.compaction_config.len().saturating_sub(1)).unwrap_or(0);
             if max_level > 0 && !self.compaction_state.has_active_claim(max_level) {
                 tracing::info!(
                     level = max_level,
@@ -1438,31 +1505,18 @@ where
             }
         }
 
-        // Check each level's threshold (from lowest to highest)
-        // thresholds[0] is the threshold for L0 → L1 compaction, etc.
-        let thresholds = self.compaction_config.thresholds.clone();
-        let l0_count = self.compaction_state.l0_count_since_compaction;
-
-        for (i, &threshold) in thresholds.iter().enumerate() {
-            let level = u8::try_from(i + 1).expect("compaction levels fit in u8");
-
-            // Check if we've accumulated enough messages
-            if l0_count < u64::from(threshold) {
-                continue;
-            }
-
-            // Check if there's already an active claim at this level
-            if self.compaction_state.has_active_claim(level) {
-                continue;
-            }
-
-            // We should trigger compaction at this level
-            tracing::info!(level, l0_count, threshold, "triggering compaction");
-
+        // Find the highest level that would trigger via cascade.
+        // E.g. if L1 triggers and completing it would also trigger L2, skip
+        // straight to L2 compaction.
+        if let Some(level) = self.compaction_state.cascade_target(&self.compaction_config)
+            && !self.compaction_state.has_active_claim(level)
+        {
+            tracing::info!(
+                level,
+                counts = ?self.compaction_state.counts,
+                "triggering compaction (cascade)"
+            );
             self.perform_compaction(level).await;
-
-            // Only trigger one level at a time
-            break;
         }
     }
 
@@ -1517,7 +1571,11 @@ where
         }
 
         let had_new_updates = !self.update_buffer.is_empty();
-        self.compaction_state.l0_count_since_compaction = 0;
+        // Reset counters for all levels up to the compacted level, and
+        // record that one entry was produced at this level (bumps the
+        // counter for the level above, if any).
+        self.compaction_state.reset_counts_up_to(level);
+        self.compaction_state.record_entry(usize::from(level));
         self.update_buffer.clear();
         self.last_compacted_snapshot = Some(compacted);
 
@@ -1567,10 +1625,8 @@ where
         let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
         let replication = self
             .compaction_config
-            .replication
             .get(usize::from(level))
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |cfg| cfg.replication);
         let delivery_count = if replication == 0 {
             acceptor_ids.len()
         } else {
@@ -1716,16 +1772,23 @@ mod tests {
             .as_secs()
     }
 
+    use universal_sync_core::{CompactionLevel, default_compaction_config};
+
+    /// Helper: 3-level config for tests (L0, L1 at threshold 10, L2 at threshold 5).
+    fn test_config_3() -> CompactionConfig {
+        default_compaction_config()
+    }
+
     #[test]
     fn compaction_state_no_active_claims() {
-        let state = CompactionState::default();
+        let state = CompactionState::new(&test_config_3());
         assert!(!state.has_active_claim(1));
         assert!(!state.has_active_claim(2));
     }
 
     #[test]
     fn compaction_state_active_claim_not_expired() {
-        let mut state = CompactionState::default();
+        let mut state = CompactionState::new(&test_config_3());
         state
             .active_claims
             .insert(1, make_claim(1, now_secs() + 60));
@@ -1735,14 +1798,14 @@ mod tests {
 
     #[test]
     fn compaction_state_expired_claim() {
-        let mut state = CompactionState::default();
+        let mut state = CompactionState::new(&test_config_3());
         state.active_claims.insert(1, make_claim(1, now_secs() - 1));
         assert!(!state.has_active_claim(1));
     }
 
     #[test]
     fn compaction_state_prune_expired() {
-        let mut state = CompactionState::default();
+        let mut state = CompactionState::new(&test_config_3());
         state.active_claims.insert(1, make_claim(1, now_secs() - 1));
         state
             .active_claims
@@ -1756,7 +1819,7 @@ mod tests {
 
     #[test]
     fn compaction_state_multiple_levels() {
-        let mut state = CompactionState::default();
+        let mut state = CompactionState::new(&test_config_3());
         state
             .active_claims
             .insert(1, make_claim(1, now_secs() + 60));
@@ -1769,11 +1832,102 @@ mod tests {
     }
 
     #[test]
-    fn compaction_state_default_values() {
-        let state = CompactionState::default();
-        assert_eq!(state.l0_count_since_compaction, 0);
+    fn compaction_state_initial_values() {
+        let config = test_config_3();
+        let state = CompactionState::new(&config);
+        assert_eq!(state.counts, vec![0, 0, 0]);
         assert!(state.last_compacted_watermark.is_empty());
         assert!(!state.force_compaction);
         assert!(state.active_claims.is_empty());
+    }
+
+    #[test]
+    fn compaction_state_record_entry_increments_next_level() {
+        let mut state = CompactionState::new(&test_config_3());
+        // Sending an L0 message should bump counts[1].
+        state.record_entry(0);
+        assert_eq!(state.counts, vec![0, 1, 0]);
+
+        // Completing an L1 compaction should bump counts[2].
+        state.record_entry(1);
+        assert_eq!(state.counts, vec![0, 1, 1]);
+
+        // Recording at L(max) should be a no-op (no level above).
+        state.record_entry(2);
+        assert_eq!(state.counts, vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn compaction_state_cascade_no_trigger() {
+        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
+        let mut state = CompactionState::new(&config);
+        // 9 L0 messages → not enough for L1 (threshold 10)
+        for _ in 0..9 {
+            state.record_entry(0);
+        }
+        assert_eq!(state.cascade_target(&config), None);
+    }
+
+    #[test]
+    fn compaction_state_cascade_l1_only() {
+        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
+        let mut state = CompactionState::new(&config);
+        // 10 L0 messages → triggers L1; L2 count is 0 so no cascade
+        for _ in 0..10 {
+            state.record_entry(0);
+        }
+        assert_eq!(state.cascade_target(&config), Some(1));
+    }
+
+    #[test]
+    fn compaction_state_cascade_skips_to_l2() {
+        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
+        let mut state = CompactionState::new(&config);
+        // Simulate: 4 previous L1 compactions already done
+        state.counts[2] = 4;
+        // 10 L0 messages → L1 would trigger → completing it bumps L2 to 5
+        // → L2 also triggers → cascade to L2
+        for _ in 0..10 {
+            state.record_entry(0);
+        }
+        assert_eq!(state.cascade_target(&config), Some(2));
+    }
+
+    #[test]
+    fn compaction_state_reset_counts_up_to() {
+        let mut state = CompactionState::new(&test_config_3());
+        state.counts = vec![0, 10, 4];
+        // Compacting at L2 should reset counts[1] and counts[2]
+        state.reset_counts_up_to(2);
+        assert_eq!(state.counts, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn compaction_state_reset_counts_l1_only() {
+        let mut state = CompactionState::new(&test_config_3());
+        state.counts = vec![0, 10, 4];
+        // Compacting at L1 should only reset counts[1], leave counts[2]
+        state.reset_counts_up_to(1);
+        assert_eq!(state.counts, vec![0, 0, 4]);
+    }
+
+    #[test]
+    fn compaction_state_cascade_two_level_config() {
+        // Simple 2-level config: L0 + L1 (threshold 3)
+        let config = vec![
+            CompactionLevel {
+                threshold: 0,
+                replication: 1,
+            },
+            CompactionLevel {
+                threshold: 3,
+                replication: 0,
+            },
+        ];
+        let mut state = CompactionState::new(&config);
+        for _ in 0..3 {
+            state.record_entry(0);
+        }
+        assert_eq!(state.cascade_target(&config), Some(1));
     }
 }

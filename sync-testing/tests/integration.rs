@@ -8,7 +8,7 @@ use std::time::Duration;
 use mls_rs::external_client::ExternalClient;
 use tempfile::TempDir;
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
-use universal_sync_core::{AcceptorId, CompactionConfig, GroupId};
+use universal_sync_core::{AcceptorId, CompactionLevel, GroupId};
 use universal_sync_proposer::GroupEvent;
 use universal_sync_testing::{
     YrsCrdt, init_tracing, spawn_acceptor, test_cipher_suite, test_crypto_provider, test_endpoint,
@@ -1464,12 +1464,17 @@ async fn wait_for_sync(
 
 /// Helper: low-threshold compaction config for fast tests.
 /// 2 levels (L0 + L(max)), threshold of `threshold` L0 messages.
-fn test_compaction_config(threshold: u32) -> CompactionConfig {
-    CompactionConfig {
-        levels: 2,
-        thresholds: vec![threshold],
-        replication: vec![1, 0], // L0 to 1, L(max) to all
-    }
+fn test_compaction_config(threshold: u32) -> Vec<CompactionLevel> {
+    vec![
+        CompactionLevel {
+            threshold: 0,
+            replication: 1,
+        }, // L0
+        CompactionLevel {
+            threshold,
+            replication: 0,
+        }, // L(max) → all
+    ]
 }
 
 /// Test 1: Welcome + force_compaction L(max) with verified compaction.
@@ -1517,7 +1522,8 @@ async fn test_welcome_force_compaction_verified() {
     match event {
         GroupEvent::CompactionCompleted { level } => {
             // force_compaction always uses L(max)
-            let max_level = CompactionConfig::default().levels.saturating_sub(1);
+            let config = universal_sync_core::default_compaction_config();
+            let max_level = (config.len() - 1) as u8;
             assert_eq!(level, max_level, "force_compaction should use L(max)");
         }
         _ => unreachable!(),

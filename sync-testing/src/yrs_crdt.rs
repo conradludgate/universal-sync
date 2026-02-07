@@ -62,7 +62,7 @@ impl Default for YrsCrdt {
 }
 
 impl Crdt for YrsCrdt {
-    fn type_id(&self) -> &str {
+    fn protocol_name(&self) -> &str {
         "yrs"
     }
 
@@ -186,7 +186,9 @@ impl CrdtFactory for YrsCrdtFactory {
     }
 
     fn compaction_config(&self) -> CompactionConfig {
-        self.compaction_config.clone().unwrap_or_default()
+        self.compaction_config
+            .clone()
+            .unwrap_or_else(universal_sync_core::default_compaction_config)
     }
 }
 
@@ -200,7 +202,7 @@ mod tests {
     #[test]
     fn test_yrs_crdt_basic() {
         let crdt = YrsCrdt::new();
-        assert_eq!(Crdt::type_id(&crdt), "yrs");
+        assert_eq!(Crdt::protocol_name(&crdt), "yrs");
 
         let snapshot = crdt.snapshot().unwrap();
         assert!(!snapshot.is_empty());
@@ -277,11 +279,11 @@ mod tests {
         assert_eq!(CrdtFactory::type_id(&factory), "yrs");
 
         let crdt = factory.create();
-        assert_eq!(Crdt::type_id(&*crdt), "yrs");
+        assert_eq!(Crdt::protocol_name(&*crdt), "yrs");
 
         let snapshot = crdt.snapshot().unwrap();
         let crdt2 = factory.from_snapshot(&snapshot).unwrap();
-        assert_eq!(Crdt::type_id(&*crdt2), "yrs");
+        assert_eq!(Crdt::protocol_name(&*crdt2), "yrs");
     }
 
     #[test]
@@ -289,7 +291,7 @@ mod tests {
         let factory = YrsCrdtFactory::with_fixed_client_id(42);
 
         let crdt = factory.create();
-        assert_eq!(Crdt::type_id(&*crdt), "yrs");
+        assert_eq!(Crdt::protocol_name(&*crdt), "yrs");
     }
 
     #[test]

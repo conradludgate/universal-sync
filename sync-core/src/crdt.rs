@@ -22,7 +22,8 @@ impl std::error::Error for CrdtError {}
 
 /// Dyn-compatible CRDT that can be synchronized across group members.
 pub trait Crdt: Send + Sync + 'static {
-    fn type_id(&self) -> &str;
+    fn protocol_name(&self) -> &str;
+
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
@@ -81,31 +82,46 @@ pub trait CrdtFactory: Send + Sync {
     }
 
     fn compaction_config(&self) -> CompactionConfig {
-        CompactionConfig::default()
+        default_compaction_config()
     }
 }
 
-/// Per-CRDT configuration for hierarchical compaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactionConfig {
-    /// Number of compaction levels (minimum 2: L0 individual + L(max) full snapshot).
-    pub levels: u8,
-    /// Per-level threshold: compact when this many entries accumulate at level N.
-    /// Length must be `levels - 1` (no threshold for the top level).
-    pub thresholds: Vec<u32>,
-    /// Per-level replication factor. 0 means replicate to all acceptors.
-    /// Length must be `levels`.
-    pub replication: Vec<u8>,
+/// Configuration for a single compaction level.
+///
+/// Index 0 is L0 (raw individual messages), higher indices are progressively
+/// more compacted tiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionLevel {
+    /// Compact into *this* level when the level below accumulates this many entries.
+    /// L0 should have `threshold: 0` (entries are created directly, not via compaction).
+    pub threshold: u32,
+    /// How many acceptors store entries at this level (0 = all).
+    pub replication: u8,
 }
 
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            levels: 3,
-            thresholds: vec![10, 5],
-            replication: vec![1, 2, 0],
-        }
-    }
+/// Per-CRDT compaction configuration.
+///
+/// A `Vec<CompactionLevel>` where index = level number. Must have at least 2
+/// levels (L0 for raw messages + L(max) for the full compacted snapshot).
+pub type CompactionConfig = Vec<CompactionLevel>;
+
+/// Default 3-level config: L0 → L1 after 10 messages, L1 → L2 after 5.
+#[must_use]
+pub fn default_compaction_config() -> CompactionConfig {
+    vec![
+        CompactionLevel {
+            threshold: 0,
+            replication: 1,
+        },
+        CompactionLevel {
+            threshold: 10,
+            replication: 2,
+        },
+        CompactionLevel {
+            threshold: 5,
+            replication: 0,
+        },
+    ]
 }
 
 /// No-op CRDT for groups without CRDT support.
@@ -113,7 +129,7 @@ impl Default for CompactionConfig {
 pub struct NoCrdt;
 
 impl Crdt for NoCrdt {
-    fn type_id(&self) -> &'static str {
+    fn protocol_name(&self) -> &'static str {
         "none"
     }
 
@@ -171,7 +187,7 @@ mod tests {
     fn test_no_crdt() {
         let mut crdt = NoCrdt;
 
-        assert_eq!(Crdt::type_id(&crdt), "none");
+        assert_eq!(Crdt::protocol_name(&crdt), "none");
         assert!(crdt.apply(b"anything").is_ok());
         assert!(crdt.merge(b"anything").is_ok());
 
@@ -188,30 +204,38 @@ mod tests {
         assert_eq!(CrdtFactory::type_id(&factory), "none");
 
         let crdt = factory.create();
-        assert_eq!(Crdt::type_id(&*crdt), "none");
+        assert_eq!(Crdt::protocol_name(&*crdt), "none");
 
         let crdt2 = factory.from_snapshot(b"ignored").unwrap();
-        assert_eq!(Crdt::type_id(&*crdt2), "none");
+        assert_eq!(Crdt::protocol_name(&*crdt2), "none");
     }
 
     #[test]
     fn test_compaction_config_default() {
-        let config = CompactionConfig::default();
-        assert_eq!(config.levels, 3);
-        assert_eq!(config.thresholds.len(), 2); // levels - 1
-        assert_eq!(config.replication.len(), 3); // levels
-        assert_eq!(config.replication[2], 0); // L(max) → all acceptors
+        let config = default_compaction_config();
+        assert_eq!(config.len(), 3);
+        assert_eq!(config[0].threshold, 0); // L0: no threshold
+        assert_eq!(config[0].replication, 1);
+        assert_eq!(config[1].threshold, 10); // L0 → L1 after 10
+        assert_eq!(config[1].replication, 2);
+        assert_eq!(config[2].threshold, 5); // L1 → L2 after 5
+        assert_eq!(config[2].replication, 0); // L(max) → all acceptors
     }
 
     #[test]
     fn test_compaction_config_two_level() {
-        let config = CompactionConfig {
-            levels: 2,
-            thresholds: vec![5],
-            replication: vec![1, 0],
-        };
-        assert_eq!(config.thresholds.len(), 1); // levels - 1
-        assert_eq!(config.replication.len(), 2);
+        let config: CompactionConfig = vec![
+            CompactionLevel {
+                threshold: 0,
+                replication: 1,
+            },
+            CompactionLevel {
+                threshold: 5,
+                replication: 0,
+            },
+        ];
+        assert_eq!(config.len(), 2);
+        assert_eq!(config[1].threshold, 5);
     }
 
     #[test]
@@ -224,15 +248,26 @@ mod tests {
 
     #[test]
     fn test_compaction_config_roundtrip() {
-        let config = CompactionConfig {
-            levels: 4,
-            thresholds: vec![100, 50, 10],
-            replication: vec![1, 2, 3, 0],
-        };
+        let config: CompactionConfig = vec![
+            CompactionLevel {
+                threshold: 0,
+                replication: 1,
+            },
+            CompactionLevel {
+                threshold: 100,
+                replication: 2,
+            },
+            CompactionLevel {
+                threshold: 50,
+                replication: 3,
+            },
+            CompactionLevel {
+                threshold: 10,
+                replication: 0,
+            },
+        ];
         let bytes = postcard::to_allocvec(&config).unwrap();
         let decoded: CompactionConfig = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.levels, 4);
-        assert_eq!(decoded.thresholds, vec![100, 50, 10]);
-        assert_eq!(decoded.replication, vec![1, 2, 3, 0]);
+        assert_eq!(decoded, config);
     }
 }
