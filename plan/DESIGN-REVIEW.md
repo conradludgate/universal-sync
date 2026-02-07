@@ -16,7 +16,11 @@ compromise message secrecy. There is no detection or recovery mechanism for
 this scenario — it requires manual intervention (creating a new group).
 
 Metadata privacy (who is in a group, message timing/frequency) is leaked to
-acceptors. This is an accepted trade-off.
+acceptors. This is an accepted trade-off (owner confirmed not a concern).
+
+Members within a group are fully trusted. This means compaction results are
+not independently verified — the compactor is trusted to produce a correct
+merged snapshot.
 
 ## Paxos Consensus
 
@@ -114,6 +118,47 @@ compacted snapshot remains. Devices backfill with their `StateVector`, receive
 the snapshot plus newer updates, and reconstruct state.
 
 Snapshots are re-encrypted at the current epoch for offline/new members.
+
+### Offline Duration Limits
+
+There is no explicit offline duration limit, but practical limits exist:
+
+- Messages that fail to decrypt after 10 attempts (`MAX_MESSAGE_ATTEMPTS`)
+  are dropped.
+- Messages that fail to decrypt after 3 attempts when the device is 5+
+  epochs past its join epoch are also dropped.
+- If compaction deletes old messages from acceptors, the compacted snapshot
+  covers the deleted data, so offline devices can still catch up via
+  snapshot + newer updates.
+- The critical gap is commit catch-up: if a device is offline for multiple
+  epochs and can't learn the intermediate commits, it gets stuck. See
+  [COMMIT-CATCHUP.md](COMMIT-CATCHUP.md).
+
+## Deferred / Not Yet Designed
+
+### Read-Only Membership
+
+The old README mentioned read-only members whose messages are "ignored
+unless a group admin allows that member to send messages." This has not
+been designed or implemented. The enforcement mechanism (cryptographic vs
+policy-based) is undecided. Deferred for future consideration.
+
+### Acceptor Message Replication
+
+No replication or gossip between acceptors for application messages.
+Permanent acceptor failure can lose messages stored only on that acceptor.
+With `ceil(sqrt(n))` routing, messages are typically on multiple acceptors,
+reducing but not eliminating risk. No plan to address this yet — accepted
+as a trade-off of the `ceil(sqrt(n))` routing design.
+
+## Stale Documentation
+
+- **COMPACTION.md Phase 5**: Lists AcceptorAdd/AcceptorRemove migration from
+  context extensions to custom proposals. This migration is already complete
+  in the code — Phase 5 should be marked as done.
+- **Old README**: Claimed p2p initial sync via iroh for new members. The
+  current implementation uses compaction-based catch-up from acceptors
+  instead. The README has been rewritten to reflect this.
 
 ## Priority Issues
 
