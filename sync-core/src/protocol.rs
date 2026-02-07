@@ -128,6 +128,73 @@ pub struct EncryptedAppMessage {
     pub ciphertext: Vec<u8>,
 }
 
+/// Authenticated data carried alongside an MLS application message.
+///
+/// This is placed in the MLS `authenticated_data` field — authenticated but
+/// not encrypted, so acceptors can inspect it without decrypting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthData {
+    /// A regular L0 CRDT update.
+    Update {
+        /// Sender-scoped sequence number.
+        seq: u64,
+    },
+    /// A compacted snapshot that supersedes earlier messages.
+    Compaction {
+        /// Sender-scoped sequence number (shared space with `Update`).
+        seq: u64,
+        /// Compaction level (1 = L0→L1, 2 = L1→L2, etc.).
+        level: u8,
+        /// State vector watermark: messages at or below these per-sender
+        /// sequence numbers are superseded by this compaction.
+        watermark: StateVector,
+    },
+}
+
+impl AuthData {
+    /// Create authenticated data for a regular update.
+    #[must_use]
+    pub fn update(seq: u64) -> Self {
+        Self::Update { seq }
+    }
+
+    /// Create authenticated data for a compaction.
+    #[must_use]
+    pub fn compaction(seq: u64, level: u8, watermark: StateVector) -> Self {
+        Self::Compaction {
+            seq,
+            level,
+            watermark,
+        }
+    }
+
+    /// Extract the sequence number regardless of variant.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Update { seq } | Self::Compaction { seq, .. } => *seq,
+        }
+    }
+
+    /// Encode to bytes for MLS `authenticated_data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        postcard::to_allocvec(self)
+    }
+
+    /// Decode from MLS `authenticated_data` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MessageRequest {
     Send {
@@ -259,6 +326,47 @@ mod tests {
             decoded,
             MessageRequest::Backfill { limit: 100, .. }
         ));
+    }
+
+    #[test]
+    fn auth_data_update_roundtrip() {
+        let ad = AuthData::update(42);
+        let bytes = ad.to_bytes().unwrap();
+        let decoded = AuthData::from_bytes(&bytes).unwrap();
+        assert_eq!(ad, decoded);
+        assert_eq!(decoded.seq(), 42);
+    }
+
+    #[test]
+    fn auth_data_compaction_roundtrip() {
+        let mut watermark = StateVector::new();
+        watermark.insert(MemberFingerprint([0xAA; 32]), 100);
+        watermark.insert(MemberFingerprint([0xBB; 32]), 200);
+
+        let ad = AuthData::compaction(50, 1, watermark.clone());
+        let bytes = ad.to_bytes().unwrap();
+        let decoded = AuthData::from_bytes(&bytes).unwrap();
+        assert_eq!(ad, decoded);
+        assert_eq!(decoded.seq(), 50);
+
+        match decoded {
+            AuthData::Compaction {
+                level, watermark: wm, ..
+            } => {
+                assert_eq!(level, 1);
+                assert_eq!(wm, watermark);
+            }
+            AuthData::Update { .. } => panic!("expected Compaction"),
+        }
+    }
+
+    #[test]
+    fn auth_data_seq_accessor() {
+        assert_eq!(AuthData::update(7).seq(), 7);
+        assert_eq!(
+            AuthData::compaction(99, 2, StateVector::new()).seq(),
+            99
+        );
     }
 }
 

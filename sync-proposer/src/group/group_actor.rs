@@ -11,9 +11,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use universal_sync_core::{
-    AcceptorId, CompactionConfig, CrdtFactory, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
-    GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN, StateVector,
-    SyncProposal,
+    AcceptorId, AuthData, CompactionConfig, CrdtFactory, EncryptedAppMessage, Epoch, GroupId,
+    GroupMessage, GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN,
+    StateVector, SyncProposal,
 };
 use universal_sync_paxos::proposer::{ProposeResult, Proposer, QuorumTracker};
 use universal_sync_paxos::{AcceptorMessage, Learner, Proposal};
@@ -587,7 +587,14 @@ where
         // Buffer the raw CRDT update for compaction
         self.update_buffer.push(data.to_vec());
 
-        let authenticated_data = seq.to_be_bytes().to_vec();
+        let auth_data = AuthData::update(seq);
+        let authenticated_data = match auth_data.to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = reply.send(Err(Report::new(GroupError).attach(format!("auth data encode: {e}"))));
+                return;
+            }
+        };
 
         let result = blocking(|| {
             self.learner
@@ -1419,11 +1426,15 @@ where
             return;
         };
 
-        let seq = if app_msg.authenticated_data.len() >= 8 {
-            u64::from_be_bytes(app_msg.authenticated_data[..8].try_into().unwrap_or([0; 8]))
-        } else {
-            0
+        let auth_data = match AuthData::from_bytes(&app_msg.authenticated_data) {
+            Ok(ad) => ad,
+            Err(e) => {
+                tracing::warn!(?e, "failed to decode auth data, dropping message");
+                return;
+            }
         };
+
+        let seq = auth_data.seq();
 
         let sender_member = MemberId(app_msg.sender_index);
         let signing_key = self
@@ -1454,9 +1465,17 @@ where
             *hw = seq;
         }
 
-        self.compaction_state.record_entry(0);
+        match &auth_data {
+            AuthData::Update { .. } => {
+                self.compaction_state.record_entry(0);
+            }
+            AuthData::Compaction { level, .. } => {
+                self.compaction_state
+                    .record_entry(usize::from(*level));
+            }
+        }
 
-        // Buffer the raw CRDT update for compaction
+        // Buffer the raw CRDT update/snapshot for compaction
         let data = app_msg.data().to_vec();
         self.update_buffer.push(data.clone());
 
@@ -1566,7 +1585,7 @@ where
             "compaction merge complete"
         );
 
-        if !self.encrypt_and_send_to_acceptors(&compacted, level) {
+        if !self.encrypt_and_send_to_acceptors(&compacted, level, &watermark) {
             return;
         }
 
@@ -1590,12 +1609,24 @@ where
     /// Encrypt data at the current epoch and send it to acceptors using the
     /// replication factor for the given compaction level. Returns `false` on
     /// encryption failure.
-    fn encrypt_and_send_to_acceptors(&mut self, data: &[u8], level: u8) -> bool {
+    fn encrypt_and_send_to_acceptors(
+        &mut self,
+        data: &[u8],
+        level: u8,
+        watermark: &StateVector,
+    ) -> bool {
         let seq = self.message_seq;
         self.message_seq += 1;
         self.state_vector.insert(self.own_fingerprint, seq);
 
-        let authenticated_data = seq.to_be_bytes().to_vec();
+        let authenticated_data =
+            match AuthData::compaction(seq, level, watermark.clone()).to_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(?e, "failed to encode compaction auth data");
+                    return false;
+                }
+            };
         let mls_message = match blocking(|| {
             self.learner
                 .encrypt_application_message(data, authenticated_data)

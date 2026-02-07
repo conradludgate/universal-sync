@@ -26,8 +26,8 @@ pub use extension::{
 };
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub use protocol::{
-    EncryptedAppMessage, GroupId, GroupMessage, Handshake, HandshakeResponse, MemberFingerprint,
-    MessageId, MessageRequest, MessageResponse, StateVector, StreamType,
+    AuthData, EncryptedAppMessage, GroupId, GroupMessage, Handshake, HandshakeResponse,
+    MemberFingerprint, MessageId, MessageRequest, MessageResponse, StateVector, StreamType,
 };
 pub use sink_stream::FromIoError;
 
