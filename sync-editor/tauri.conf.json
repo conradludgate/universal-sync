@@ -4,10 +4,18 @@
   "version": "0.1.0",
   "identifier": "com.universal-sync.editor",
   "build": {
-    "frontendDist": "./ui"
+    "frontendDist": "./ui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": {
+      "script": "PATH=\"/opt/homebrew/bin:$PATH\" npm run dev",
+      "cwd": "./ui"
+    },
+    "beforeBuildCommand": {
+      "script": "PATH=\"/opt/homebrew/bin:$PATH\" npm run build",
+      "cwd": "./ui"
+    }
   },
   "app": {
-    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Sync Editor",
