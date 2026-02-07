@@ -92,12 +92,7 @@
                         </div>
                     </div>
                     <div class="editor-wrapper">
-                        <textarea
-                            id="editor"
-                            class="editor"
-                            placeholder="Start typing..."
-                            spellcheck="false"
-                        ></textarea>
+                        <div id="editor" class="editor"></div>
                     </div>
                 </div>
             </main>
@@ -161,6 +156,7 @@
         <div id="toast-container" class="toast-container"></div>
     </div>
 
-    <script src="app.js" type="module"></script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.min.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>

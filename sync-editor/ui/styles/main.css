@@ -304,26 +304,15 @@ body {
 .editor-wrapper {
     flex: 1;
     display: flex;
-    padding: var(--space-md) var(--space-lg);
     background: var(--bg-primary);
     min-height: 0;
+    overflow: hidden;
 }
 
 .editor {
     width: 100%;
-    flex: 1;
-    padding: 0;
-    font-family: var(--font-mono);
-    font-size: 0.9375rem;
-    line-height: 1.75;
-    color: var(--ink-primary);
-    background: transparent;
-    border: none;
-    resize: none;
-    outline: none;
+    height: 100%;
 }
-
-.editor::placeholder { color: var(--ink-faint); }
 
 /* ========== Sync Status ========== */
 .sync-status {

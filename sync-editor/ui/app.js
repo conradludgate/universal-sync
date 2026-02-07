@@ -1,8 +1,9 @@
 /**
  * Sync Editor — Frontend application
  *
- * Sidebar-driven collaborative text editor using Tauri + universal-sync.
+ * Sidebar-driven collaborative text editor using Tauri + universal-sync + Monaco.
  */
+(function () {
 
 // ============================================================================
 // Tauri bridge
@@ -33,6 +34,10 @@ const state = {
     sidebarOpen: true,
 };
 
+/** @type {monaco.editor.IStandaloneCodeEditor|null} */
+let monacoEditor = null;
+let isApplyingRemote = false;
+
 // ============================================================================
 // DOM references
 // ============================================================================
@@ -59,7 +64,7 @@ const el = {
     // Editor
     emptyState: document.getElementById('empty-state'),
     editorContainer: document.getElementById('editor-container'),
-    editor: document.getElementById('editor'),
+    editorEl: document.getElementById('editor'),
     docId: document.getElementById('doc-id'),
     btnCopyId: document.getElementById('btn-copy-id'),
     syncStatus: document.getElementById('sync-status'),
@@ -110,6 +115,7 @@ function hideModal(m) { m.classList.add('hidden'); }
 function toggleSidebar() {
     state.sidebarOpen = !state.sidebarOpen;
     el.sidebar.classList.toggle('collapsed', !state.sidebarOpen);
+    if (monacoEditor) monacoEditor.layout();
 }
 
 // ============================================================================
@@ -143,17 +149,14 @@ function switchToDocument(gid) {
     const doc = state.documents.get(gid);
     if (!doc) return;
 
-    // Save current editor text back into the current doc state
-    if (state.currentDocument) {
-        state.currentDocument.text = el.editor.value;
+    if (state.currentDocument && monacoEditor) {
+        state.currentDocument.text = monacoEditor.getValue();
     }
 
     state.currentDocument = doc;
     el.docId.textContent = gid.length > 16 ? gid.slice(0, 8) + '…' + gid.slice(-8) : gid;
     el.docId.title = gid;
-    el.editor.value = doc.text;
-    lastSentText = doc.text;
-    lastText = doc.text;
+    setEditorText(doc.text);
 
     showEditor();
     renderDocList();
@@ -164,10 +167,20 @@ function switchToDocument(gid) {
 // Editor management
 // ============================================================================
 
+function setEditorText(text) {
+    if (!monacoEditor) return;
+    isApplyingRemote = true;
+    monacoEditor.setValue(text);
+    isApplyingRemote = false;
+}
+
 function showEditor() {
     el.emptyState.classList.add('hidden');
     el.editorContainer.classList.remove('hidden');
-    el.editor.focus();
+    if (monacoEditor) {
+        monacoEditor.layout();
+        monacoEditor.focus();
+    }
 }
 
 function updateSyncStatus(status) {
@@ -202,9 +215,7 @@ async function createDocument() {
 
         el.docId.textContent = doc.group_id.slice(0, 8) + '…' + doc.group_id.slice(-8);
         el.docId.title = doc.group_id;
-        el.editor.value = doc.text;
-        lastSentText = doc.text;
-        lastText = doc.text;
+        setEditorText(doc.text);
 
         showEditor();
         updateSyncStatus('synced');
@@ -224,9 +235,7 @@ function openDocument(doc) {
 
     el.docId.textContent = doc.group_id.slice(0, 8) + '…' + doc.group_id.slice(-8);
     el.docId.title = doc.group_id;
-    el.editor.value = doc.text;
-    lastSentText = doc.text;
-    lastText = doc.text;
+    setEditorText(doc.text);
 
     showEditor();
     updateSyncStatus('synced');
@@ -235,69 +244,37 @@ function openDocument(doc) {
 }
 
 // ============================================================================
-// Text editing
+// Text editing (Monaco change handler)
 // ============================================================================
 
-let lastSentText = '';
-let lastText = '';
-let debounceTimer = null;
-
-async function handleEditorInput() {
+function handleModelContentChange(event) {
+    if (isApplyingRemote) return;
     if (!state.currentDocument) return;
-    lastText = el.editor.value;
 
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(async () => {
-        const currentText = el.editor.value;
-        const delta = computeDelta(lastSentText, currentText);
-        if (!delta) return;
+    for (const change of event.changes) {
+        const { rangeOffset, rangeLength, text } = change;
 
-        lastSentText = currentText;
+        let delta;
+        if (rangeLength > 0 && text.length > 0) {
+            delta = { type: 'Replace', position: rangeOffset, length: rangeLength, text };
+        } else if (rangeLength > 0) {
+            delta = { type: 'Delete', position: rangeOffset, length: rangeLength };
+        } else if (text.length > 0) {
+            delta = { type: 'Insert', position: rangeOffset, text };
+        } else {
+            continue;
+        }
 
-        try {
-            await invoke('apply_delta', {
-                groupId: state.currentDocument.group_id,
-                delta,
-            });
+        invoke('apply_delta', {
+            groupId: state.currentDocument.group_id,
+            delta,
+        }).then(() => {
             updateSyncStatus('synced');
-        } catch (error) {
+        }).catch((error) => {
             console.error('Failed to apply delta:', error);
             updateSyncStatus('error');
-        }
-    }, 50);
-}
-
-function computeDelta(oldText, newText) {
-    let prefixLen = 0;
-    while (prefixLen < oldText.length &&
-           prefixLen < newText.length &&
-           oldText[prefixLen] === newText[prefixLen]) {
-        prefixLen++;
+        });
     }
-
-    let oldSuffixStart = oldText.length;
-    let newSuffixStart = newText.length;
-    while (oldSuffixStart > prefixLen &&
-           newSuffixStart > prefixLen &&
-           oldText[oldSuffixStart - 1] === newText[newSuffixStart - 1]) {
-        oldSuffixStart--;
-        newSuffixStart--;
-    }
-
-    const deleteLen = oldSuffixStart - prefixLen;
-    const insertText = newText.slice(prefixLen, newSuffixStart);
-
-    if (deleteLen === 0 && insertText.length === 0) return null;
-    if (deleteLen > 0 && insertText.length > 0) {
-        return { type: 'Replace', position: prefixLen, length: deleteLen, text: insertText };
-    }
-    if (deleteLen > 0) {
-        return { type: 'Delete', position: prefixLen, length: deleteLen };
-    }
-    if (insertText.length > 0) {
-        return { type: 'Insert', position: prefixLen, text: insertText };
-    }
-    return null;
 }
 
 // ============================================================================
@@ -344,7 +321,6 @@ async function startWelcomeListener() {
             openDocument(doc);
             showToast('Joined document!', 'success');
 
-            // Reset join UI after a moment
             setTimeout(cancelJoinFlow, 1500);
         }
     } catch (error) {
@@ -626,9 +602,6 @@ function setupEventListeners() {
         }
     });
 
-    // Editor input
-    el.editor.addEventListener('input', handleEditorInput);
-
     // Keyboard shortcuts
     document.addEventListener('keydown', (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === 'n') {
@@ -643,6 +616,11 @@ function setupEventListeners() {
             toggleSidebar();
         }
     });
+
+    // Re-layout Monaco when the window resizes
+    window.addEventListener('resize', () => {
+        if (monacoEditor) monacoEditor.layout();
+    });
 }
 
 // ============================================================================
@@ -656,19 +634,16 @@ async function setupTauriEvents() {
     await listen('document-updated', (event) => {
         const { group_id, text } = event.payload;
 
-        // Update stored doc
         const doc = state.documents.get(group_id);
         if (doc) doc.text = text;
 
-        if (state.currentDocument && state.currentDocument.group_id === group_id) {
-            lastSentText = text;
-            if (text === lastText) return;
+        if (state.currentDocument && state.currentDocument.group_id === group_id && monacoEditor) {
+            const currentText = monacoEditor.getValue();
+            if (text === currentText) return;
 
-            const cursorPos = el.editor.selectionStart;
-            el.editor.value = text;
-            el.editor.selectionStart = Math.min(cursorPos, text.length);
-            el.editor.selectionEnd = el.editor.selectionStart;
-            lastText = text;
+            isApplyingRemote = true;
+            monacoEditor.setValue(text);
+            isApplyingRemote = false;
             updateSyncStatus('synced');
         }
     });
@@ -698,11 +673,46 @@ async function setupTauriEvents() {
 }
 
 // ============================================================================
+// Monaco initialization
+// ============================================================================
+
+function initMonaco() {
+    return new Promise((resolve) => {
+        require.config({
+            paths: {
+                vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs',
+            },
+        });
+
+        require(['vs/editor/editor.main'], function () {
+            monacoEditor = monaco.editor.create(el.editorEl, {
+                value: '',
+                language: 'plaintext',
+                theme: 'vs-dark',
+                fontFamily: "'IBM Plex Mono', monospace",
+                fontSize: 15,
+                lineHeight: 26,
+                minimap: { enabled: false },
+                wordWrap: 'on',
+                automaticLayout: false,
+                scrollBeyondLastLine: false,
+                padding: { top: 16, bottom: 16 },
+            });
+
+            monacoEditor.onDidChangeModelContent(handleModelContentChange);
+
+            resolve();
+        });
+    });
+}
+
+// ============================================================================
 // Init
 // ============================================================================
 
 async function init() {
     setupEventListeners();
+    await initMonaco();
     try {
         await setupTauriEvents();
     } catch (e) {
@@ -711,3 +721,5 @@ async function init() {
 }
 
 init();
+
+})();
