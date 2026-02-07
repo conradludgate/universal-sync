@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
@@ -49,6 +49,7 @@ where
     acceptor_rx: mpsc::Receiver<AcceptorInbound>,
     acceptor_inbound_tx: mpsc::Sender<AcceptorInbound>,
     acceptor_handles: HashMap<AcceptorId, JoinHandle<()>>,
+    connected_acceptors: BTreeSet<AcceptorId>,
     own_fingerprint: MemberFingerprint,
     message_seq: u64,
     state_vector: StateVector,
@@ -265,6 +266,7 @@ where
             acceptor_rx,
             acceptor_inbound_tx,
             acceptor_handles: HashMap::new(),
+            connected_acceptors: BTreeSet::new(),
             own_fingerprint,
             message_seq: 0,
             state_vector: StateVector::new(),
@@ -507,6 +509,7 @@ where
             member_count,
             members,
             acceptors: self.learner.acceptor_ids().collect(),
+            connected_acceptors: self.connected_acceptors.clone(),
             confirmed_transcript_hash: mls_context.confirmed_transcript_hash.to_vec(),
         }
     }
@@ -1056,11 +1059,16 @@ where
             AcceptorInbound::EncryptedMessage { msg } => {
                 self.handle_encrypted_message(msg);
             }
+            AcceptorInbound::Connected { acceptor_id } => {
+                if self.connected_acceptors.insert(acceptor_id) {
+                    tracing::info!(?acceptor_id, "acceptor connected");
+                    let _ = self.event_tx.send(GroupEvent::AcceptorConnected { id: acceptor_id });
+                }
+            }
             AcceptorInbound::Disconnected { acceptor_id } => {
-                tracing::warn!(?acceptor_id, "acceptor disconnected");
-                self.acceptor_txs.remove(&acceptor_id);
-                if let Some(handle) = self.acceptor_handles.remove(&acceptor_id) {
-                    handle.abort();
+                if self.connected_acceptors.remove(&acceptor_id) {
+                    tracing::warn!(?acceptor_id, "acceptor disconnected");
+                    let _ = self.event_tx.send(GroupEvent::AcceptorDisconnected { id: acceptor_id });
                 }
             }
         }
@@ -1348,6 +1356,7 @@ where
                     handle.abort();
                 }
                 self.acceptor_txs.remove(&id);
+                self.connected_acceptors.remove(&id);
                 GroupEvent::AcceptorRemoved { id }
             }
             SyncProposal::CompactionClaim {

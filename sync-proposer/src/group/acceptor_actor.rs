@@ -20,18 +20,16 @@ pub(super) struct AcceptorActor {
     pub(super) protocol_version: u32,
 }
 
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 enum ConnectionResult {
     Cancelled,
-    Disconnected,
+    Disconnected { was_connected: bool },
 }
 
 impl AcceptorActor {
     pub(super) async fn run(mut self) {
-        let mut reconnect_attempts = 0u32;
         let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
 
         loop {
@@ -41,19 +39,13 @@ impl AcceptorActor {
 
             match self.run_connection().await {
                 ConnectionResult::Cancelled => break,
-                ConnectionResult::Disconnected => {
-                    reconnect_attempts += 1;
-                    if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
-                        tracing::warn!(
-                            acceptor_id = ?self.acceptor_id,
-                            "max reconnect attempts reached, giving up"
-                        );
-                        break;
+                ConnectionResult::Disconnected { was_connected } => {
+                    if was_connected {
+                        reconnect_delay = INITIAL_RECONNECT_DELAY;
                     }
 
                     tracing::debug!(
                         acceptor_id = ?self.acceptor_id,
-                        attempt = reconnect_attempts,
                         delay_ms = reconnect_delay.as_millis(),
                         "reconnecting to acceptor"
                     );
@@ -67,13 +59,6 @@ impl AcceptorActor {
                 }
             }
         }
-
-        let _ = self
-            .inbound_tx
-            .send(AcceptorInbound::Disconnected {
-                acceptor_id: self.acceptor_id,
-            })
-            .await;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -89,7 +74,10 @@ impl AcceptorActor {
             Ok(streams) => streams,
             Err(e) => {
                 tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to open proposal stream");
-                return ConnectionResult::Disconnected;
+                let _ = self.inbound_tx.send(AcceptorInbound::Disconnected {
+                    acceptor_id: self.acceptor_id,
+                }).await;
+                return ConnectionResult::Disconnected { was_connected: false };
             }
         };
 
@@ -134,12 +122,16 @@ impl AcceptorActor {
             None => (None, None),
         };
 
-        loop {
+        let _ = self.inbound_tx.send(AcceptorInbound::Connected {
+            acceptor_id: self.acceptor_id,
+        }).await;
+
+        let result = loop {
             tokio::select! {
                 biased;
 
                 () = self.cancel_token.cancelled() => {
-                    return ConnectionResult::Cancelled;
+                    break ConnectionResult::Cancelled;
                 }
 
                 Some(outbound) = self.outbound_rx.recv() => {
@@ -147,7 +139,7 @@ impl AcceptorActor {
                         AcceptorOutbound::ProposalRequest { request } => {
                             if let Err(e) = proposal_writer.send(request).await {
                                 tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to send proposal");
-                                return ConnectionResult::Disconnected;
+                                break ConnectionResult::Disconnected { was_connected: true };
                             }
                         }
                         AcceptorOutbound::AppMessage { id, msg } => {
@@ -169,7 +161,7 @@ impl AcceptorActor {
                         }
                         Err(e) => {
                             tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "proposal stream error");
-                            return ConnectionResult::Disconnected;
+                            break ConnectionResult::Disconnected { was_connected: true };
                         }
                     }
                 }
@@ -201,6 +193,14 @@ impl AcceptorActor {
                     }
                 }
             }
+        };
+
+        if matches!(result, ConnectionResult::Disconnected { .. }) {
+            let _ = self.inbound_tx.send(AcceptorInbound::Disconnected {
+                acceptor_id: self.acceptor_id,
+            }).await;
         }
+
+        result
     }
 }

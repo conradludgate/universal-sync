@@ -12,6 +12,7 @@
 mod acceptor_actor;
 mod group_actor;
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -115,6 +116,9 @@ enum AcceptorInbound {
     EncryptedMessage {
         msg: EncryptedAppMessage,
     },
+    Connected {
+        acceptor_id: AcceptorId,
+    },
     Disconnected {
         acceptor_id: AcceptorId,
     },
@@ -147,6 +151,8 @@ pub enum GroupEvent {
     MemberRemoved { index: u32 },
     AcceptorAdded { id: AcceptorId },
     AcceptorRemoved { id: AcceptorId },
+    AcceptorConnected { id: AcceptorId },
+    AcceptorDisconnected { id: AcceptorId },
     ReInitiated,
     ExternalInit,
     ExtensionsUpdated,
@@ -170,6 +176,7 @@ pub struct GroupContext {
     pub member_count: usize,
     pub members: Vec<MemberInfo>,
     pub acceptors: Vec<AcceptorId>,
+    pub connected_acceptors: BTreeSet<AcceptorId>,
     pub confirmed_transcript_hash: Vec<u8>,
 }
 
