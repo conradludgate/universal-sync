@@ -60,6 +60,8 @@ pub struct GroupStatePayload {
     pub epoch: u64,
     pub transcript_hash: String,
     pub member_count: usize,
+    pub acceptor_count: usize,
+    pub connected_acceptor_count: usize,
 }
 
 /// Abstracts event emission so actors can be tested without Tauri.

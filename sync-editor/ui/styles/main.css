@@ -83,12 +83,6 @@ body {
     gap: var(--space-sm);
 }
 
-.header-right {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-}
-
 .logo {
     font-family: var(--font-display);
     font-size: 0.9rem;

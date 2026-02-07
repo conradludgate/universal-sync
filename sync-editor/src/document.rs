@@ -320,6 +320,8 @@ where
             epoch: ctx.epoch.0,
             transcript_hash: hex::encode(&ctx.confirmed_transcript_hash),
             member_count: ctx.member_count,
+            acceptor_count: ctx.acceptors.len(),
+            connected_acceptor_count: ctx.connected_acceptors.len(),
         })
     }
 

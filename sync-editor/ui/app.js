@@ -159,6 +159,7 @@ function switchToDocument(gid) {
     setEditorText(doc.text);
 
     showEditor();
+    updateSyncStatus('syncing');
     renderDocList();
     fetchGroupState();
 }
@@ -188,15 +189,15 @@ function updateSyncStatus(status) {
     switch (status) {
         case 'synced':
             indicator.className = 'sync-indicator synced';
-            el.syncStatus.lastChild.textContent = 'Synced';
+            el.syncStatus.lastChild.textContent = 'Online';
             break;
         case 'syncing':
             indicator.className = 'sync-indicator syncing';
-            el.syncStatus.lastChild.textContent = 'Syncing…';
+            el.syncStatus.lastChild.textContent = 'Connecting…';
             break;
         case 'error':
             indicator.className = 'sync-indicator error';
-            el.syncStatus.lastChild.textContent = 'Error';
+            el.syncStatus.lastChild.textContent = 'Offline';
             break;
     }
 }
@@ -218,7 +219,6 @@ async function createDocument() {
         setEditorText(doc.text);
 
         showEditor();
-        updateSyncStatus('synced');
         renderDocList();
         fetchGroupState();
         showToast('Document created!', 'success');
@@ -238,7 +238,7 @@ function openDocument(doc) {
     setEditorText(doc.text);
 
     showEditor();
-    updateSyncStatus('synced');
+    updateSyncStatus('syncing');
     renderDocList();
     fetchGroupState();
 }
@@ -268,11 +268,8 @@ function handleModelContentChange(event) {
         invoke('apply_delta', {
             groupId: state.currentDocument.group_id,
             delta,
-        }).then(() => {
-            updateSyncStatus('synced');
         }).catch((error) => {
             console.error('Failed to apply delta:', error);
-            updateSyncStatus('error');
         });
     }
 }
@@ -350,6 +347,12 @@ function updateGroupStateDisplay(payload) {
     el.groupHash.title = `${payload.transcript_hash}\n(click to copy)`;
     el.groupHash.dataset.fullHash = payload.transcript_hash;
     el.groupMembers.textContent = payload.member_count;
+
+    if (payload.acceptor_count === 0 || payload.connected_acceptor_count > 0) {
+        updateSyncStatus('synced');
+    } else {
+        updateSyncStatus('error');
+    }
 }
 
 function resetGroupStateDisplay() {
@@ -644,7 +647,6 @@ async function setupTauriEvents() {
             isApplyingRemote = true;
             monacoEditor.setValue(text);
             isApplyingRemote = false;
-            updateSyncStatus('synced');
         }
     });
 
@@ -658,18 +660,6 @@ async function setupTauriEvents() {
         }
     });
 
-    await listen('acceptors-updated', (event) => {
-        const { group_id } = event.payload;
-        if (state.currentDocument && state.currentDocument.group_id === group_id) {
-            if (!el.shareModal.classList.contains('hidden')) {
-                fetchPeers();
-            }
-        }
-    });
-
-    await listen('connection-status', (event) => {
-        updateSyncStatus(event.payload.connected ? 'synced' : 'error');
-    });
 }
 
 // ============================================================================
