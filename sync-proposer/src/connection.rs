@@ -25,6 +25,9 @@ use universal_sync_core::{
 
 use crate::connector::ConnectorError;
 
+pub(crate) type HandshakeReader = FramedRead<RecvStream, LengthDelimitedCodec>;
+pub(crate) type HandshakeWriter = FramedWrite<SendStream, LengthDelimitedCodec>;
+
 /// Manages connections to acceptors with stream multiplexing.
 /// Share across groups to maximize connection reuse.
 #[derive(Clone)]
@@ -98,7 +101,7 @@ impl ConnectionManager {
         acceptor_id: &AcceptorId,
         group_id: GroupId,
         since_epoch: Epoch,
-    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
+    ) -> Result<(HandshakeWriter, HandshakeReader), Report<ConnectorError>> {
         let conn = self.get_connection(acceptor_id).await?;
         self.open_stream_with_handshake(
             &conn,
@@ -116,7 +119,7 @@ impl ConnectionManager {
         acceptor_id: &AcceptorId,
         group_id: GroupId,
         sender: MemberFingerprint,
-    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
+    ) -> Result<(HandshakeWriter, HandshakeReader), Report<ConnectorError>> {
         let conn = self.new_connection(acceptor_id).await?;
         self.open_stream_with_handshake(&conn, Handshake::JoinMessages(group_id, sender))
             .await
@@ -144,11 +147,16 @@ impl ConnectionManager {
             .change_context(ConnectorError)
     }
 
+    /// Performs the handshake and returns the framed streams. Callers should
+    /// use `map_decoder`/`map_encoder` to swap in the application-level codec.
+    /// This preserves `FramedRead`'s internal state (buffer + `is_readable`
+    /// flag), avoiding data loss when the server sends data immediately after
+    /// the handshake response.
     async fn open_stream_with_handshake(
         &self,
         conn: &Connection,
         handshake: Handshake,
-    ) -> Result<(SendStream, RecvStream), Report<ConnectorError>> {
+    ) -> Result<(HandshakeWriter, HandshakeReader), Report<ConnectorError>> {
         let (send, recv) = conn.open_bi().await.change_context(ConnectorError)?;
 
         let codec = LengthDelimitedCodec::builder()
@@ -186,9 +194,6 @@ impl ConnectionManager {
             }
         }
 
-        let recv = reader.into_inner();
-        let send = writer.into_inner();
-
-        Ok((send, recv))
+        Ok((writer, reader))
     }
 }

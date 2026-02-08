@@ -72,6 +72,17 @@ impl<T> PostcardCodec<T> {
             _marker: PhantomData,
         }
     }
+
+    /// Wrap an existing `LengthDelimitedCodec`, reusing its configuration and
+    /// internal state. Useful with `FramedRead::map_decoder` to swap the
+    /// deserialization layer without losing buffered data.
+    #[must_use]
+    pub fn wrap(inner: LengthDelimitedCodec) -> Self {
+        Self {
+            inner,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T> Decoder for PostcardCodec<T>
@@ -130,6 +141,18 @@ impl<T> VersionedCodec<T> {
         }
     }
 
+    /// Wrap an existing `LengthDelimitedCodec`, reusing its configuration and
+    /// internal state. Useful with `FramedRead::map_decoder` to swap the
+    /// deserialization layer without losing buffered data.
+    #[must_use]
+    pub fn wrap(inner: LengthDelimitedCodec, protocol_version: u32) -> Self {
+        Self {
+            inner,
+            protocol_version,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn set_protocol_version(&mut self, version: u32) {
         self.protocol_version = version;
     }
@@ -181,6 +204,73 @@ mod tests {
 
     use super::*;
     use crate::protocol::{AuthData, MessageRequest, MessageResponse};
+
+    /// Demonstrates that `FramedRead::read_buffer_mut()` does NOT make
+    /// pre-buffered data decodable — `is_readable` stays `false` so
+    /// `poll_next` skips `decode()` entirely and waits for new IO that
+    /// never arrives. `map_decoder` preserves the internal state correctly.
+    #[tokio::test]
+    async fn framed_read_buffer_mut_ignores_buffered_data() {
+        use futures::StreamExt;
+        use tokio_util::codec::FramedRead;
+
+        // Encode a frame with LengthDelimitedCodec into raw bytes.
+        let mut raw = BytesMut::new();
+        LengthDelimitedCodec::new()
+            .encode(Bytes::from("hello"), &mut raw)
+            .unwrap();
+
+        // Use a duplex where the write half is kept alive but never written to.
+        // This makes poll_read return Pending (not EOF).
+        let (client, _server) = tokio::io::duplex(1024);
+
+        // BROKEN: create new FramedRead, inject buffer via read_buffer_mut.
+        // poll_next returns Pending forever because is_readable=false.
+        let mut reader = FramedRead::new(client, LengthDelimitedCodec::new());
+        *reader.read_buffer_mut() = raw.clone();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), reader.next()).await;
+        assert!(
+            result.is_err(),
+            "read_buffer_mut data is ignored — poll_next hangs"
+        );
+    }
+
+    /// Shows that `map_decoder` correctly preserves the internal `is_readable`
+    /// flag and buffer, so pre-buffered data is decoded immediately.
+    #[tokio::test]
+    async fn map_decoder_preserves_buffered_data() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio_util::codec::FramedRead;
+
+        // Encode a String via PostcardCodec for a valid frame.
+        let mut frame_bytes = BytesMut::new();
+        PostcardCodec::<String>::new()
+            .encode("hello".to_string(), &mut frame_bytes)
+            .unwrap();
+
+        // Phase 1: read one frame to set is_readable=true in the internal state.
+        let (client, mut server) = tokio::io::duplex(1024);
+        server.write_all(&frame_bytes).await.unwrap();
+
+        let mut phase1 = FramedRead::new(client, LengthDelimitedCodec::new());
+        let _frame = phase1.next().await.unwrap().unwrap();
+
+        // Phase 2: inject new buffered data and swap to PostcardCodec via map_decoder.
+        *phase1.read_buffer_mut() = frame_bytes;
+        let mut phase2: FramedRead<_, PostcardCodec<String>> =
+            phase1.map_decoder(PostcardCodec::wrap);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), phase2.next()).await;
+        assert!(
+            result.is_ok(),
+            "map_decoder preserves is_readable — decode succeeds immediately"
+        );
+        assert_eq!(result.unwrap().unwrap().unwrap(), "hello");
+    }
 
     #[test]
     fn versioned_auth_data_roundtrip() {

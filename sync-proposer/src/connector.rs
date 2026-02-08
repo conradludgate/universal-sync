@@ -125,10 +125,7 @@ where
                 }
             }
 
-            let recv = reader.into_inner();
-            let send = writer.into_inner();
-
-            Ok(new_iroh_connection::<L, L::Error>(send, recv))
+            Ok(new_iroh_connection::<L, L::Error>(writer, reader))
         })
     }
 }
@@ -192,15 +189,15 @@ pub type IrohConnection<L, E> = Mapped<
 
 #[must_use]
 pub(crate) fn new_iroh_connection<L, E>(
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+    writer: crate::connection::HandshakeWriter,
+    reader: crate::connection::HandshakeReader,
 ) -> IrohConnection<L, E>
 where
     L: Learner<Proposal = GroupProposal, Message = GroupMessage>,
 {
     Mapped::new(SinkStream::new(
-        FramedWrite::new(send, PostcardCodec::new()),
-        FramedRead::new(recv, PostcardCodec::new()),
+        writer.map_encoder(PostcardCodec::wrap),
+        reader.map_decoder(PostcardCodec::wrap),
     ))
 }
 
@@ -229,11 +226,11 @@ pub(crate) type ProposalReader =
 
 #[must_use]
 pub(crate) fn make_proposal_streams(
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+    writer: crate::connection::HandshakeWriter,
+    reader: crate::connection::HandshakeReader,
 ) -> (ProposalWriter, ProposalReader) {
     (
-        FramedWrite::new(send, PostcardCodec::new()),
-        FramedRead::new(recv, PostcardCodec::new()),
+        writer.map_encoder(PostcardCodec::wrap),
+        reader.map_decoder(PostcardCodec::wrap),
     )
 }

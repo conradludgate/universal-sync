@@ -73,7 +73,7 @@ impl AcceptorActor {
             .open_proposal_stream(&self.acceptor_id, self.group_id, self.current_epoch)
             .await;
 
-        let (proposal_send, proposal_recv) = match proposal_streams {
+        let (proposal_writer, proposal_reader) = match proposal_streams {
             Ok(streams) => streams,
             Err(e) => {
                 tracing::warn!(acceptor_id = ?self.acceptor_id, ?e, "failed to open proposal stream");
@@ -84,7 +84,7 @@ impl AcceptorActor {
         };
 
         let (mut proposal_writer, mut proposal_reader) =
-            crate::connector::make_proposal_streams(proposal_send, proposal_recv);
+            crate::connector::make_proposal_streams(proposal_writer, proposal_reader);
 
         let message_streams = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -97,11 +97,12 @@ impl AcceptorActor {
         .await;
 
         let message_io: Option<(MessageWriter, MessageReader)> = match message_streams {
-            Ok(Ok((message_send, message_recv))) => {
+            Ok(Ok((handshake_writer, handshake_reader))) => {
+                let pv = self.protocol_version;
                 let mut message_writer =
-                    FramedWrite::new(message_send, VersionedCodec::new(self.protocol_version));
+                    handshake_writer.map_encoder(|ldc| VersionedCodec::wrap(ldc, pv));
                 let message_reader =
-                    FramedRead::new(message_recv, VersionedCodec::new(self.protocol_version));
+                    handshake_reader.map_decoder(|ldc| VersionedCodec::wrap(ldc, pv));
 
                 let backfill_request = MessageRequest::Backfill {
                     state_vector: StateVector::default(),
