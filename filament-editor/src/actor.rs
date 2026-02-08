@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use filament_core::GroupId;
-use filament_testing::YrsCrdt;
 use filament_weave::{Weaver, WeaverClient};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -15,6 +14,7 @@ use yrs::Transact;
 
 use crate::document::DocumentActor;
 use crate::types::{CoordinatorRequest, DocRequest, DocumentInfo, EventEmitter};
+use crate::yrs_crdt::YrsCrdt;
 
 pub struct CoordinatorActor<E: EventEmitter> {
     group_client: WeaverClient,

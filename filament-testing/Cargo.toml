@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 filament-core = { path = "../filament-core" }
+filament-editor = { path = "../filament-editor" }
 filament-weave = { path = "../filament-weave" }
 filament-spool = { path = "../filament-spool" }
 filament-warp = { path = "../filament-warp" }

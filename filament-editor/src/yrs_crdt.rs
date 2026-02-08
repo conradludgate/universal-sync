@@ -21,21 +21,23 @@ pub struct PeerAwareness {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct CrdtMessage {
-    pub awareness: PeerAwareness,
+pub(crate) struct CrdtMessage {
+    pub(crate) awareness: PeerAwareness,
     #[serde(with = "option_yrs_update")]
-    pub doc_update: Option<Vec<u8>>,
+    pub(crate) doc_update: Option<Vec<u8>>,
 }
 
 mod option_yrs_update {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use yrs::updates::decoder::Decode;
 
-    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         v.serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
         let v: Option<Vec<u8>> = Option::deserialize(d)?;
         if let Some(ref bytes) = v {
             yrs::Update::decode_v2(bytes).map_err(serde::de::Error::custom)?;
@@ -43,8 +45,6 @@ mod option_yrs_update {
         Ok(v)
     }
 }
-
-pub const AWARENESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct YrsCrdt {
     doc: Doc,
@@ -93,27 +93,8 @@ impl YrsCrdt {
     }
 
     #[must_use]
-    pub fn client_id(&self) -> u64 {
-        self.client_id
-    }
-
-    #[must_use]
     pub fn doc(&self) -> &Doc {
         &self.doc
-    }
-
-    pub fn doc_mut(&mut self) -> &mut Doc {
-        &mut self.doc
-    }
-
-    #[must_use]
-    pub fn state_vector(&self) -> StateVector {
-        self.doc.transact().state_vector()
-    }
-
-    pub fn encode_diff(&self, sv: &StateVector) -> Result<Vec<u8>, Report<CrdtError>> {
-        let txn = self.doc.transact();
-        Ok(txn.encode_diff_v2(sv))
     }
 
     /// # Errors

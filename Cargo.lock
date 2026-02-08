@@ -1780,6 +1780,7 @@ version = "0.1.0"
 dependencies = [
  "bs58",
  "bytes",
+ "error-stack",
  "filament-core",
  "filament-spool",
  "filament-testing",
@@ -1838,6 +1839,7 @@ dependencies = [
  "bs58",
  "error-stack",
  "filament-core",
+ "filament-editor",
  "filament-spool",
  "filament-warp",
  "filament-weave",

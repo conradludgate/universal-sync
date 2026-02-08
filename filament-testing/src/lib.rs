@@ -1,11 +1,9 @@
 //! Test utilities for Universal Sync integration tests.
 
-mod repl;
-pub mod yrs_crdt;
-
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
+pub use filament_editor::{PeerAwareness, YrsCrdt};
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
 };
@@ -15,21 +13,14 @@ use mls_rs::external_client::ExternalClient;
 use mls_rs::identity::basic::BasicIdentityProvider;
 use mls_rs::{CipherSuite, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-pub use repl::ReplContext;
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
-pub use yrs_crdt::{AWARENESS_TIMEOUT, YrsCrdt};
 
 const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 
 #[must_use]
 pub fn test_weaver_client(name: &str, endpoint: Endpoint) -> WeaverClient {
     WeaverClient::new(name.as_bytes().to_vec(), endpoint)
-}
-
-#[must_use]
-pub fn test_repl_context(name: &str, endpoint: Endpoint) -> ReplContext {
-    ReplContext::new(test_weaver_client(name, endpoint))
 }
 
 /// Alias for [`test_weaver_client`].

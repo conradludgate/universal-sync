@@ -4,9 +4,9 @@
 //! and a [`YrsCrdt`] separately — no mutexes.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use filament_core::GroupId;
-use filament_testing::YrsCrdt;
 use filament_weave::{Weaver, WeaverEvent};
 use tokio::sync::{broadcast, mpsc};
 use yrs::{Any, GetString, Observable, Out, Text, Transact};
@@ -15,6 +15,7 @@ use crate::types::{
     AwarenessPayload, AwarenessPeer, Delta, DocRequest, DocumentUpdatedPayload, EventEmitter,
     GroupStatePayload, PeerEntry,
 };
+use crate::yrs_crdt::YrsCrdt;
 
 pub struct DocumentActor<E: EventEmitter> {
     group: Weaver,
@@ -24,6 +25,9 @@ pub struct DocumentActor<E: EventEmitter> {
     event_rx: broadcast::Receiver<WeaverEvent>,
     emitter: E,
 }
+
+const AWARENESS_HEARTBEAT: Duration = Duration::from_secs(5);
+const AWARENESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl<E: EventEmitter> DocumentActor<E> {
     pub fn new(
@@ -81,7 +85,7 @@ impl<E: EventEmitter> DocumentActor<E> {
             });
         }
 
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut heartbeat = tokio::time::interval(AWARENESS_HEARTBEAT);
         heartbeat.tick().await; // consume immediate first tick
 
         loop {
@@ -129,7 +133,7 @@ impl<E: EventEmitter> DocumentActor<E> {
                     if let Err(e) = self.group.send_update(&mut self.crdt).await {
                         tracing::debug!(?e, "heartbeat send failed");
                     }
-                    if self.crdt.expire_stale_peers(filament_testing::AWARENESS_TIMEOUT) {
+                    if self.crdt.expire_stale_peers(AWARENESS_TIMEOUT) {
                         self.emit_awareness();
                     }
                 }
