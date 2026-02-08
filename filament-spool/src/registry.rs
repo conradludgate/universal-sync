@@ -237,10 +237,7 @@ where
     pub fn subscribe_messages(
         &self,
         group_id: &GroupId,
-    ) -> tokio::sync::broadcast::Receiver<(
-        filament_core::MessageId,
-        filament_core::EncryptedAppMessage,
-    )> {
+    ) -> tokio::sync::watch::Receiver<filament_core::StateVector> {
         self.state_store.subscribe_messages(group_id)
     }
 

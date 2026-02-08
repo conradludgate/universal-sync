@@ -1,6 +1,7 @@
 //! Persistent acceptor state store using fjall.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
@@ -14,10 +15,10 @@ use filament_warp::acceptor::RoundState;
 use filament_warp::core::decision;
 use filament_warp::{AcceptorStateStore, Learner, Proposal};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use futures::{Stream, StreamExt, stream};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 const STORAGE_MAGIC: [u8; 2] = [0xFF, 0xFE];
 const STORAGE_VERSION: u8 = 1;
@@ -93,9 +94,8 @@ pub struct GroupStorageSizes {
     pub snapshots_bytes: u64,
 }
 
-type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
-type MessageBroadcasts =
-    RwLock<HashMap<[u8; 32], broadcast::Sender<(MessageId, EncryptedAppMessage)>>>;
+type GroupBroadcasts = RwLock<HashMap<[u8; 32], watch::Sender<Option<GroupProposal>>>>;
+type MessageBroadcasts = RwLock<HashMap<[u8; 32], watch::Sender<StateVector>>>;
 
 const SNAPSHOT_CACHE_CAPACITY: usize = 512;
 const ACCEPTED_CACHE_CAPACITY: usize = 4096;
@@ -217,7 +217,10 @@ impl FjallStateStore {
         if let Ok(broadcasts) = self.message_broadcasts.read()
             && let Some(tx) = broadcasts.get(group_id.as_bytes())
         {
-            let _ = tx.send((*id, msg.clone()));
+            tx.send_modify(|sv| {
+                let hw = sv.entry(id.sender).or_insert(0);
+                *hw = (*hw).max(id.seq);
+            });
         }
 
         Ok(())
@@ -285,16 +288,13 @@ impl FjallStateStore {
         Ok(deleted)
     }
 
-    pub(crate) fn subscribe_messages(
-        &self,
-        group_id: &GroupId,
-    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
+    pub(crate) fn subscribe_messages(&self, group_id: &GroupId) -> watch::Receiver<StateVector> {
         let mut broadcasts = self.message_broadcasts.write().unwrap();
         let key = *group_id.as_bytes();
 
         broadcasts
             .entry(key)
-            .or_insert_with(|| broadcast::channel(256).0)
+            .or_insert_with(|| watch::channel(StateVector::default()).0)
             .subscribe()
     }
 
@@ -429,10 +429,7 @@ impl FjallStateStore {
         highest
     }
 
-    fn get_broadcast(
-        &self,
-        group_id: &GroupId,
-    ) -> broadcast::Sender<(GroupProposal, GroupMessage)> {
+    fn get_broadcast(&self, group_id: &GroupId) -> watch::Sender<Option<GroupProposal>> {
         if let Some(sender) = self.broadcasts.read().unwrap().get(&group_id.0) {
             return sender.clone();
         }
@@ -440,7 +437,7 @@ impl FjallStateStore {
         let mut broadcasts = self.broadcasts.write().unwrap();
         broadcasts
             .entry(group_id.0)
-            .or_insert_with(|| broadcast::channel(64).0)
+            .or_insert_with(|| watch::channel(None).0)
             .clone()
     }
 
@@ -663,10 +660,7 @@ impl SharedFjallStateStore {
     }
 
     #[must_use]
-    pub(crate) fn subscribe_messages(
-        &self,
-        group_id: &GroupId,
-    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
+    pub(crate) fn subscribe_messages(&self, group_id: &GroupId) -> watch::Receiver<StateVector> {
         self.inner.subscribe_messages(group_id)
     }
 
@@ -733,23 +727,81 @@ impl GroupStateStore {
     }
 }
 
-pub struct GroupReceiver {
-    inner: tokio_stream::wrappers::BroadcastStream<(GroupProposal, GroupMessage)>,
+type WatchChangedFut = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Result<(), watch::error::RecvError>,
+                    watch::Receiver<Option<GroupProposal>>,
+                ),
+            > + Send,
+    >,
+>;
+
+fn make_watch_changed_fut(mut rx: watch::Receiver<Option<GroupProposal>>) -> WatchChangedFut {
+    Box::pin(async move {
+        let result = rx.changed().await;
+        (result, rx)
+    })
 }
 
-impl Stream for GroupReceiver {
+pub struct GroupSubscription {
+    inner: Arc<FjallStateStore>,
+    group_id: GroupId,
+    state: GroupSubscriptionState,
+    next_epoch: Epoch,
+    buffer: std::collections::VecDeque<(GroupProposal, GroupMessage)>,
+}
+
+enum GroupSubscriptionState {
+    Idle(watch::Receiver<Option<GroupProposal>>),
+    Waiting(WatchChangedFut),
+    Done,
+}
+
+impl Stream for GroupSubscription {
     type Item = (GroupProposal, GroupMessage);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match std::task::ready!(Pin::new(&mut self.get_mut().inner).poll_next(cx)) {
-            Some(Ok(item)) => Poll::Ready(Some(item)),
-            _ => Poll::Ready(None),
+        let this = self.get_mut();
+
+        if let Some(item) = this.buffer.pop_front() {
+            this.next_epoch = Epoch(item.0.epoch.0 + 1);
+            return Poll::Ready(Some(item));
+        }
+
+        loop {
+            match &mut this.state {
+                GroupSubscriptionState::Done => return Poll::Ready(None),
+                GroupSubscriptionState::Idle(_) => {
+                    let GroupSubscriptionState::Idle(rx) =
+                        std::mem::replace(&mut this.state, GroupSubscriptionState::Done)
+                    else {
+                        unreachable!()
+                    };
+                    this.state = GroupSubscriptionState::Waiting(make_watch_changed_fut(rx));
+                }
+                GroupSubscriptionState::Waiting(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready((Ok(()), rx)) => {
+                        this.state = GroupSubscriptionState::Idle(rx);
+                        let from = this.next_epoch;
+                        let entries = this.inner.get_accepted_from_sync(&this.group_id, from);
+                        this.buffer.extend(entries);
+                        if let Some(item) = this.buffer.pop_front() {
+                            this.next_epoch = Epoch(item.0.epoch.0 + 1);
+                            return Poll::Ready(Some(item));
+                        }
+                    }
+                    Poll::Ready((Err(_), _)) => {
+                        this.state = GroupSubscriptionState::Done;
+                        return Poll::Ready(None);
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+            }
         }
     }
 }
-
-pub type HistoricalStream = stream::Iter<std::vec::IntoIter<(GroupProposal, GroupMessage)>>;
-pub type GroupSubscription = stream::Chain<HistoricalStream, GroupReceiver>;
 
 impl<L> AcceptorStateStore<L> for GroupStateStore
 where
@@ -839,7 +891,7 @@ where
                     accepted: current_accepted.clone(),
                 })?;
 
-            let _ = inner.get_broadcast(&group_id).send((proposal, message));
+            inner.get_broadcast(&group_id).send_replace(Some(proposal));
 
             Ok(())
         })
@@ -851,19 +903,26 @@ where
         let inner = self.inner.clone();
         let group_id = self.group_id;
 
-        let historical = tokio::task::spawn_blocking(move || {
-            inner.get_accepted_from_sync(&group_id, from_round)
+        let historical = tokio::task::spawn_blocking({
+            let inner = inner.clone();
+            move || inner.get_accepted_from_sync(&group_id, from_round)
         })
         .await
         .expect("spawn_blocking panicked");
 
-        let live = GroupReceiver {
-            inner: tokio_stream::wrappers::BroadcastStream::new(
-                self.inner.get_broadcast(&self.group_id).subscribe(),
-            ),
-        };
+        let watch_rx = self.inner.get_broadcast(&self.group_id).subscribe();
 
-        stream::iter(historical).chain(live)
+        let next_epoch = historical
+            .last()
+            .map_or(from_round, |(p, _)| Epoch(p.epoch.0 + 1));
+
+        GroupSubscription {
+            inner,
+            group_id: self.group_id,
+            state: GroupSubscriptionState::Idle(watch_rx),
+            next_epoch,
+            buffer: historical.into(),
+        }
     }
 
     async fn highest_accepted_round(&self) -> Option<Epoch> {

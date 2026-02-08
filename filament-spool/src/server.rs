@@ -5,7 +5,7 @@ use filament_core::codec::{PostcardCodec, VersionedCodec};
 use filament_core::sink_stream::{Mapped, SinkStream};
 use filament_core::{
     ConnectorError, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
-    MemberFingerprint, MemberId, MessageRequest, MessageResponse, PAXOS_ALPN,
+    MemberFingerprint, MemberId, MessageRequest, MessageResponse, PAXOS_ALPN, StateVector,
 };
 use filament_warp::acceptor::{AcceptorHandler, run_acceptor_with_epoch_waiter};
 use filament_warp::{AcceptorMessage, AcceptorRequest, Learner};
@@ -300,6 +300,7 @@ where
     let send = writer.into_inner();
     let mut connection = new_message_connection(send, recv, protocol_version);
     let mut subscription = registry.subscribe_messages(&group_id);
+    let mut local_sv = StateVector::default();
 
     loop {
         tokio::select! {
@@ -313,18 +314,21 @@ where
                 handle_message_request(&group_id, &subscriber, request, &mut connection, &registry, &acceptor).await?;
             }
 
-            msg = subscription.recv() => {
-                match msg {
-                    Ok((id, message)) => {
-                        // Don't echo messages back to the sender.
-                        if id.sender == subscriber {
-                            continue;
-                        }
-                        let response = MessageResponse::Message { id, message };
-                        connection.send(response).await.change_context(ConnectorError)?;
+            result = subscription.changed() => {
+                if result.is_err() {
+                    break;
+                }
+
+                let messages = registry.get_messages_after(&group_id, &local_sv);
+                for (id, message) in messages {
+                    let hw = local_sv.entry(id.sender).or_insert(0);
+                    *hw = (*hw).max(id.seq);
+
+                    if id.sender == subscriber {
+                        continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    let response = MessageResponse::Message { id, message };
+                    connection.send(response).await.change_context(ConnectorError)?;
                 }
             }
         }
