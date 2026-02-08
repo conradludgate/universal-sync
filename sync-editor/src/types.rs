@@ -65,10 +65,24 @@ pub struct GroupStatePayload {
     pub connected_acceptor_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AwarenessPeer {
+    pub client_id: u64,
+    pub cursor: Option<u32>,
+    pub selection_end: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AwarenessPayload {
+    pub group_id: String,
+    pub peers: Vec<AwarenessPeer>,
+}
+
 /// Abstracts event emission so actors can be tested without Tauri.
 pub trait EventEmitter: Clone + Send + 'static {
     fn emit_document_updated(&self, payload: &DocumentUpdatedPayload);
     fn emit_group_state_changed(&self, payload: &GroupStatePayload);
+    fn emit_awareness_changed(&self, payload: &AwarenessPayload);
 }
 
 impl EventEmitter for AppHandle {
@@ -79,6 +93,10 @@ impl EventEmitter for AppHandle {
     fn emit_group_state_changed(&self, payload: &GroupStatePayload) {
         use tauri::Emitter;
         let _ = self.emit("group-state-changed", payload);
+    }
+    fn emit_awareness_changed(&self, payload: &AwarenessPayload) {
+        use tauri::Emitter;
+        let _ = self.emit("awareness-changed", payload);
     }
 }
 
@@ -142,6 +160,10 @@ pub enum DocRequest {
     },
     UpdateKeys {
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateCursor {
+        anchor: u32,
+        head: u32,
     },
     #[allow(dead_code)]
     Shutdown,

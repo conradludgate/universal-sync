@@ -1,4 +1,4 @@
-import type { Delta, SyncStatus } from "../types";
+import type { AwarenessPeer, Delta, SyncStatus } from "../types";
 import { EditorToolbar } from "./EditorToolbar";
 import { MonacoWrapper } from "./MonacoWrapper";
 
@@ -7,6 +7,7 @@ interface EditorViewProps {
   text: string;
   deltas: Delta[] | null;
   syncStatus: SyncStatus;
+  awarenessPeers: AwarenessPeer[];
   onShare: () => void;
 }
 
@@ -15,6 +16,7 @@ export function EditorView({
   text,
   deltas,
   syncStatus,
+  awarenessPeers,
   onShare,
 }: EditorViewProps) {
   return (
@@ -24,7 +26,12 @@ export function EditorView({
         syncStatus={syncStatus}
         onShare={onShare}
       />
-      <MonacoWrapper groupId={groupId} text={text} deltas={deltas} />
+      <MonacoWrapper
+        groupId={groupId}
+        text={text}
+        deltas={deltas}
+        awarenessPeers={awarenessPeers}
+      />
     </div>
   );
 }

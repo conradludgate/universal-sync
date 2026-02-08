@@ -197,3 +197,22 @@ pub async fn update_keys(
 ) -> Result<(), String> {
     doc_request(&state, &group_id, |reply| DocRequest::UpdateKeys { reply }).await
 }
+
+#[tauri::command]
+pub async fn update_cursor(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+    anchor: u32,
+    head: u32,
+) -> Result<(), String> {
+    let group_id = parse_group_id(&group_id)?;
+    state
+        .coordinator_tx
+        .send(CoordinatorRequest::ForDoc {
+            group_id,
+            request: DocRequest::UpdateCursor { anchor, head },
+        })
+        .await
+        .map_err(|_| "coordinator actor closed".to_string())?;
+    Ok(())
+}

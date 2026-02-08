@@ -58,6 +58,7 @@ fn main() {
             commands::remove_acceptor,
             commands::get_group_state,
             commands::update_keys,
+            commands::update_cursor,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

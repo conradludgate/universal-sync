@@ -45,3 +45,6 @@ export const getGroupState = (groupId: string) =>
 
 export const updateKeys = (groupId: string) =>
   invoke<void>("update_keys", { groupId });
+
+export const updateCursor = (groupId: string, anchor: number, head: number) =>
+  invoke<void>("update_cursor", { groupId, anchor, head });

@@ -3,6 +3,8 @@ import * as tauri from "./tauri";
 import { useToast } from "./hooks/useToast";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import type {
+  AwarenessPeer,
+  AwarenessPayload,
   Delta,
   DocumentInfo,
   DocumentUpdatedPayload,
@@ -30,6 +32,7 @@ export function App() {
   // Remote text updates: store text + deltas for the editor to apply
   const [remoteText, setRemoteText] = useState<string>("");
   const [remoteDeltas, setRemoteDeltas] = useState<Delta[] | null>(null);
+  const [awarenessPeers, setAwarenessPeers] = useState<AwarenessPeer[]>([]);
 
   const currentGroupIdRef = useRef(currentGroupId);
   currentGroupIdRef.current = currentGroupId;
@@ -153,9 +156,19 @@ export function App() {
     [],
   );
 
+  const handleAwarenessChanged = useCallback(
+    (payload: AwarenessPayload) => {
+      if (currentGroupIdRef.current === payload.group_id) {
+        setAwarenessPeers(payload.peers);
+      }
+    },
+    [],
+  );
+
   useTauriEvents({
     onDocumentUpdated: handleDocumentUpdated,
     onGroupStateChanged: handleGroupStateChanged,
+    onAwarenessChanged: handleAwarenessChanged,
   });
 
   // Keyboard shortcuts
@@ -200,6 +213,7 @@ export function App() {
               text={remoteText}
               deltas={remoteDeltas}
               syncStatus={syncStatus}
+              awarenessPeers={awarenessPeers}
               onShare={handleOpenShareModal}
             />
           ) : (

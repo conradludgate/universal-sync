@@ -30,6 +30,7 @@ impl EventEmitter for MockEmitter {
         let _ = self.tx.try_send(payload.clone());
     }
     fn emit_group_state_changed(&self, _payload: &sync_editor::types::GroupStatePayload) {}
+    fn emit_awareness_changed(&self, _payload: &sync_editor::types::AwarenessPayload) {}
 }
 
 fn mock_emitter() -> (MockEmitter, mpsc::Receiver<DocumentUpdatedPayload>) {

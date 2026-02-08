@@ -28,4 +28,15 @@ export interface GroupStatePayload {
   connected_acceptor_count: number;
 }
 
+export interface AwarenessPeer {
+  client_id: number;
+  cursor: number | null;
+  selection_end: number | null;
+}
+
+export interface AwarenessPayload {
+  group_id: string;
+  peers: AwarenessPeer[];
+}
+
 export type SyncStatus = "synced" | "syncing" | "error";

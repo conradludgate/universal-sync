@@ -44,6 +44,19 @@ pub trait Crdt: Send + Sync + 'static {
     ///
     /// Returns [`CrdtError`] if encoding the diff fails.
     fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>>;
+
+    /// Snapshot suitable for sending over the wire (may include framing).
+    ///
+    /// Defaults to [`Crdt::snapshot`]. Implementations that use prefix
+    /// framing in [`Crdt::apply`] should override this to wrap the snapshot
+    /// so that receivers can decode it via `apply()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError`] if encoding the snapshot fails.
+    fn wire_snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
+        self.snapshot()
+    }
 }
 
 /// Configuration for a single compaction level.

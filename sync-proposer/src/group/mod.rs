@@ -542,24 +542,26 @@ where
     ///
     /// Returns [`GroupError`] if flushing the CRDT or sending the message fails.
     pub async fn send_update(&mut self, crdt: &mut impl Crdt) -> Result<(), Report<GroupError>> {
-        let update = crdt.flush_update().change_context(GroupError)?;
+        loop {
+            let update = crdt.flush_update().change_context(GroupError)?;
 
-        let Some(data) = update else {
-            return Ok(());
-        };
+            let Some(data) = update else {
+                return Ok(());
+            };
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.request_tx
-            .send(GroupRequest::SendMessage {
-                data,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| Report::new(GroupError).attach("group actor closed"))?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.request_tx
+                .send(GroupRequest::SendMessage {
+                    data,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| Report::new(GroupError).attach("group actor closed"))?;
 
-        reply_rx
-            .await
-            .map_err(|_| Report::new(GroupError).attach("group actor dropped reply"))?
+            reply_rx
+                .await
+                .map_err(|_| Report::new(GroupError).attach("group actor dropped reply"))??;
+        }
     }
 
     /// Non-blocking: drain and apply pending CRDT updates. Returns `true` if any applied.
@@ -592,7 +594,7 @@ where
     ///
     /// Returns [`GroupError`] if snapshotting, encryption, or consensus fails.
     pub async fn compact(&mut self, crdt: &impl Crdt, level: u8) -> Result<(), Report<GroupError>> {
-        let snapshot = crdt.snapshot().change_context(GroupError)?;
+        let snapshot = crdt.wire_snapshot().change_context(GroupError)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::CompactSnapshot {
