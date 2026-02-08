@@ -9,7 +9,7 @@ mod document;
 mod types;
 
 use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
-use filament_weave::GroupClient;
+use filament_weave::WeaverClient;
 use iroh::{Endpoint, SecretKey};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
@@ -50,12 +50,12 @@ fn main() {
             commands::apply_delta,
             commands::get_document_text,
             commands::add_member,
-            commands::add_acceptor,
-            commands::list_acceptors,
+            commands::add_spool,
+            commands::list_spools,
             commands::list_peers,
             commands::add_peer,
             commands::remove_member,
-            commands::remove_acceptor,
+            commands::remove_spool,
             commands::get_group_state,
             commands::update_keys,
             commands::update_cursor,
@@ -112,7 +112,7 @@ async fn setup_coordinator(
 
     info!(addr = ?endpoint.addr(), "iroh endpoint ready");
 
-    let group_client = GroupClient::new(client, secret_key, cipher_suite, endpoint);
+    let group_client = WeaverClient::new(client, secret_key, cipher_suite, endpoint);
 
     let coordinator = CoordinatorActor::new(group_client, coordinator_rx, app_handle);
     coordinator.run().await;

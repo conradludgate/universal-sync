@@ -113,12 +113,12 @@ pub async fn add_member(
 }
 
 #[tauri::command]
-pub async fn add_acceptor(
+pub async fn add_spool(
     state: tauri::State<'_, AppState>,
     group_id: String,
     addr_b58: String,
 ) -> Result<(), String> {
-    doc_request(&state, &group_id, |reply| DocRequest::AddAcceptor {
+    doc_request(&state, &group_id, |reply| DocRequest::AddSpool {
         addr_b58,
         reply,
     })
@@ -126,14 +126,11 @@ pub async fn add_acceptor(
 }
 
 #[tauri::command]
-pub async fn list_acceptors(
+pub async fn list_spools(
     state: tauri::State<'_, AppState>,
     group_id: String,
 ) -> Result<Vec<String>, String> {
-    doc_request(&state, &group_id, |reply| DocRequest::ListAcceptors {
-        reply,
-    })
-    .await
+    doc_request(&state, &group_id, |reply| DocRequest::ListSpools { reply }).await
 }
 
 #[tauri::command]
@@ -171,13 +168,13 @@ pub async fn remove_member(
 }
 
 #[tauri::command]
-pub async fn remove_acceptor(
+pub async fn remove_spool(
     state: tauri::State<'_, AppState>,
     group_id: String,
-    acceptor_id_b58: String,
+    spool_id_b58: String,
 ) -> Result<(), String> {
-    doc_request(&state, &group_id, |reply| DocRequest::RemoveAcceptor {
-        acceptor_id_b58,
+    doc_request(&state, &group_id, |reply| DocRequest::RemoveSpool {
+        spool_id_b58,
         reply,
     })
     .await

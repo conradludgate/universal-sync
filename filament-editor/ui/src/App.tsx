@@ -43,7 +43,7 @@ export function App() {
     try {
       const gs = await tauri.getGroupState(groupId);
       setGroupState(gs);
-      if (gs.acceptor_count === 0 || gs.connected_acceptor_count > 0) {
+      if (gs.spool_count === 0 || gs.connected_spool_count > 0) {
         setSyncStatus("synced");
       } else {
         setSyncStatus("error");
@@ -144,8 +144,8 @@ export function App() {
       if (currentGroupIdRef.current === payload.group_id) {
         setGroupState(payload);
         if (
-          payload.acceptor_count === 0 ||
-          payload.connected_acceptor_count > 0
+          payload.spool_count === 0 ||
+          payload.connected_spool_count > 0
         ) {
           setSyncStatus("synced");
         } else {

@@ -44,7 +44,7 @@ pub enum PeerEntry {
         is_self: bool,
         client_id: u64,
     },
-    Acceptor {
+    Spool {
         id: String,
     },
 }
@@ -62,8 +62,8 @@ pub struct GroupStatePayload {
     pub epoch: u64,
     pub transcript_hash: String,
     pub member_count: usize,
-    pub acceptor_count: usize,
-    pub connected_acceptor_count: usize,
+    pub spool_count: usize,
+    pub connected_spool_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,17 +135,17 @@ pub enum DocRequest {
         key_package_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    AddAcceptor {
+    AddSpool {
         addr_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    ListAcceptors {
+    ListSpools {
         reply: oneshot::Sender<Result<Vec<String>, String>>,
     },
     ListPeers {
         reply: oneshot::Sender<Result<Vec<PeerEntry>, String>>,
     },
-    /// Auto-detect KeyPackage (member) vs EndpointAddr (acceptor).
+    /// Auto-detect KeyPackage (member) vs EndpointAddr (spool).
     AddPeer {
         input_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
@@ -154,8 +154,8 @@ pub enum DocRequest {
         member_index: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    RemoveAcceptor {
-        acceptor_id_b58: String,
+    RemoveSpool {
+        spool_id_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     GetGroupState {

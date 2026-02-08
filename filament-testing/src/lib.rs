@@ -1,12 +1,13 @@
 //! Test utilities for Universal Sync integration tests.
 
+mod repl;
 pub mod yrs_crdt;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use filament_spool::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
-use filament_weave::{GroupClient, ReplContext};
+use filament_weave::WeaverClient;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use mls_rs::crypto::SignatureSecretKey;
 use mls_rs::external_client::ExternalClient;
@@ -14,6 +15,7 @@ use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::{CipherSuite, CipherSuiteProvider, Client, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+pub use repl::ReplContext;
 use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 pub use yrs_crdt::{AWARENESS_TIMEOUT, YrsCrdt};
@@ -81,12 +83,12 @@ pub fn test_client(name: &str) -> TestClientResult<impl mls_rs::client_builder::
 /// # Panics
 /// Panics if key generation or client building fails.
 #[must_use]
-pub fn test_group_client(
+pub fn test_weaver_client(
     name: &'static str,
     endpoint: iroh::Endpoint,
-) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
+) -> WeaverClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
     let result = test_client(name);
-    GroupClient::new(result.client, result.signer, result.cipher_suite, endpoint)
+    WeaverClient::new(result.client, result.signer, result.cipher_suite, endpoint)
 }
 
 /// # Panics
@@ -96,17 +98,17 @@ pub fn test_repl_context(
     name: &'static str,
     endpoint: iroh::Endpoint,
 ) -> ReplContext<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
-    let client = test_group_client(name, endpoint);
+    let client = test_weaver_client(name, endpoint);
     ReplContext::new(client)
 }
 
-/// Alias for [`test_group_client`] (factory registration is no longer needed).
+/// Alias for [`test_weaver_client`] (factory registration is no longer needed).
 #[must_use]
-pub fn test_yrs_group_client(
+pub fn test_yrs_weaver_client(
     name: &'static str,
     endpoint: Endpoint,
-) -> GroupClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
-    test_group_client(name, endpoint)
+) -> WeaverClient<impl mls_rs::client_builder::MlsConfig, TestCipherSuiteProvider> {
+    test_weaver_client(name, endpoint)
 }
 
 /// Safe to call multiple times.

@@ -12,7 +12,7 @@ use filament_editor::types::{
     CoordinatorRequest, Delta, DocRequest, DocumentInfo, DocumentUpdatedPayload, EventEmitter,
 };
 use filament_testing::{
-    YrsCrdt, init_tracing, spawn_acceptor, test_endpoint, test_yrs_group_client,
+    YrsCrdt, init_tracing, spawn_acceptor, test_endpoint, test_yrs_weaver_client,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -90,9 +90,9 @@ async fn spawn_doc_actor() -> (
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_group_client("doc-actor-test", test_endpoint().await);
+    let client = test_yrs_weaver_client("doc-actor-test", test_endpoint().await);
     let group = client
-        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
 
@@ -227,20 +227,20 @@ async fn doc_actor_remote_update_triggers_event() {
     let (_acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_group_client("alice-doc-event", test_endpoint().await);
+    let alice_client = test_yrs_weaver_client("alice-doc-event", test_endpoint().await);
     let mut alice_group = alice_client
-        .create_group(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let group_id = alice_group.group_id();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut bob_client = test_yrs_group_client("bob-doc-event", test_endpoint().await);
+    let mut bob_client = test_yrs_weaver_client("bob-doc-event", test_endpoint().await);
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     alice_group.add_member(bob_kp).await.expect("add bob");
     let welcome = bob_client.recv_welcome().await.expect("bob welcome");
-    let join_info = bob_client.join_group(&welcome).await.expect("bob join");
+    let join_info = bob_client.join(&welcome).await.expect("bob join");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -304,7 +304,7 @@ async fn doc_actor_remote_update_triggers_event() {
 /// Spawn a CoordinatorActor for testing.
 /// Returns the request sender and the event receiver.
 fn spawn_coordinator(
-    client: filament_weave::GroupClient<
+    client: filament_weave::WeaverClient<
         impl mls_rs::client_builder::MlsConfig + 'static,
         impl mls_rs::CipherSuiteProvider + Clone + 'static,
     >,
@@ -327,7 +327,7 @@ async fn coordinator_create_document() {
     let (_acceptor_task, _acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_group_client("coord-create", test_endpoint().await);
+    let client = test_yrs_weaver_client("coord-create", test_endpoint().await);
     let (tx, _event_rx) = spawn_coordinator(client);
 
     let info: DocumentInfo = send_coord(&tx, |reply| CoordinatorRequest::CreateDocument { reply })
@@ -353,7 +353,7 @@ async fn coordinator_create_multiple_documents() {
     let (_acceptor_task, _addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_group_client("coord-multi", test_endpoint().await);
+    let client = test_yrs_weaver_client("coord-multi", test_endpoint().await);
     let (tx, _event_rx) = spawn_coordinator(client);
 
     let info_a = send_coord(&tx, |reply| CoordinatorRequest::CreateDocument { reply })
@@ -395,7 +395,7 @@ async fn coordinator_create_multiple_documents() {
 #[tokio::test]
 async fn coordinator_route_to_unknown_group_id() {
     init_tracing();
-    let client = test_yrs_group_client("coord-unknown", test_endpoint().await);
+    let client = test_yrs_weaver_client("coord-unknown", test_endpoint().await);
     let (tx, _event_rx) = spawn_coordinator(client);
 
     let fake_id = GroupId::new([42u8; 32]);
@@ -424,7 +424,7 @@ async fn coordinator_join_via_welcome() {
     let (_acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_group_client("alice-coord", test_endpoint().await);
+    let alice_client = test_yrs_weaver_client("alice-coord", test_endpoint().await);
     let (alice_tx, _alice_events) = spawn_coordinator(alice_client);
 
     let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
@@ -435,7 +435,7 @@ async fn coordinator_join_via_welcome() {
     let alice_group_id = GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
 
     let addr_b58 = bs58::encode(postcard::to_allocvec(&acceptor_addr).unwrap()).into_string();
-    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddAcceptor {
+    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddSpool {
         addr_b58,
         reply,
     })
@@ -455,7 +455,7 @@ async fn coordinator_join_via_welcome() {
     .await
     .expect("alice write");
 
-    let bob_client = test_yrs_group_client("bob-coord", test_endpoint().await);
+    let bob_client = test_yrs_weaver_client("bob-coord", test_endpoint().await);
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp.to_bytes().unwrap()).into_string();
     let (bob_tx, _bob_events) = spawn_coordinator(bob_client);
@@ -506,7 +506,7 @@ async fn full_two_peer_sync() {
     let (_acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_group_client("alice-sync", test_endpoint().await);
+    let alice_client = test_yrs_weaver_client("alice-sync", test_endpoint().await);
     let (alice_tx, mut alice_events) = spawn_coordinator(alice_client);
 
     let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
@@ -517,7 +517,7 @@ async fn full_two_peer_sync() {
     let alice_group_id = GroupId::from_slice(&bs58::decode(&doc_info.group_id).into_vec().unwrap());
 
     let addr_b58 = bs58::encode(postcard::to_allocvec(&acceptor_addr).unwrap()).into_string();
-    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddAcceptor {
+    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddSpool {
         addr_b58,
         reply,
     })
@@ -525,7 +525,7 @@ async fn full_two_peer_sync() {
     .expect("add acceptor");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let bob_client = test_yrs_group_client("bob-sync", test_endpoint().await);
+    let bob_client = test_yrs_weaver_client("bob-sync", test_endpoint().await);
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp.to_bytes().unwrap()).into_string();
     let (bob_tx, mut bob_events) = spawn_coordinator(bob_client);
@@ -625,7 +625,7 @@ async fn two_member_unidirectional_sync() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Spawn Alice's coordinator
-    let alice_client = test_yrs_group_client("alice-uni", test_endpoint().await);
+    let alice_client = test_yrs_weaver_client("alice-uni", test_endpoint().await);
     let (alice_tx, _alice_events) = spawn_coordinator(alice_client);
 
     // Alice creates a document
@@ -638,7 +638,7 @@ async fn two_member_unidirectional_sync() {
 
     // Alice adds the acceptor
     let addr_b58 = bs58::encode(postcard::to_allocvec(&acceptor_addr).unwrap()).into_string();
-    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddAcceptor {
+    send_coord_doc(&alice_tx, alice_group_id, |reply| DocRequest::AddSpool {
         addr_b58,
         reply,
     })
@@ -647,7 +647,7 @@ async fn two_member_unidirectional_sync() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Spawn Bob's coordinator
-    let bob_client = test_yrs_group_client("bob-uni", test_endpoint().await);
+    let bob_client = test_yrs_weaver_client("bob-uni", test_endpoint().await);
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp.to_bytes().unwrap()).into_string();
     let (bob_tx, mut bob_events) = spawn_coordinator(bob_client);

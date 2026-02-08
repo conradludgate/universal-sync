@@ -3,7 +3,6 @@
 #![warn(clippy::pedantic)]
 
 use std::fmt;
-use std::future::Future;
 use std::hash::Hash;
 
 use error_stack::Report;
@@ -143,16 +142,6 @@ pub trait Learner: Send + Sync + 'static {
         proposal: Self::Proposal,
         message: Self::Message,
     ) -> Result<(), Self::Error>;
-}
-
-/// Connects to acceptors by their ID.
-/// Implementations should handle backoff/retry logic internally.
-pub trait Connector<L: Learner>: Clone + Send + 'static {
-    type Connection: AcceptorConn<L> + Send;
-    type Error: fmt::Debug + fmt::Display + Send + 'static;
-    type ConnectFuture: Future<Output = Result<Self::Connection, Self::Error>> + Send;
-
-    fn connect(&mut self, acceptor_id: &L::AcceptorId) -> Self::ConnectFuture;
 }
 
 pub trait AcceptorConn<L: Learner>:

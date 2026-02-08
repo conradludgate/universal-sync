@@ -11,7 +11,7 @@ export type Delta =
 
 export type PeerEntry =
   | { kind: "Member"; index: number; identity: string; is_self: boolean; client_id: number }
-  | { kind: "Acceptor"; id: string };
+  | { kind: "Spool"; id: string };
 
 export interface DocumentUpdatedPayload {
   group_id: string;
@@ -24,8 +24,8 @@ export interface GroupStatePayload {
   epoch: number;
   transcript_hash: string;
   member_count: number;
-  acceptor_count: number;
-  connected_acceptor_count: number;
+  spool_count: number;
+  connected_spool_count: number;
 }
 
 export interface AwarenessPeer {

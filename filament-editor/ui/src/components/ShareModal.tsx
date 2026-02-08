@@ -37,7 +37,7 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
   const handleAddPeer = useCallback(async () => {
     const input = peerInput.trim();
     if (!input) {
-      showToast("Paste an invite code or acceptor address", "error");
+      showToast("Paste an invite code or spool address", "error");
       return;
     }
     try {
@@ -65,15 +65,15 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
     [groupId, showToast, fetchPeers],
   );
 
-  const handleRemoveAcceptor = useCallback(
+  const handleRemoveSpool = useCallback(
     async (id: string) => {
       try {
-        await tauri.removeAcceptor(groupId, id);
-        showToast("Acceptor removed", "success");
+        await tauri.removeSpool(groupId, id);
+        showToast("Spool removed", "success");
         await fetchPeers();
       } catch (error) {
-        console.error("Failed to remove acceptor:", error);
-        showToast(`Failed to remove acceptor: ${error}`, "error");
+        console.error("Failed to remove spool:", error);
+        showToast(`Failed to remove spool: ${error}`, "error");
       }
     },
     [groupId, showToast, fetchPeers],
@@ -107,8 +107,8 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
   const members = peers.filter(
     (p): p is Extract<PeerEntry, { kind: "Member" }> => p.kind === "Member",
   );
-  const acceptors = peers.filter(
-    (p): p is Extract<PeerEntry, { kind: "Acceptor" }> => p.kind === "Acceptor",
+  const spools = peers.filter(
+    (p): p is Extract<PeerEntry, { kind: "Spool" }> => p.kind === "Spool",
   );
 
   const shortHash = groupState
@@ -199,10 +199,10 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
                     ))}
                   </>
                 )}
-                {acceptors.length > 0 && (
+                {spools.length > 0 && (
                   <>
-                    <div className="peer-section-label">Acceptors</div>
-                    {acceptors.map((a) => (
+                    <div className="peer-section-label">Spools</div>
+                    {spools.map((a) => (
                       <div key={a.id} className="peer-item">
                         <div className="peer-item-info">
                           <span className="peer-item-id" title={a.id}>
@@ -212,7 +212,7 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
                         <button
                           className="peer-item-remove"
                           title="Remove"
-                          onClick={() => handleRemoveAcceptor(a.id)}
+                          onClick={() => handleRemoveSpool(a.id)}
                         >
                           ✕
                         </button>
@@ -227,12 +227,12 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
           <div className="peer-add-form">
             <label>
               <span>Add Peer</span>
-              <small>Paste an invite code (member) or acceptor address</small>
+              <small>Paste an invite code (member) or spool address</small>
             </label>
             <div className="peer-input-row">
               <textarea
                 className="input-textarea"
-                placeholder="Paste invite code or acceptor address..."
+                placeholder="Paste invite code or spool address..."
                 rows={3}
                 value={peerInput}
                 onChange={(e) => setPeerInput(e.target.value)}

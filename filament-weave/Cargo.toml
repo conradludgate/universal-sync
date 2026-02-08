@@ -3,10 +3,6 @@ name = "filament-weave"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "proposer"
-path = "src/main.rs"
-
 [dependencies]
 filament-core = { path = "../filament-core" }
 filament-warp = { path = "../filament-warp" }

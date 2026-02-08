@@ -19,22 +19,22 @@ use tokio_util::sync::CancellationToken;
 
 use super::acceptor_actor::AcceptorActor;
 use super::{
-    AcceptorInbound, AcceptorOutbound, GroupContext, GroupError, GroupEvent, GroupRequest,
-    MAX_MESSAGE_ATTEMPTS, MemberInfo, PendingMessage, blocking, group_info_ext_list,
+    AcceptorInbound, AcceptorOutbound, GroupRequest, MAX_MESSAGE_ATTEMPTS, MemberInfo,
+    PendingMessage, WeaverContext, WeaverError, WeaverEvent, blocking, group_info_ext_list,
     group_info_with_ext,
 };
 use crate::connection::ConnectionManager;
 use crate::connector::{ProposalRequest, ProposalResponse};
-use crate::learner::{GroupLearner, fingerprint_of_member};
+use crate::learner::{WeaverLearner, fingerprint_of_member};
 
 pub(crate) struct GroupActor<C, CS>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Send + Sync + 'static,
 {
-    learner: GroupLearner<C, CS>,
-    proposer: Proposer<GroupLearner<C, CS>>,
-    quorum_tracker: QuorumTracker<GroupLearner<C, CS>>,
+    learner: WeaverLearner<C, CS>,
+    proposer: Proposer<WeaverLearner<C, CS>>,
+    quorum_tracker: QuorumTracker<WeaverLearner<C, CS>>,
     attempt: filament_core::Attempt,
     group_id: GroupId,
     #[allow(dead_code)]
@@ -42,7 +42,7 @@ where
     connection_manager: ConnectionManager,
     request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
     app_message_tx: mpsc::Sender<Vec<u8>>,
-    event_tx: broadcast::Sender<GroupEvent>,
+    event_tx: broadcast::Sender<WeaverEvent>,
     cancel_token: CancellationToken,
     acceptor_txs: HashMap<AcceptorId, mpsc::Sender<AcceptorOutbound>>,
     acceptor_rx: mpsc::Receiver<AcceptorInbound>,
@@ -72,18 +72,18 @@ struct ActiveProposal {
 }
 
 enum ProposalReplyKind {
-    Simple(oneshot::Sender<Result<(), Report<GroupError>>>),
+    Simple(oneshot::Sender<Result<(), Report<WeaverError>>>),
     WithWelcome {
         member_addr: EndpointAddr,
         welcome: Vec<u8>,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     },
 }
 
 struct WelcomeToSend {
     member_addr: EndpointAddr,
     welcome: Vec<u8>,
-    reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+    reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
 }
 
 /// Tracks an active compaction claim at a given level.
@@ -219,13 +219,13 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        learner: GroupLearner<C, CS>,
+        learner: WeaverLearner<C, CS>,
         group_id: GroupId,
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
         request_rx: mpsc::Receiver<GroupRequest<C, CS>>,
         app_message_tx: mpsc::Sender<Vec<u8>>,
-        event_tx: broadcast::Sender<GroupEvent>,
+        event_tx: broadcast::Sender<WeaverEvent>,
         cancel_token: CancellationToken,
         compaction_config: CompactionConfig,
         key_rotation_interval: Option<std::time::Duration>,
@@ -395,7 +395,7 @@ where
     async fn register_group_with_acceptor(
         &self,
         addr: &EndpointAddr,
-    ) -> Result<(), Report<GroupError>> {
+    ) -> Result<(), Report<WeaverError>> {
         use crate::connector::register_group_with_addr;
 
         let acceptors = self.learner.acceptors().values().cloned();
@@ -407,7 +407,7 @@ where
             &group_info_bytes,
         )
         .await
-        .change_context(GroupError)?;
+        .change_context(WeaverError)?;
 
         Ok(())
     }
@@ -460,7 +460,7 @@ where
         false
     }
 
-    fn get_context(&self) -> GroupContext {
+    fn get_context(&self) -> WeaverContext {
         let mls_context = self.learner.group().context();
         let my_index = self.learner.group().current_member_index();
         let members = self
@@ -482,13 +482,13 @@ where
             })
             .collect::<Vec<_>>();
         let member_count = members.len();
-        GroupContext {
+        WeaverContext {
             group_id: self.group_id,
             epoch: self.learner.mls_epoch(),
             member_count,
             members,
-            acceptors: self.learner.acceptor_ids().collect(),
-            connected_acceptors: self.connected_acceptors.clone(),
+            spools: self.learner.acceptor_ids().collect(),
+            connected_spools: self.connected_acceptors.clone(),
             confirmed_transcript_hash: mls_context.confirmed_transcript_hash.to_vec(),
         }
     }
@@ -497,11 +497,11 @@ where
         &mut self,
         key_package: MlsMessage,
         member_addr: EndpointAddr,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let acceptor_count = self.learner.acceptor_ids().len();
         if acceptor_count == 0 {
-            let _ = reply.send(Err(Report::new(GroupError).attach(
+            let _ = reply.send(Err(Report::new(WeaverError).attach(
                 "cannot add members to a group without acceptors: add an acceptor first",
             )));
             return;
@@ -510,7 +510,7 @@ where
         let current_version = match self.learner.protocol_version() {
             Ok(v) => v,
             Err(e) => {
-                let _ = reply.send(Err(e.change_context(GroupError)));
+                let _ = reply.send(Err(e.change_context(WeaverError)));
                 return;
             }
         };
@@ -518,7 +518,7 @@ where
             && let Ok(Some(kp_ext)) = kp.extensions.get_as::<filament_core::KeyPackageExt>()
             && !kp_ext.supports_version(current_version)
         {
-            let _ = reply.send(Err(Report::new(GroupError).attach(format!(
+            let _ = reply.send(Err(Report::new(WeaverError).attach(format!(
                 "member does not support protocol version {current_version} (supports {:?})",
                 kp_ext.supported_protocol_versions
             ))));
@@ -533,19 +533,19 @@ where
                 .group_mut()
                 .commit_builder()
                 .add_member(key_package)
-                .change_context(GroupError)?
+                .change_context(WeaverError)?
                 .set_group_info_ext(group_info_ext)
                 .build()
-                .change_context(GroupError)?;
+                .change_context(WeaverError)?;
 
             let welcome_bytes = commit_output
                 .welcome_messages
                 .first()
-                .ok_or_else(|| Report::new(GroupError).attach("no welcome message generated"))?
+                .ok_or_else(|| Report::new(WeaverError).attach("no welcome message generated"))?
                 .to_bytes()
-                .change_context(GroupError)?;
+                .change_context(WeaverError)?;
 
-            Ok::<_, Report<GroupError>>((commit_output, welcome_bytes))
+            Ok::<_, Report<WeaverError>>((commit_output, welcome_bytes))
         });
 
         match result {
@@ -563,16 +563,16 @@ where
     async fn handle_remove_member(
         &mut self,
         member_index: u32,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = blocking(|| {
             self.learner
                 .group_mut()
                 .commit_builder()
                 .remove_member(member_index)
-                .change_context(GroupError)?
+                .change_context(WeaverError)?
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {
@@ -586,13 +586,16 @@ where
         }
     }
 
-    async fn handle_update_keys(&mut self, reply: oneshot::Sender<Result<(), Report<GroupError>>>) {
+    async fn handle_update_keys(
+        &mut self,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
+    ) {
         let result = blocking(|| {
             self.learner
                 .group_mut()
                 .commit_builder()
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {
@@ -609,7 +612,7 @@ where
     fn handle_send_message(
         &mut self,
         data: &[u8],
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let seq = self.message_seq;
         self.message_seq += 1;
@@ -620,7 +623,7 @@ where
             Ok(bytes) => bytes,
             Err(e) => {
                 let _ = reply.send(Err(
-                    Report::new(GroupError).attach(format!("auth data encode: {e}"))
+                    Report::new(WeaverError).attach(format!("auth data encode: {e}"))
                 ));
                 return;
             }
@@ -631,7 +634,7 @@ where
                 .encrypt_application_message(data, authenticated_data)
         });
 
-        let mls_message = match result.change_context(GroupError) {
+        let mls_message = match result.change_context(WeaverError) {
             Ok(msg) => msg,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -639,7 +642,7 @@ where
             }
         };
 
-        let ciphertext = match mls_message.to_bytes().change_context(GroupError) {
+        let ciphertext = match mls_message.to_bytes().change_context(WeaverError) {
             Ok(bytes) => bytes,
             Err(e) => {
                 let _ = reply.send(Err(e));
@@ -678,7 +681,7 @@ where
                 .cascade_target(&self.compaction_config)
             && !self.compaction_state.has_active_claim(level)
         {
-            let _ = self.event_tx.send(GroupEvent::CompactionNeeded { level });
+            let _ = self.event_tx.send(WeaverEvent::CompactionNeeded { level });
         }
 
         let _ = reply.send(Ok(()));
@@ -687,18 +690,18 @@ where
     async fn handle_add_acceptor(
         &mut self,
         addr: EndpointAddr,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = blocking(|| {
             let proposal = SyncProposal::acceptor_add(addr.clone());
-            let custom = proposal.to_custom_proposal().change_context(GroupError)?;
+            let custom = proposal.to_custom_proposal().change_context(WeaverError)?;
 
             self.learner
                 .group_mut()
                 .commit_builder()
                 .custom_proposal(custom)
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {
@@ -715,18 +718,18 @@ where
     async fn handle_remove_acceptor(
         &mut self,
         acceptor_id: AcceptorId,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = blocking(|| {
             let proposal = SyncProposal::acceptor_remove(acceptor_id);
-            let custom = proposal.to_custom_proposal().change_context(GroupError)?;
+            let custom = proposal.to_custom_proposal().change_context(WeaverError)?;
 
             self.learner
                 .group_mut()
                 .commit_builder()
                 .custom_proposal(custom)
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {
@@ -743,7 +746,7 @@ where
     async fn start_proposal(
         &mut self,
         message: GroupMessage,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = self
             .proposer
@@ -782,7 +785,7 @@ where
         message: GroupMessage,
         member_addr: EndpointAddr,
         welcome: Vec<u8>,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = self
             .proposer
@@ -826,12 +829,12 @@ where
     async fn retry_proposal_simple(
         &mut self,
         message: GroupMessage,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
         retries: u32,
     ) {
         if retries >= MAX_PROPOSAL_RETRIES {
             let _ = reply.send(Err(
-                Report::new(GroupError).attach("max proposal retries exceeded")
+                Report::new(WeaverError).attach("max proposal retries exceeded")
             ));
             return;
         }
@@ -873,12 +876,12 @@ where
         message: GroupMessage,
         member_addr: EndpointAddr,
         welcome: Vec<u8>,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
         retries: u32,
     ) {
         if retries >= MAX_PROPOSAL_RETRIES {
             let _ = reply.send(Err(
-                Report::new(GroupError).attach("max proposal retries exceeded")
+                Report::new(WeaverError).attach("max proposal retries exceeded")
             ));
             return;
         }
@@ -951,7 +954,7 @@ where
                 reply
             }
         };
-        let _ = reply.send(Err(Report::new(GroupError).attach(message)));
+        let _ = reply.send(Err(Report::new(WeaverError).attach(message)));
     }
 
     async fn complete_proposal_success(&mut self, active: ActiveProposal) {
@@ -969,7 +972,7 @@ where
         &self,
         member_addr: EndpointAddr,
         welcome: Vec<u8>,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = self.send_welcome_inner(&member_addr, &welcome).await;
         let _ = reply.send(result);
@@ -979,7 +982,7 @@ where
         &self,
         member_addr: &EndpointAddr,
         welcome: &[u8],
-    ) -> Result<(), Report<GroupError>> {
+    ) -> Result<(), Report<WeaverError>> {
         use futures::SinkExt;
         use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 
@@ -989,23 +992,23 @@ where
             .endpoint
             .connect(member_addr.clone(), PAXOS_ALPN)
             .await
-            .change_context(GroupError)?;
+            .change_context(WeaverError)?;
 
-        let (send, _recv) = conn.open_bi().await.change_context(GroupError)?;
+        let (send, _recv) = conn.open_bi().await.change_context(WeaverError)?;
 
         let mut framed = FramedWrite::new(send, LengthDelimitedCodec::new());
 
         let handshake = Handshake::SendWelcome(welcome.to_vec());
-        let handshake_bytes = postcard::to_stdvec(&handshake).change_context(GroupError)?;
+        let handshake_bytes = postcard::to_stdvec(&handshake).change_context(WeaverError)?;
 
         framed
             .send(handshake_bytes.into())
             .await
-            .change_context(GroupError)?;
+            .change_context(WeaverError)?;
 
         let mut send = framed.into_inner();
-        send.finish().change_context(GroupError)?;
-        send.stopped().await.change_context(GroupError)?;
+        send.finish().change_context(WeaverError)?;
+        send.stopped().await.change_context(WeaverError)?;
 
         tracing::debug!("welcome sent successfully");
 
@@ -1015,7 +1018,7 @@ where
     fn send_proposal_request(
         &self,
         acceptor_id: AcceptorId,
-        request: filament_warp::AcceptorRequest<GroupLearner<C, CS>>,
+        request: filament_warp::AcceptorRequest<WeaverLearner<C, CS>>,
     ) {
         let wire_request = match request {
             filament_warp::AcceptorRequest::Prepare(p) => ProposalRequest::Prepare(p),
@@ -1049,7 +1052,7 @@ where
                     tracing::info!(?acceptor_id, "acceptor connected");
                     let _ = self
                         .event_tx
-                        .send(GroupEvent::AcceptorConnected { id: acceptor_id });
+                        .send(WeaverEvent::SpoolConnected { id: acceptor_id });
                 }
             }
             AcceptorInbound::Disconnected { acceptor_id } => {
@@ -1057,7 +1060,7 @@ where
                     tracing::warn!(?acceptor_id, "acceptor disconnected");
                     let _ = self
                         .event_tx
-                        .send(GroupEvent::AcceptorDisconnected { id: acceptor_id });
+                        .send(WeaverEvent::SpoolDisconnected { id: acceptor_id });
                 }
             }
         }
@@ -1068,7 +1071,7 @@ where
         acceptor_id: AcceptorId,
         response: ProposalResponse,
     ) {
-        let acceptor_msg: AcceptorMessage<GroupLearner<C, CS>> = AcceptorMessage {
+        let acceptor_msg: AcceptorMessage<WeaverLearner<C, CS>> = AcceptorMessage {
             promised: response.promised,
             accepted: response.accepted,
         };
@@ -1238,7 +1241,7 @@ where
             for event in events {
                 let _ = self.event_tx.send(event);
             }
-            let _ = self.event_tx.send(GroupEvent::EpochAdvanced {
+            let _ = self.event_tx.send(WeaverEvent::EpochAdvanced {
                 epoch: self.learner.mls_epoch().0,
             });
             self.last_epoch_advance = std::time::Instant::now();
@@ -1260,13 +1263,13 @@ where
         &mut self,
         effect: &CommitEffect,
         committer_index: Option<u32>,
-    ) -> (Vec<GroupEvent>, Vec<(AcceptorId, EndpointAddr)>) {
+    ) -> (Vec<WeaverEvent>, Vec<(AcceptorId, EndpointAddr)>) {
         let applied_proposals = match effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
                 &new_epoch.applied_proposals
             }
             CommitEffect::ReInit(_) => {
-                return (vec![GroupEvent::ReInitiated], vec![]);
+                return (vec![WeaverEvent::ReInitiated], vec![]);
             }
         };
 
@@ -1292,20 +1295,20 @@ where
                     if max_level > 0 {
                         let _ = self
                             .event_tx
-                            .send(GroupEvent::CompactionNeeded { level: max_level });
+                            .send(WeaverEvent::CompactionNeeded { level: max_level });
                     }
-                    GroupEvent::MemberAdded { index: 0 }
+                    WeaverEvent::MemberAdded { index: 0 }
                 }
-                MlsProposal::Remove(remove_proposal) => GroupEvent::MemberRemoved {
+                MlsProposal::Remove(remove_proposal) => WeaverEvent::MemberRemoved {
                     index: remove_proposal.to_remove(),
                 },
-                MlsProposal::ReInit(_) => GroupEvent::ReInitiated,
-                MlsProposal::ExternalInit(_) => GroupEvent::ExternalInit,
-                MlsProposal::GroupContextExtensions(_) => GroupEvent::ExtensionsUpdated,
+                MlsProposal::ReInit(_) => WeaverEvent::ReInitiated,
+                MlsProposal::ExternalInit(_) => WeaverEvent::ExternalInit,
+                MlsProposal::GroupContextExtensions(_) => WeaverEvent::ExtensionsUpdated,
                 MlsProposal::Custom(custom) => {
                     self.process_custom_proposal(custom, committer_fingerprint, &mut new_acceptors)
                 }
-                _ => GroupEvent::Unknown,
+                _ => WeaverEvent::Unknown,
             };
 
             events.push(event);
@@ -1319,9 +1322,9 @@ where
         custom: &mls_rs::group::proposal::CustomProposal,
         committer_fingerprint: Option<MemberFingerprint>,
         new_acceptors: &mut Vec<(AcceptorId, EndpointAddr)>,
-    ) -> GroupEvent {
+    ) -> WeaverEvent {
         let Ok(proposal) = SyncProposal::from_custom_proposal(custom) else {
-            return GroupEvent::Unknown;
+            return WeaverEvent::Unknown;
         };
 
         match proposal {
@@ -1329,7 +1332,7 @@ where
                 let id = AcceptorId::from_bytes(*addr.id.as_bytes());
                 self.learner.add_acceptor_addr(addr.clone());
                 new_acceptors.push((id, addr));
-                GroupEvent::AcceptorAdded { id }
+                WeaverEvent::SpoolAdded { id }
             }
             SyncProposal::AcceptorRemove(id) => {
                 self.learner.remove_acceptor_id(&id);
@@ -1338,7 +1341,7 @@ where
                 }
                 self.acceptor_txs.remove(&id);
                 self.connected_acceptors.remove(&id);
-                GroupEvent::AcceptorRemoved { id }
+                WeaverEvent::SpoolRemoved { id }
             }
             SyncProposal::CompactionClaim {
                 level,
@@ -1366,7 +1369,7 @@ where
                     .active_claims
                     .insert(level, active_claim);
 
-                GroupEvent::CompactionClaimed { level }
+                WeaverEvent::CompactionClaimed { level }
             }
             SyncProposal::CompactionComplete { level, watermark } => {
                 tracing::info!(
@@ -1391,7 +1394,7 @@ where
                 self.compaction_state.reset_counts_up_to(level);
                 self.compaction_state.record_entry(usize::from(level));
 
-                GroupEvent::CompactionCompleted { level }
+                WeaverEvent::CompactionCompleted { level }
             }
         }
     }
@@ -1506,14 +1509,15 @@ where
         &mut self,
         snapshot: Vec<u8>,
         level: u8,
-        reply: oneshot::Sender<Result<(), Report<GroupError>>>,
+        reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let watermark = self.state_vector.clone();
 
         if !self.encrypt_and_send_to_acceptors(&snapshot, level, &watermark) {
-            let _ = reply.send(Err(
-                Report::new(GroupError).attach("failed to encrypt/send compacted snapshot")
-            ));
+            let _ =
+                reply
+                    .send(Err(Report::new(WeaverError)
+                        .attach("failed to encrypt/send compacted snapshot")));
             return;
         }
 
@@ -1649,7 +1653,7 @@ where
                 .commit_builder()
                 .custom_proposal(custom_proposal)
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {
@@ -1699,7 +1703,7 @@ where
                 .commit_builder()
                 .custom_proposal(custom_proposal)
                 .build()
-                .change_context(GroupError)
+                .change_context(WeaverError)
         });
 
         match result {

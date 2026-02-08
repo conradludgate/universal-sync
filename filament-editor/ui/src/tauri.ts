@@ -22,11 +22,11 @@ export const getDocumentText = (groupId: string) =>
 export const addMember = (groupId: string, keyPackageB58: string) =>
   invoke<void>("add_member", { groupId, keyPackageB58 });
 
-export const addAcceptor = (groupId: string, addrB58: string) =>
-  invoke<void>("add_acceptor", { groupId, addrB58 });
+export const addSpool = (groupId: string, addrB58: string) =>
+  invoke<void>("add_spool", { groupId, addrB58 });
 
-export const listAcceptors = (groupId: string) =>
-  invoke<string[]>("list_acceptors", { groupId });
+export const listSpools = (groupId: string) =>
+  invoke<string[]>("list_spools", { groupId });
 
 export const listPeers = (groupId: string) =>
   invoke<PeerEntry[]>("list_peers", { groupId });
@@ -37,8 +37,8 @@ export const addPeer = (groupId: string, inputB58: string) =>
 export const removeMember = (groupId: string, memberIndex: number) =>
   invoke<void>("remove_member", { groupId, memberIndex });
 
-export const removeAcceptor = (groupId: string, acceptorIdB58: string) =>
-  invoke<void>("remove_acceptor", { groupId, acceptorIdB58 });
+export const removeSpool = (groupId: string, spoolIdB58: string) =>
+  invoke<void>("remove_spool", { groupId, spoolIdB58 });
 
 export const getGroupState = (groupId: string) =>
   invoke<GroupStatePayload>("get_group_state", { groupId });

@@ -1,4 +1,4 @@
-//! High-level client abstraction for creating and joining groups.
+//! High-level client abstraction for creating and joining weavers.
 
 use std::sync::Arc;
 
@@ -11,10 +11,12 @@ use mls_rs::{CipherSuiteProvider, Client, ExtensionList, MlsMessage};
 use tokio::sync::mpsc;
 
 use crate::connection::ConnectionManager;
-use crate::group::{Group, GroupError, JoinInfo};
+use crate::group::{JoinInfo, Weaver, WeaverError};
 
-/// Combines an MLS client, iroh endpoint, and connection manager.
-pub struct GroupClient<C, CS> {
+/// Entry point for creating and joining synchronized groups.
+///
+/// Wraps an MLS client, iroh endpoint, and connection manager.
+pub struct WeaverClient<C, CS> {
     client: Arc<Client<C>>,
     signer: SignatureSecretKey,
     cipher_suite: CS,
@@ -22,7 +24,7 @@ pub struct GroupClient<C, CS> {
     welcome_rx: mpsc::Receiver<Vec<u8>>,
 }
 
-impl<C, CS> GroupClient<C, CS>
+impl<C, CS> WeaverClient<C, CS>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
@@ -70,47 +72,47 @@ where
     ///
     /// # Errors
     /// Returns an error if key package generation fails.
-    pub fn generate_key_package(&self) -> Result<MlsMessage, Report<GroupError>> {
+    pub fn generate_key_package(&self) -> Result<MlsMessage, Report<WeaverError>> {
         let kp_ext = KeyPackageExt::new(
             self.connection_manager.endpoint().addr(),
             std::iter::empty::<String>(),
         );
         let mut kp_extensions = ExtensionList::default();
-        kp_extensions.set_from(kp_ext).change_context(GroupError)?;
+        kp_extensions.set_from(kp_ext).change_context(WeaverError)?;
 
         let ln_ext = LeafNodeExt::random();
         let mut ln_extensions = ExtensionList::default();
-        ln_extensions.set_from(ln_ext).change_context(GroupError)?;
+        ln_extensions.set_from(ln_ext).change_context(WeaverError)?;
 
         self.client
             .generate_key_package_message(kp_extensions, ln_extensions, None)
-            .change_context(GroupError)
+            .change_context(WeaverError)
     }
 
-    /// Create a new group with the default compaction config.
+    /// Create a new weaver with the default compaction config.
     ///
     /// # Errors
-    /// Returns an error if group creation fails.
-    pub async fn create_group(
+    /// Returns an error if creation fails.
+    pub async fn create(
         &self,
         acceptors: &[EndpointAddr],
         protocol_name: &str,
-    ) -> Result<Group<C, CS>, Report<GroupError>> {
-        self.create_group_with_config(acceptors, protocol_name, default_compaction_config())
+    ) -> Result<Weaver<C, CS>, Report<WeaverError>> {
+        self.create_with_config(acceptors, protocol_name, default_compaction_config())
             .await
     }
 
-    /// Create a group with a custom compaction config.
+    /// Create a weaver with a custom compaction config.
     ///
     /// # Errors
-    /// Returns an error if group creation fails.
-    pub async fn create_group_with_config(
+    /// Returns an error if creation fails.
+    pub async fn create_with_config(
         &self,
         acceptors: &[EndpointAddr],
         protocol_name: &str,
         compaction_config: CompactionConfig,
-    ) -> Result<Group<C, CS>, Report<GroupError>> {
-        Group::create(
+    ) -> Result<Weaver<C, CS>, Report<WeaverError>> {
+        Weaver::create(
             &self.client,
             self.signer.clone(),
             self.cipher_suite.clone(),
@@ -128,11 +130,8 @@ where
     ///
     /// # Errors
     /// Returns an error if joining fails.
-    pub async fn join_group(
-        &self,
-        welcome_bytes: &[u8],
-    ) -> Result<JoinInfo<C, CS>, Report<GroupError>> {
-        Group::join(
+    pub async fn join(&self, welcome_bytes: &[u8]) -> Result<JoinInfo<C, CS>, Report<WeaverError>> {
+        Weaver::join(
             &self.client,
             self.signer.clone(),
             self.cipher_suite.clone(),

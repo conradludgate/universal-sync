@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use filament_core::GroupId;
 use filament_testing::YrsCrdt;
-use filament_weave::{Group, GroupEvent};
+use filament_weave::{Weaver, WeaverEvent};
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::{CipherSuiteProvider, MlsMessage};
 use tokio::sync::{broadcast, mpsc};
@@ -24,11 +24,11 @@ where
     CS: CipherSuiteProvider + Send + Sync + 'static,
     E: EventEmitter,
 {
-    group: Group<C, CS>,
+    group: Weaver<C, CS>,
     crdt: YrsCrdt,
     group_id_b58: String,
     request_rx: mpsc::Receiver<DocRequest>,
-    event_rx: broadcast::Receiver<GroupEvent>,
+    event_rx: broadcast::Receiver<WeaverEvent>,
     emitter: E,
 }
 
@@ -39,7 +39,7 @@ where
     E: EventEmitter,
 {
     pub fn new(
-        group: Group<C, CS>,
+        group: Weaver<C, CS>,
         crdt: YrsCrdt,
         group_id: GroupId,
         request_rx: mpsc::Receiver<DocRequest>,
@@ -121,7 +121,7 @@ where
                 }
                 event = self.event_rx.recv() => {
                     match event {
-                        Ok(GroupEvent::CompactionNeeded { level }) => {
+                        Ok(WeaverEvent::CompactionNeeded { level }) => {
                             if let Err(e) = self.group.compact(&self.crdt, level).await {
                                 tracing::warn!(?e, level, "compaction failed");
                             }
@@ -177,12 +177,12 @@ where
                 let result = self.add_member(&key_package_b58).await;
                 let _ = reply.send(result);
             }
-            DocRequest::AddAcceptor { addr_b58, reply } => {
-                let result = self.add_acceptor(&addr_b58).await;
+            DocRequest::AddSpool { addr_b58, reply } => {
+                let result = self.add_spool(&addr_b58).await;
                 let _ = reply.send(result);
             }
-            DocRequest::ListAcceptors { reply } => {
-                let result = self.list_acceptors().await;
+            DocRequest::ListSpools { reply } => {
+                let result = self.list_spools().await;
                 let _ = reply.send(result);
             }
             DocRequest::ListPeers { reply } => {
@@ -200,11 +200,11 @@ where
                 let result = self.remove_member(member_index).await;
                 let _ = reply.send(result);
             }
-            DocRequest::RemoveAcceptor {
-                acceptor_id_b58,
+            DocRequest::RemoveSpool {
+                spool_id_b58,
                 reply,
             } => {
-                let result = self.remove_acceptor(&acceptor_id_b58).await;
+                let result = self.remove_spool(&spool_id_b58).await;
                 let _ = reply.send(result);
             }
             DocRequest::GetGroupState { reply } => {
@@ -284,26 +284,26 @@ where
             .map_err(|e| format!("failed to add member: {e:?}"))
     }
 
-    async fn add_acceptor(&mut self, addr_b58: &str) -> Result<(), String> {
+    async fn add_spool(&mut self, addr_b58: &str) -> Result<(), String> {
         let bytes = bs58::decode(addr_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
         let addr: iroh::EndpointAddr =
             postcard::from_bytes(&bytes).map_err(|e| format!("invalid address: {e}"))?;
         self.group
-            .add_acceptor(addr)
+            .add_spool(addr)
             .await
-            .map_err(|e| format!("failed to add acceptor: {e:?}"))
+            .map_err(|e| format!("failed to add spool: {e:?}"))
     }
 
-    async fn list_acceptors(&mut self) -> Result<Vec<String>, String> {
+    async fn list_spools(&mut self) -> Result<Vec<String>, String> {
         let ctx = self
             .group
             .context()
             .await
             .map_err(|e| format!("failed to get context: {e:?}"))?;
         Ok(ctx
-            .acceptors
+            .spools
             .iter()
             .map(|a| bs58::encode(a.as_bytes()).into_string())
             .collect())
@@ -324,11 +324,11 @@ where
                 index: m.index,
                 identity,
                 is_self: m.is_self,
-                client_id: m.client_id,
+                client_id: m.client_id.0,
             });
         }
-        for a in &ctx.acceptors {
-            peers.push(PeerEntry::Acceptor {
+        for a in &ctx.spools {
+            peers.push(PeerEntry::Spool {
                 id: bs58::encode(a.as_bytes()).into_string(),
             });
         }
@@ -347,7 +347,7 @@ where
         }
 
         if postcard::from_bytes::<iroh::EndpointAddr>(&bytes).is_ok() {
-            return self.add_acceptor(input_b58).await;
+            return self.add_spool(input_b58).await;
         }
 
         Err("input is neither a valid KeyPackage nor an EndpointAddr".to_string())
@@ -360,19 +360,19 @@ where
             .map_err(|e| format!("failed to remove member: {e:?}"))
     }
 
-    async fn remove_acceptor(&mut self, acceptor_id_b58: &str) -> Result<(), String> {
-        let bytes = bs58::decode(acceptor_id_b58)
+    async fn remove_spool(&mut self, spool_id_b58: &str) -> Result<(), String> {
+        let bytes = bs58::decode(spool_id_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
-        let acceptor_id = filament_core::AcceptorId::from_bytes(
+        let spool_id = filament_core::AcceptorId::from_bytes(
             bytes
                 .try_into()
-                .map_err(|_| "acceptor ID must be 32 bytes".to_string())?,
+                .map_err(|_| "spool ID must be 32 bytes".to_string())?,
         );
         self.group
-            .remove_acceptor(acceptor_id)
+            .remove_spool(spool_id)
             .await
-            .map_err(|e| format!("failed to remove acceptor: {e:?}"))
+            .map_err(|e| format!("failed to remove spool: {e:?}"))
     }
 
     async fn get_group_state(&mut self) -> Result<GroupStatePayload, String> {
@@ -386,8 +386,8 @@ where
             epoch: ctx.epoch.0,
             transcript_hash: hex::encode(&ctx.confirmed_transcript_hash),
             member_count: ctx.member_count,
-            acceptor_count: ctx.acceptors.len(),
-            connected_acceptor_count: ctx.connected_acceptors.len(),
+            spool_count: ctx.spools.len(),
+            connected_spool_count: ctx.connected_spools.len(),
         })
     }
 

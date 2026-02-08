@@ -6,13 +6,11 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use filament_core::{AcceptorId, GroupId};
+use filament_weave::{Weaver, WeaverClient};
 use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::{CipherSuiteProvider, MlsMessage};
 use tracing::info;
-
-use crate::GroupClient;
-use crate::group::Group;
 
 /// REPL context holding all state
 pub struct ReplContext<C, CS>
@@ -20,10 +18,8 @@ where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
-    /// Group client for creating and joining groups
-    pub client: GroupClient<C, CS>,
-    /// Currently loaded groups
-    pub groups: HashMap<GroupId, Group<C, CS>>,
+    pub client: WeaverClient<C, CS>,
+    pub groups: HashMap<GroupId, Weaver<C, CS>>,
 }
 
 impl<C, CS> ReplContext<C, CS>
@@ -33,7 +29,7 @@ where
 {
     /// Create a new REPL context with the given client.
     #[must_use]
-    pub fn new(client: GroupClient<C, CS>) -> Self {
+    pub fn new(client: WeaverClient<C, CS>) -> Self {
         Self {
             client,
             groups: HashMap::new(),
@@ -51,7 +47,7 @@ where
 
         // Process all pending welcomes
         while let Some(welcome_bytes) = self.client.try_recv_welcome() {
-            match self.client.join_group(&welcome_bytes).await {
+            match self.client.join(&welcome_bytes).await {
                 Ok(join_info) => {
                     let group_id = join_info.group.group_id();
                     info!(?group_id, protocol_name = %join_info.protocol_name, "Automatically joined group from welcome");
@@ -112,11 +108,11 @@ where
                 }
                 self.cmd_join_group(parts[1]).await
             }
-            "add_acceptor" => {
+            "add_spool" => {
                 if parts.len() < 3 {
-                    return Err("Usage: add_acceptor <group_id_hex> <address_hex>".to_string());
+                    return Err("Usage: add_spool <group_id_hex> <address_hex>".to_string());
                 }
-                self.cmd_add_acceptor(parts[1], parts[2]).await
+                self.cmd_add_spool(parts[1], parts[2]).await
             }
             "add_member" => {
                 if parts.len() < 3 {
@@ -130,13 +126,11 @@ where
                 }
                 self.cmd_update_keys(parts[1]).await
             }
-            "remove_acceptor" => {
+            "remove_spool" => {
                 if parts.len() < 3 {
-                    return Err(
-                        "Usage: remove_acceptor <group_id_hex> <public_key_hex>".to_string()
-                    );
+                    return Err("Usage: remove_spool <group_id_hex> <public_key_hex>".to_string());
                 }
-                self.cmd_remove_acceptor(parts[1], parts[2]).await
+                self.cmd_remove_spool(parts[1], parts[2]).await
             }
             "remove_member" => {
                 if parts.len() < 3 {
@@ -183,10 +177,10 @@ where
   key_package                              - Generate a new key package (prints base58)
   create_group                             - Create a new group (prints group ID base58)
   join_group <welcome_base58>              - Join a group from a Welcome message
-  add_acceptor <group_id> <addr_base58>    - Add an acceptor to a group
+  add_spool <group_id> <addr_base58>       - Add a spool server to a group
   add_member <group_id> <key_package>      - Add a member to a group (sends welcome directly)
   update_keys <group_id>                   - Update keys in a group
-  remove_acceptor <group_id> <pubkey>      - Remove an acceptor from a group
+  remove_spool <group_id> <pubkey>         - Remove a spool server from a group
   remove_member <group_id> <member_index>  - Remove a member from a group
   group_context <group_id>                 - Display group context
   list_groups                              - List all loaded groups
@@ -222,7 +216,7 @@ Note: Welcome messages are received automatically in the background.
     async fn cmd_create_group(&mut self) -> Result<String, String> {
         let group = self
             .client
-            .create_group(&[], "none")
+            .create(&[], "none")
             .await
             .map_err(|e| format!("Failed to create group: {e:?}"))?;
 
@@ -241,7 +235,7 @@ Note: Welcome messages are received automatically in the background.
 
         let join_info = self
             .client
-            .join_group(&welcome_bytes)
+            .join(&welcome_bytes)
             .await
             .map_err(|e| format!("Failed to join group: {e:?}"))?;
 
@@ -255,7 +249,7 @@ Note: Welcome messages are received automatically in the background.
         Ok(output)
     }
 
-    async fn cmd_add_acceptor(
+    async fn cmd_add_spool(
         &mut self,
         group_id_hex: &str,
         address_hex: &str,
@@ -263,7 +257,7 @@ Note: Welcome messages are received automatically in the background.
         let group_id = parse_group_id(group_id_hex)?;
         let addr = parse_endpoint_addr(address_hex)?;
 
-        let acceptor_id = AcceptorId::from_bytes(*addr.id.as_bytes());
+        let spool_id = AcceptorId::from_bytes(*addr.id.as_bytes());
 
         let group = self
             .groups
@@ -271,15 +265,15 @@ Note: Welcome messages are received automatically in the background.
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
         group
-            .add_acceptor(addr)
+            .add_spool(addr)
             .await
-            .map_err(|e| format!("Failed to add acceptor: {e:?}"))?;
+            .map_err(|e| format!("Failed to add spool: {e:?}"))?;
 
-        info!(?acceptor_id, "Added acceptor");
+        info!(?spool_id, "Added spool");
 
         Ok(format!(
-            "Added acceptor: {}",
-            bs58::encode(acceptor_id.as_bytes()).into_string()
+            "Added spool: {}",
+            bs58::encode(spool_id.as_bytes()).into_string()
         ))
     }
 
@@ -325,13 +319,13 @@ Note: Welcome messages are received automatically in the background.
         Ok(format!("Keys updated. New epoch: {}", context.epoch.0))
     }
 
-    async fn cmd_remove_acceptor(
+    async fn cmd_remove_spool(
         &mut self,
         group_id_hex: &str,
         public_key_hex: &str,
     ) -> Result<String, String> {
         let group_id = parse_group_id(group_id_hex)?;
-        let acceptor_id = parse_acceptor_id(public_key_hex)?;
+        let spool_id = parse_acceptor_id(public_key_hex)?;
 
         let group = self
             .groups
@@ -339,11 +333,11 @@ Note: Welcome messages are received automatically in the background.
             .ok_or_else(|| format!("Group not loaded: {group_id_hex}"))?;
 
         group
-            .remove_acceptor(acceptor_id)
+            .remove_spool(spool_id)
             .await
-            .map_err(|e| format!("Failed to remove acceptor: {e:?}"))?;
+            .map_err(|e| format!("Failed to remove spool: {e:?}"))?;
 
-        Ok(format!("Removed acceptor: {public_key_hex}"))
+        Ok(format!("Removed spool: {public_key_hex}"))
     }
 
     async fn cmd_remove_member(
@@ -381,7 +375,7 @@ Note: Welcome messages are received automatically in the background.
         Ok(Self::print_group_context(&context))
     }
 
-    fn print_group_context(context: &crate::GroupContext) -> String {
+    fn print_group_context(context: &filament_weave::WeaverContext) -> String {
         let mut output = String::new();
         let _ = writeln!(
             output,
@@ -396,15 +390,15 @@ Note: Welcome messages are received automatically in the background.
         );
         let _ = writeln!(output, "Members: {}", context.member_count);
 
-        if context.acceptors.is_empty() {
-            output.push_str("Acceptors: none\n");
+        if context.spools.is_empty() {
+            output.push_str("Spools: none\n");
         } else {
-            output.push_str("Acceptors:\n");
-            for acceptor_id in &context.acceptors {
+            output.push_str("Spools:\n");
+            for spool_id in &context.spools {
                 let _ = writeln!(
                     output,
                     "  {}",
-                    bs58::encode(acceptor_id.as_bytes()).into_string()
+                    bs58::encode(spool_id.as_bytes()).into_string()
                 );
             }
         }

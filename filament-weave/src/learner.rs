@@ -1,4 +1,4 @@
-//! `GroupLearner` - implements paxos Learner for MLS group members (devices)
+//! `WeaverLearner` - implements paxos Learner for MLS group members (devices)
 
 use std::collections::BTreeMap;
 
@@ -25,7 +25,7 @@ pub(crate) fn fingerprint_of_member(group_id: &GroupId, member: &Member) -> Memb
     MemberFingerprint::from_key(group_id, &member.signing_identity.signature_key, binding_id)
 }
 
-/// Error marker for `GroupLearner` operations.
+/// Error marker for `WeaverLearner` operations.
 ///
 /// Use `error_stack::Report<LearnerError>` with context attachments for detailed errors.
 #[derive(Debug, Default)]
@@ -46,7 +46,7 @@ impl std::error::Error for LearnerError {}
 ///
 /// The list of acceptors is tracked separately and updated when
 /// commits containing [`AcceptorAdd`] or [`AcceptorRemove`] extensions are applied.
-pub struct GroupLearner<C, CS>
+pub struct WeaverLearner<C, CS>
 where
     C: MlsConfig + Clone,
     CS: CipherSuiteProvider,
@@ -64,7 +64,7 @@ where
     acceptors: BTreeMap<AcceptorId, EndpointAddr>,
 }
 
-impl<C, CS> GroupLearner<C, CS>
+impl<C, CS> WeaverLearner<C, CS>
 where
     C: MlsConfig + Clone,
     CS: CipherSuiteProvider,
@@ -306,8 +306,8 @@ where
     }
 }
 
-// Implement Learner trait for GroupLearner
-impl<C, CS> filament_warp::Learner for GroupLearner<C, CS>
+// Implement Learner trait for WeaverLearner
+impl<C, CS> filament_warp::Learner for WeaverLearner<C, CS>
 where
     C: MlsConfig + Clone + Send + Sync + 'static,
     CS: CipherSuiteProvider + Send + Sync + 'static,

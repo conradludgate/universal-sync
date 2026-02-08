@@ -1,6 +1,6 @@
 //! Coordinator actor.
 //!
-//! Owns the [`GroupClient`] and routes requests to per-document actors.
+//! Owns the [`WeaverClient`] and routes requests to per-document actors.
 //! Spawns a [`DocumentActor`](crate::document::DocumentActor) when a
 //! group is created or joined.
 
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use filament_core::GroupId;
 use filament_testing::YrsCrdt;
-use filament_weave::{Group, GroupClient};
+use filament_weave::{Weaver, WeaverClient};
 use mls_rs::CipherSuiteProvider;
 use mls_rs::client_builder::MlsConfig;
 use tokio::sync::{mpsc, oneshot};
@@ -24,8 +24,8 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
     E: EventEmitter,
 {
-    group_client: GroupClient<C, CS>,
-    /// Split out of GroupClient for non-blocking select
+    group_client: WeaverClient<C, CS>,
+    /// Split out of WeaverClient for non-blocking select
     welcome_rx: mpsc::Receiver<Vec<u8>>,
     doc_actors: HashMap<GroupId, mpsc::Sender<DocRequest>>,
     request_rx: mpsc::Receiver<CoordinatorRequest>,
@@ -40,7 +40,7 @@ where
     E: EventEmitter,
 {
     pub fn new(
-        mut group_client: GroupClient<C, CS>,
+        mut group_client: WeaverClient<C, CS>,
         request_rx: mpsc::Receiver<CoordinatorRequest>,
         emitter: E,
     ) -> Self {
@@ -98,11 +98,11 @@ where
     async fn create_document(&mut self) -> Result<DocumentInfo, String> {
         let group = self
             .group_client
-            .create_group(&[], "yrs")
+            .create(&[], "yrs")
             .await
             .map_err(|e| format!("failed to create group: {e:?}"))?;
 
-        let crdt = YrsCrdt::with_client_id(group.my_client_id());
+        let crdt = YrsCrdt::with_client_id(group.client_id().0);
         self.register_document(group, crdt)
     }
 
@@ -143,11 +143,11 @@ where
     async fn join_with_welcome(&mut self, welcome_bytes: &[u8]) -> Result<DocumentInfo, String> {
         let join_info = self
             .group_client
-            .join_group(welcome_bytes)
+            .join(welcome_bytes)
             .await
             .map_err(|e| format!("failed to join group: {e:?}"))?;
 
-        let client_id = join_info.group.my_client_id();
+        let client_id = join_info.group.client_id().0;
         let crdt = if let Some(snapshot) = join_info.snapshot {
             YrsCrdt::from_snapshot(&snapshot, client_id)
                 .map_err(|e| format!("failed to create CRDT from snapshot: {e:?}"))?
@@ -160,7 +160,7 @@ where
 
     fn register_document(
         &mut self,
-        group: Group<C, CS>,
+        group: Weaver<C, CS>,
         crdt: YrsCrdt,
     ) -> Result<DocumentInfo, String> {
         let group_id = group.group_id();
