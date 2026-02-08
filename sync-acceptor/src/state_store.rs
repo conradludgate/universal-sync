@@ -72,9 +72,14 @@ impl FjallStateStore {
     fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
         let db = Database::builder(path).open()?;
 
-        let accepted = db.keyspace("accepted", KeyspaceCreateOptions::default)?;
-        let messages = db.keyspace("messages", KeyspaceCreateOptions::default)?;
-        let snapshots = db.keyspace("snapshots", KeyspaceCreateOptions::default)?;
+        let opts = || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+        };
+
+        let accepted = db.keyspace("accepted", &opts)?;
+        let messages = db.keyspace("messages", &opts)?;
+        let snapshots = db.keyspace("snapshots", &opts)?;
 
         Ok(Self {
             db,
