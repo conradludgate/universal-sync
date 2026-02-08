@@ -106,14 +106,16 @@ permanently don't.
 
 ### Acceptor: sender roster check
 
-In the `MessageRequest::Send` handler (`sync-acceptor/src/server.rs`),
-before calling `registry.store_message()`, look up `id.sender` in the
-latest epoch roster via `get_epoch_roster_at_or_before_sync`. Reject if the
-fingerprint is not found.
+**Implemented** via `GroupAcceptor::is_fingerprint_in_roster()`. When a
+message stream is opened, `handle_message_stream` loads the `GroupAcceptor`
+(which contains the `ExternalGroup` with the current roster). Each
+incoming `MessageRequest::Send` is checked against the roster by computing
+`MemberFingerprint` for each roster member and comparing.
 
-`EpochRoster` stores `(MemberId, Vec<u8>)` (leaf index + signing key).
-To check by `MemberFingerprint`, compute fingerprints from the stored
-signing keys on lookup. Acceptable for expected group sizes.
+The check uses the roster at connection time — it does not update as new
+commits are learned during the stream's lifetime. This is a best-effort
+filter (see "Security" section above). See
+[ACCEPTOR-STORAGE.md](ACCEPTOR-STORAGE.md) for storage details.
 
 ### Device: log level change
 

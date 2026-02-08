@@ -93,24 +93,22 @@ where
             .map_or_else(Vec::new, |info| info.acceptors)
     }
 
-    fn create_acceptor_from_bytes(
+    fn create_acceptor_from_snapshot(
         &self,
-        group_info_bytes: &[u8],
+        snapshot_bytes: &[u8],
     ) -> Result<GroupAcceptor<C, CS>, Report<RegistryError>> {
-        let mls_message = MlsMessage::from_bytes(group_info_bytes)
+        let snapshot = mls_rs::external_client::ExternalSnapshot::from_bytes(snapshot_bytes)
             .change_context(RegistryError)
-            .attach("failed to parse MLS message")?;
-
-        let acceptors = mls_message
-            .as_group_info()
-            .map(|gi| Self::extract_acceptors_from_extensions(gi.extensions()))
-            .unwrap_or_default();
+            .attach("failed to parse ExternalSnapshot")?;
 
         let external_group = self
             .external_client
-            .observe_group(mls_message, None, None)
+            .load_group(snapshot)
             .change_context(RegistryError)
-            .attach("failed to observe group")?;
+            .attach("failed to load group from snapshot")?;
+
+        let acceptors =
+            Self::extract_acceptors_from_extensions(&external_group.group_context().extensions);
 
         Ok(GroupAcceptor::new(
             external_group,
@@ -127,15 +125,13 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
     pub fn get_group(&self, group_id: &GroupId) -> Option<(GroupAcceptor<C, CS>, GroupStateStore)> {
-        let group_info_bytes = self.state_store.get_group_info(group_id)?;
-        let acceptor = self.create_acceptor_from_bytes(&group_info_bytes).ok()?;
+        let (snapshot_epoch, snapshot_bytes) = self.state_store.get_latest_snapshot(group_id)?;
+        let acceptor = self.create_acceptor_from_snapshot(&snapshot_bytes).ok()?;
         let state = self.state_store.for_group(*group_id);
 
         let mut acceptor = acceptor.with_state_store(state.clone());
-        acceptor.store_initial_epoch_roster();
 
-        // Replay accepted messages to catch up from epoch 0
-        let historical = state.get_accepted_from(acceptor.current_round());
+        let historical = state.get_accepted_from(snapshot_epoch);
 
         for (proposal, message) in historical {
             tracing::debug!(epoch = ?proposal.epoch, "replaying commit for acceptor");
@@ -190,15 +186,10 @@ where
             acceptors,
         );
 
-        self.state_store
-            .store_group(&group_id, group_info_bytes)
-            .change_context(RegistryError)
-            .attach("failed to persist group")?;
-
         let state = self.state_store.for_group(group_id);
 
         let acceptor = acceptor.with_state_store(state.clone());
-        acceptor.store_initial_epoch_roster();
+        acceptor.store_initial_snapshot();
 
         self.ensure_epoch_watcher_and_learning(
             group_id,
@@ -244,16 +235,6 @@ where
         universal_sync_core::EncryptedAppMessage,
     )> {
         self.state_store.subscribe_messages(group_id)
-    }
-
-    pub fn check_sender_in_roster(
-        &self,
-        group_id: &GroupId,
-        sender: universal_sync_core::MemberFingerprint,
-    ) -> bool {
-        self.state_store
-            .for_group(*group_id)
-            .check_sender_in_roster(sender)
     }
 
     pub fn get_epoch_watcher(&self, group_id: &GroupId) -> Option<EpochWatcher> {

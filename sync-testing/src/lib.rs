@@ -161,6 +161,8 @@ pub async fn spawn_acceptor() -> (tokio::task::JoinHandle<()>, EndpointAddr, Tem
     let external_client = ExternalClient::builder()
         .crypto_provider(crypto)
         .identity_provider(test_identity_provider())
+        .extension_type(SYNC_EXTENSION_TYPE)
+        .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
         .build();
 
     let registry =

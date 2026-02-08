@@ -8,7 +8,9 @@ use std::time::Duration;
 use mls_rs::external_client::ExternalClient;
 use tempfile::TempDir;
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
-use universal_sync_core::{AcceptorId, CompactionLevel, GroupId, NoCrdt};
+use universal_sync_core::{
+    AcceptorId, CompactionLevel, GroupId, NoCrdt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
+};
 use universal_sync_proposer::GroupEvent;
 use universal_sync_testing::{
     YrsCrdt, init_tracing, spawn_acceptor, test_cipher_suite, test_crypto_provider, test_endpoint,
@@ -16,16 +18,15 @@ use universal_sync_testing::{
 };
 
 #[tokio::test]
-async fn test_state_store_group_persistence() {
+async fn test_state_store_snapshot_persistence() {
     init_tracing();
 
     let temp_dir = TempDir::new().unwrap();
 
-    // Create and store some groups
     let group_id_1 = GroupId::new([1u8; 32]);
     let group_id_2 = GroupId::new([2u8; 32]);
-    let group_info_1 = b"test group info 1".to_vec();
-    let group_info_2 = b"test group info 2".to_vec();
+    let snap_1 = b"snapshot data 1".to_vec();
+    let snap_2 = b"snapshot data 2".to_vec();
 
     {
         let store = SharedFjallStateStore::open(temp_dir.path())
@@ -33,13 +34,12 @@ async fn test_state_store_group_persistence() {
             .expect("open store");
 
         store
-            .store_group(&group_id_1, &group_info_1)
+            .store_snapshot(&group_id_1, universal_sync_core::Epoch(0), &snap_1)
             .expect("store 1");
         store
-            .store_group(&group_id_2, &group_info_2)
+            .store_snapshot(&group_id_2, universal_sync_core::Epoch(0), &snap_2)
             .expect("store 2");
 
-        // Verify they're stored
         let groups = store.list_groups();
         assert_eq!(groups.len(), 2);
     }
@@ -53,11 +53,13 @@ async fn test_state_store_group_persistence() {
         let groups = store.list_groups();
         assert_eq!(groups.len(), 2);
 
-        let info_1 = store.get_group_info(&group_id_1);
-        assert_eq!(info_1, Some(group_info_1));
+        let (epoch, bytes) = store.get_latest_snapshot(&group_id_1).unwrap();
+        assert_eq!(epoch, universal_sync_core::Epoch(0));
+        assert_eq!(bytes, snap_1);
 
-        let info_2 = store.get_group_info(&group_id_2);
-        assert_eq!(info_2, Some(group_info_2));
+        let (epoch, bytes) = store.get_latest_snapshot(&group_id_2).unwrap();
+        assert_eq!(epoch, universal_sync_core::Epoch(0));
+        assert_eq!(bytes, snap_2);
     }
 }
 
@@ -96,6 +98,8 @@ async fn test_alice_adds_bob_with_group_api() {
     let external_client = ExternalClient::builder()
         .crypto_provider(crypto.clone())
         .identity_provider(test_identity_provider())
+        .extension_type(SYNC_EXTENSION_TYPE)
+        .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
         .build();
 
     let state_store = SharedFjallStateStore::open(acceptor_dir.path())
@@ -240,6 +244,8 @@ async fn test_acceptor_add_remove() {
         let external_client = ExternalClient::builder()
             .crypto_provider(crypto.clone())
             .identity_provider(test_identity_provider())
+            .extension_type(SYNC_EXTENSION_TYPE)
+            .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
             .build();
 
         let registry = AcceptorRegistry::new(
@@ -271,6 +277,8 @@ async fn test_acceptor_add_remove() {
         let external_client = ExternalClient::builder()
             .crypto_provider(crypto.clone())
             .identity_provider(test_identity_provider())
+            .extension_type(SYNC_EXTENSION_TYPE)
+            .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
             .build();
 
         let registry = AcceptorRegistry::new(

@@ -50,6 +50,10 @@ where
         &self.state
     }
 
+    pub(crate) fn acceptor(&self) -> &A {
+        &self.acceptor
+    }
+
     /// Used by the runner to apply learned values.
     pub(crate) fn acceptor_mut(&mut self) -> &mut A {
         &mut self.acceptor

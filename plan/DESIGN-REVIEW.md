@@ -91,9 +91,15 @@ COMPACTION.md Phase 5 migration note is stale — this is done.
 
 ### New Acceptor Bootstrapping
 
-New acceptors receive `GroupInfo`, then replay all historical commits from
-epoch 0. They know the current slot from MLS context and validate proposals
-against epoch rosters. No gap here.
+New acceptors receive `GroupInfo` and store an `ExternalSnapshot` at their
+join epoch. On reconnect (`get_group()`), they load the nearest
+`ExternalSnapshot` and replay only subsequent accepted commits — not from
+epoch 0. See [ACCEPTOR-STORAGE.md](ACCEPTOR-STORAGE.md).
+
+Proposal validation uses the in-memory `ExternalGroup` roster (current or
+future epochs). Historical epoch roster lookup is not yet implemented
+(returns `None` for past epochs with a TODO for reconstruction from
+snapshots).
 
 ### Quorum
 

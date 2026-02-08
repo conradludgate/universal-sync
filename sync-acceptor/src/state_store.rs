@@ -9,10 +9,11 @@ use std::task::{Context, Poll};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use universal_sync_core::{
-    EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint, MessageId,
-    StateVector,
+    Attempt, EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint,
+    MemberId, MessageId, StateVector,
 };
 use universal_sync_paxos::acceptor::RoundState;
 use universal_sync_paxos::core::decision;
@@ -38,52 +39,14 @@ fn storage_versioned_decode(bytes: &[u8]) -> (u8, &[u8]) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RosterMember {
-    pub(crate) signing_key: Vec<u8>,
-    pub(crate) binding_id: u64,
+struct SlimAccepted {
+    member_id: MemberId,
+    attempt: Attempt,
+    signature: Vec<u8>,
+    message: GroupMessage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct EpochRoster {
-    pub(crate) epoch: Epoch,
-    pub(crate) members: Vec<(universal_sync_core::MemberId, RosterMember)>,
-}
-
-impl EpochRoster {
-    pub(crate) fn new(
-        epoch: Epoch,
-        members: impl IntoIterator<Item = (universal_sync_core::MemberId, RosterMember)>,
-    ) -> Self {
-        Self {
-            epoch,
-            members: members.into_iter().collect(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn get_member_key(&self, member_id: universal_sync_core::MemberId) -> Option<&[u8]> {
-        self.members
-            .iter()
-            .find(|(id, _)| *id == member_id)
-            .map(|(_, m)| m.signing_key.as_slice())
-    }
-
-    pub(crate) fn has_fingerprint(&self, group_id: &GroupId, sender: MemberFingerprint) -> bool {
-        self.members.iter().any(|(_, m)| {
-            MemberFingerprint::from_key(group_id, &m.signing_key, m.binding_id) == sender
-        })
-    }
-
-    #[must_use]
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).expect("serialization should not fail")
-    }
-
-    #[must_use]
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        postcard::from_bytes(bytes).ok()
-    }
-}
+const PROMISED_SENTINEL_EPOCH: u64 = u64::MAX;
 
 type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
 type MessageBroadcasts =
@@ -91,11 +54,9 @@ type MessageBroadcasts =
 
 pub(crate) struct FjallStateStore {
     db: Database,
-    promised: Keyspace,
     accepted: Keyspace,
-    groups: Keyspace,
     messages: Keyspace,
-    epoch_rosters: Keyspace,
+    snapshots: Keyspace,
     broadcasts: GroupBroadcasts,
     message_broadcasts: MessageBroadcasts,
 }
@@ -111,19 +72,15 @@ impl FjallStateStore {
     fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
         let db = Database::builder(path).open()?;
 
-        let promised = db.keyspace("promised", KeyspaceCreateOptions::default)?;
         let accepted = db.keyspace("accepted", KeyspaceCreateOptions::default)?;
-        let groups = db.keyspace("groups", KeyspaceCreateOptions::default)?;
         let messages = db.keyspace("messages", KeyspaceCreateOptions::default)?;
-        let epoch_rosters = db.keyspace("epoch_rosters", KeyspaceCreateOptions::default)?;
+        let snapshots = db.keyspace("snapshots", KeyspaceCreateOptions::default)?;
 
         Ok(Self {
             db,
-            promised,
             accepted,
-            groups,
             messages,
-            epoch_rosters,
+            snapshots,
             broadcasts: RwLock::new(HashMap::new()),
             message_broadcasts: RwLock::new(HashMap::new()),
         })
@@ -154,16 +111,6 @@ impl FjallStateStore {
     }
 
     fn deserialize_proposal(bytes: &[u8]) -> Option<GroupProposal> {
-        let (_, payload) = storage_versioned_decode(bytes);
-        postcard::from_bytes(payload).ok()
-    }
-
-    fn serialize_message(message: &GroupMessage) -> Vec<u8> {
-        let data = postcard::to_allocvec(message).expect("serialization should not fail");
-        storage_versioned_encode(STORAGE_VERSION, &data)
-    }
-
-    fn deserialize_message(bytes: &[u8]) -> Option<GroupMessage> {
         let (_, payload) = storage_versioned_decode(bytes);
         postcard::from_bytes(payload).ok()
     }
@@ -302,12 +249,13 @@ impl FjallStateStore {
     }
 
     fn get_promised_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<GroupProposal> {
-        let key = Self::build_key(group_id, epoch);
-        self.promised
+        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
+        self.accepted
             .get(key)
             .ok()
             .flatten()
             .and_then(|bytes| Self::deserialize_proposal(&bytes))
+            .filter(|p| p.epoch == epoch)
     }
 
     fn get_accepted_sync(
@@ -316,18 +264,26 @@ impl FjallStateStore {
         epoch: Epoch,
     ) -> Option<(GroupProposal, GroupMessage)> {
         let key = Self::build_key(group_id, epoch);
-        self.accepted.get(key).ok().flatten().and_then(|bytes| {
-            if bytes.len() < 4 {
-                return None;
-            }
-            let proposal_len = u32::from_be_bytes(bytes[0..4].try_into().ok()?) as usize;
-            if bytes.len() < 4 + proposal_len {
-                return None;
-            }
-            let proposal = Self::deserialize_proposal(&bytes[4..4 + proposal_len])?;
-            let message = Self::deserialize_message(&bytes[4 + proposal_len..])?;
-            Some((proposal, message))
-        })
+        let bytes = self.accepted.get(key).ok()??;
+        Self::decode_slim_accepted(&bytes, epoch)
+    }
+
+    fn decode_slim_accepted(bytes: &[u8], epoch: Epoch) -> Option<(GroupProposal, GroupMessage)> {
+        let (_, payload) = storage_versioned_decode(bytes);
+        let slim: SlimAccepted = postcard::from_bytes(payload).ok()?;
+
+        let message_bytes =
+            postcard::to_allocvec(&slim.message).expect("serialization should not fail");
+        let message_hash: [u8; 32] = Sha256::digest(&message_bytes).into();
+
+        let proposal = GroupProposal {
+            member_id: slim.member_id,
+            epoch,
+            attempt: slim.attempt,
+            message_hash,
+            signature: slim.signature,
+        };
+        Some((proposal, slim.message))
     }
 
     fn set_promised_sync(
@@ -335,14 +291,13 @@ impl FjallStateStore {
         group_id: &GroupId,
         proposal: &GroupProposal,
     ) -> Result<(), fjall::Error> {
-        let key = Self::build_key(group_id, proposal.epoch);
+        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
         let value = Self::serialize_proposal(proposal);
-        self.promised.insert(key, &value)?;
+        self.accepted.insert(key, &value)?;
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn set_accepted_sync(
         &self,
         group_id: &GroupId,
@@ -351,13 +306,14 @@ impl FjallStateStore {
     ) -> Result<(), fjall::Error> {
         let key = Self::build_key(group_id, proposal.epoch);
 
-        let proposal_bytes = Self::serialize_proposal(proposal);
-        let message_bytes = Self::serialize_message(message);
-
-        let mut value = Vec::with_capacity(4 + proposal_bytes.len() + message_bytes.len());
-        value.extend_from_slice(&(proposal_bytes.len() as u32).to_be_bytes());
-        value.extend_from_slice(&proposal_bytes);
-        value.extend_from_slice(&message_bytes);
+        let slim = SlimAccepted {
+            member_id: proposal.member_id,
+            attempt: proposal.attempt,
+            signature: proposal.signature.clone(),
+            message: message.clone(),
+        };
+        let data = postcard::to_allocvec(&slim).expect("serialization should not fail");
+        let value = storage_versioned_encode(STORAGE_VERSION, &data);
 
         self.accepted.insert(key, &value)?;
         self.db.persist(PersistMode::SyncAll)?;
@@ -380,19 +336,10 @@ impl FjallStateStore {
                     return None;
                 }
                 let epoch = Self::parse_epoch_from_key(&key)?;
-                if epoch < from_epoch {
+                if epoch < from_epoch || epoch.0 == PROMISED_SENTINEL_EPOCH {
                     return None;
                 }
-                if value.len() < 4 {
-                    return None;
-                }
-                let proposal_len = u32::from_be_bytes(value[0..4].try_into().ok()?) as usize;
-                if value.len() < 4 + proposal_len {
-                    return None;
-                }
-                let proposal = Self::deserialize_proposal(&value[4..4 + proposal_len])?;
-                let message = Self::deserialize_message(&value[4 + proposal_len..])?;
-                Some((proposal, message))
+                Self::decode_slim_accepted(&value, epoch)
             })
             .collect()
     }
@@ -413,6 +360,7 @@ impl FjallStateStore {
         for guard in self.accepted.range(prefix..end_key) {
             if let Ok((key, _)) = guard.into_inner()
                 && let Some(epoch) = Self::parse_epoch_from_key(&key)
+                && epoch.0 != PROMISED_SENTINEL_EPOCH
             {
                 highest = Some(epoch);
             }
@@ -435,73 +383,134 @@ impl FjallStateStore {
             .clone()
     }
 
-    fn store_group_sync(&self, group_id: &GroupId, group_info: &[u8]) -> Result<(), fjall::Error> {
-        self.groups.insert(group_id.as_bytes(), group_info)?;
-        self.db.persist(PersistMode::SyncAll)?;
-        Ok(())
-    }
-
-    fn get_group_sync(&self, group_id: &GroupId) -> Option<Vec<u8>> {
-        self.groups
-            .get(group_id.as_bytes())
-            .ok()
-            .flatten()
-            .map(|slice| slice.to_vec())
-    }
-
-    fn list_groups_sync(&self) -> Vec<GroupId> {
-        self.groups
-            .iter()
-            .filter_map(|guard| {
-                let (key, _) = guard.into_inner().ok()?;
-                if key.len() == 32 {
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&key);
-                    Some(GroupId::new(bytes))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn remove_group_sync(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
-        self.groups.remove(group_id.as_bytes())?;
-        self.db.persist(PersistMode::SyncAll)?;
-        Ok(())
-    }
-
-    fn store_epoch_roster_sync(
-        &self,
-        group_id: &GroupId,
-        roster: &EpochRoster,
-    ) -> Result<(), fjall::Error> {
-        let key = Self::build_key(group_id, roster.epoch);
-        self.epoch_rosters.insert(key, roster.to_bytes())?;
-        self.db.persist(PersistMode::SyncAll)?;
-        Ok(())
-    }
-
-    fn get_epoch_roster_at_or_before_sync(
+    fn store_snapshot_sync(
         &self,
         group_id: &GroupId,
         epoch: Epoch,
-    ) -> Option<EpochRoster> {
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        let key = Self::build_key(group_id, epoch);
+        self.snapshots.insert(key, snapshot_bytes)?;
+        Ok(())
+    }
+
+    fn get_latest_snapshot_sync(&self, group_id: &GroupId) -> Option<(Epoch, Vec<u8>)> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut end_key = prefix;
+        for byte in end_key.iter_mut().rev() {
+            if *byte < 0xFF {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+
+        for guard in self.snapshots.range(prefix..end_key).rev() {
+            if let Ok((key, value)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+            {
+                return Some((epoch, value.to_vec()));
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    fn get_snapshot_at_or_before_sync(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+    ) -> Option<(Epoch, Vec<u8>)> {
         let prefix = Self::build_group_prefix(group_id);
         let target_key = Self::build_key(group_id, epoch);
 
         for guard in self
-            .epoch_rosters
+            .snapshots
             .range(prefix.as_slice()..=target_key.as_slice())
             .rev()
         {
-            if let Ok((_, value)) = guard.into_inner()
-                && let Some(roster) = EpochRoster::from_bytes(&value)
+            if let Ok((key, value)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
             {
-                return Some(roster);
+                return Some((epoch, value.to_vec()));
             }
         }
         None
+    }
+
+    fn prune_snapshots_sync(
+        &self,
+        group_id: &GroupId,
+        current_epoch: Epoch,
+    ) -> Result<(), fjall::Error> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut end_key = prefix;
+        for byte in end_key.iter_mut().rev() {
+            if *byte < 0xFF {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+
+        let mut kept_epochs = std::collections::HashSet::new();
+        kept_epochs.insert(current_epoch.0);
+        if current_epoch.0 >= 1 {
+            kept_epochs.insert(current_epoch.0 - 1);
+        }
+        if current_epoch.0 >= 2 {
+            kept_epochs.insert(current_epoch.0 - 2);
+        }
+        let mut gap = 4u64;
+        while gap <= current_epoch.0 {
+            kept_epochs.insert(current_epoch.0 - gap);
+            gap = gap.saturating_mul(2);
+        }
+
+        let mut oldest_epoch: Option<u64> = None;
+        let mut to_delete = Vec::new();
+
+        for guard in self.snapshots.range(prefix.as_slice()..end_key.as_slice()) {
+            if let Ok((key, _)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+            {
+                if oldest_epoch.is_none() {
+                    oldest_epoch = Some(epoch.0);
+                }
+                if Some(epoch.0) != oldest_epoch && !kept_epochs.contains(&epoch.0) {
+                    to_delete.push(key.to_vec());
+                }
+            }
+        }
+
+        for key in to_delete {
+            self.snapshots.remove(&key)?;
+        }
+
+        Ok(())
+    }
+
+    fn list_groups_sync(&self) -> Vec<GroupId> {
+        let mut groups = Vec::new();
+        let mut last_group: Option<[u8; 32]> = None;
+
+        for guard in self.snapshots.iter() {
+            let Ok((key, _)) = guard.into_inner() else {
+                continue;
+            };
+            if key.len() < 32 {
+                continue;
+            }
+            let mut group_bytes = [0u8; 32];
+            group_bytes.copy_from_slice(&key[..32]);
+
+            if last_group.as_ref() == Some(&group_bytes) {
+                continue;
+            }
+            last_group = Some(group_bytes);
+            groups.push(GroupId::new(group_bytes));
+        }
+        groups
     }
 }
 
@@ -529,18 +538,6 @@ impl SharedFjallStateStore {
         }
     }
 
-    /// # Errors
-    ///
-    /// Returns [`fjall::Error`] if writing to the database fails.
-    pub fn store_group(&self, group_id: &GroupId, group_info: &[u8]) -> Result<(), fjall::Error> {
-        self.inner.store_group_sync(group_id, group_info)
-    }
-
-    #[must_use]
-    pub fn get_group_info(&self, group_id: &GroupId) -> Option<Vec<u8>> {
-        self.inner.get_group_sync(group_id)
-    }
-
     #[must_use]
     pub fn list_groups(&self) -> Vec<GroupId> {
         self.inner.list_groups_sync()
@@ -548,9 +545,20 @@ impl SharedFjallStateStore {
 
     /// # Errors
     ///
-    /// Returns [`fjall::Error`] if deleting from the database fails.
-    pub fn remove_group(&self, group_id: &GroupId) -> Result<(), fjall::Error> {
-        self.inner.remove_group_sync(group_id)
+    /// Returns [`fjall::Error`] if storing the snapshot fails.
+    pub fn store_snapshot(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        self.inner
+            .store_snapshot_sync(group_id, epoch, snapshot_bytes)
+    }
+
+    #[must_use]
+    pub fn get_latest_snapshot(&self, group_id: &GroupId) -> Option<(Epoch, Vec<u8>)> {
+        self.inner.get_latest_snapshot_sync(group_id)
     }
 
     pub(crate) fn store_app_message(
@@ -596,14 +604,6 @@ pub struct GroupStateStore {
 }
 
 impl GroupStateStore {
-    #[cfg(test)]
-    pub(crate) fn new(inner: FjallStateStore, group_id: GroupId) -> Self {
-        Self {
-            inner: Arc::new(inner),
-            group_id,
-        }
-    }
-
     #[must_use]
     pub(crate) fn get_accepted_from(
         &self,
@@ -613,34 +613,39 @@ impl GroupStateStore {
             .get_accepted_from_sync(&self.group_id, from_epoch)
     }
 
-    pub(crate) fn store_epoch_roster(&self, roster: &EpochRoster) -> Result<(), fjall::Error> {
-        self.inner.store_epoch_roster_sync(&self.group_id, roster)
+    /// # Errors
+    ///
+    /// Returns [`fjall::Error`] if storing the snapshot fails.
+    pub(crate) fn store_snapshot(
+        &self,
+        epoch: Epoch,
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        self.inner
+            .store_snapshot_sync(&self.group_id, epoch, snapshot_bytes)?;
+        self.inner.prune_snapshots_sync(&self.group_id, epoch)?;
+        Ok(())
     }
 
     #[must_use]
-    pub(crate) fn get_epoch_roster_at_or_before(&self, epoch: Epoch) -> Option<EpochRoster> {
-        self.inner
-            .get_epoch_roster_at_or_before_sync(&self.group_id, epoch)
+    #[allow(dead_code)]
+    pub(crate) fn get_latest_snapshot(&self) -> Option<(Epoch, Vec<u8>)> {
+        self.inner.get_latest_snapshot_sync(&self.group_id)
     }
 
-    /// Delete all messages for this group whose (sender, seq) is covered by the watermark.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn get_snapshot_at_or_before(&self, epoch: Epoch) -> Option<(Epoch, Vec<u8>)> {
+        self.inner
+            .get_snapshot_at_or_before_sync(&self.group_id, epoch)
+    }
+
     pub(crate) fn delete_before_watermark(
         &self,
         watermark: &StateVector,
     ) -> Result<usize, fjall::Error> {
         self.inner
             .delete_before_watermark(&self.group_id, watermark)
-    }
-
-    pub(crate) fn check_sender_in_roster(&self, sender: MemberFingerprint) -> bool {
-        let Some(roster) = self
-            .inner
-            .get_epoch_roster_at_or_before_sync(&self.group_id, Epoch(u64::MAX))
-        else {
-            return true;
-        };
-
-        roster.has_fingerprint(&self.group_id, sender)
     }
 }
 
@@ -798,34 +803,248 @@ where
 
 #[cfg(test)]
 mod tests {
-    use universal_sync_core::MemberId;
+    use mls_rs::ExtensionList;
 
     use super::*;
 
-    fn test_roster_member(key: &[u8]) -> RosterMember {
-        RosterMember {
-            signing_key: key.to_vec(),
-            binding_id: 0,
+    fn make_test_message() -> GroupMessage {
+        use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+        use mls_rs::{CipherSuite, CipherSuiteProvider, CryptoProvider};
+        use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+        let cipher_suite = CipherSuite::CURVE25519_AES128;
+        let crypto = RustCryptoProvider::default();
+        let cs = crypto.cipher_suite_provider(cipher_suite).unwrap();
+
+        let (secret_key, public_key) = cs.signature_key_generate().unwrap();
+        let credential = BasicCredential::new(b"test".to_vec());
+        let signing_identity =
+            mls_rs::identity::SigningIdentity::new(credential.into_credential(), public_key);
+
+        let client = mls_rs::Client::builder()
+            .crypto_provider(crypto)
+            .identity_provider(BasicIdentityProvider::new())
+            .signing_identity(signing_identity, secret_key, cipher_suite)
+            .build();
+
+        let mut group = client
+            .create_group(ExtensionList::default(), ExtensionList::default(), None)
+            .unwrap();
+        let commit = group.commit_builder().build().unwrap();
+        GroupMessage::new(commit.commit_message)
+    }
+
+    fn make_test_proposal(epoch: Epoch) -> GroupProposal {
+        GroupProposal {
+            member_id: MemberId(1),
+            epoch,
+            attempt: Attempt(0),
+            message_hash: [0u8; 32],
+            signature: vec![1, 2, 3, 4],
         }
     }
 
     #[test]
-    fn test_epoch_roster_roundtrip() {
-        let roster = EpochRoster::new(
-            Epoch(5),
-            vec![
-                (MemberId(0), test_roster_member(&[1, 2, 3, 4])),
-                (MemberId(1), test_roster_member(&[5, 6, 7, 8])),
-            ],
+    fn slim_accepted_roundtrip() {
+        let message = make_test_message();
+        let epoch = Epoch(42);
+
+        let slim = SlimAccepted {
+            member_id: MemberId(5),
+            attempt: Attempt(3),
+            signature: vec![10, 20, 30],
+            message: message.clone(),
+        };
+
+        let data = postcard::to_allocvec(&slim).expect("serialize");
+        let encoded = storage_versioned_encode(STORAGE_VERSION, &data);
+        let decoded = FjallStateStore::decode_slim_accepted(&encoded, epoch).unwrap();
+
+        assert_eq!(decoded.0.member_id, MemberId(5));
+        assert_eq!(decoded.0.epoch, epoch);
+        assert_eq!(decoded.0.attempt, Attempt(3));
+        assert_eq!(decoded.0.signature, vec![10, 20, 30]);
+
+        let message_bytes = postcard::to_allocvec(&message).expect("serialization should not fail");
+        let expected_hash: [u8; 32] = Sha256::digest(&message_bytes).into();
+        assert_eq!(decoded.0.message_hash, expected_hash);
+    }
+
+    #[test]
+    fn accepted_set_get_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([1u8; 32]);
+        let message = make_test_message();
+        let proposal = make_test_proposal(Epoch(10));
+
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+        let (loaded_proposal, _loaded_message) = store.get_accepted_sync(&gid, Epoch(10)).unwrap();
+
+        assert_eq!(loaded_proposal.member_id, proposal.member_id);
+        assert_eq!(loaded_proposal.epoch, Epoch(10));
+        assert_eq!(loaded_proposal.attempt, proposal.attempt);
+        assert_eq!(loaded_proposal.signature, proposal.signature);
+    }
+
+    #[test]
+    fn accepted_from_range_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([2u8; 32]);
+        let message = make_test_message();
+
+        for e in 0..5 {
+            let proposal = make_test_proposal(Epoch(e));
+            store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+        }
+
+        let from_2 = store.get_accepted_from_sync(&gid, Epoch(2));
+        assert_eq!(from_2.len(), 3);
+        assert_eq!(from_2[0].0.epoch, Epoch(2));
+        assert_eq!(from_2[2].0.epoch, Epoch(4));
+    }
+
+    #[test]
+    fn accepted_from_excludes_promised_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([3u8; 32]);
+        let message = make_test_message();
+
+        let proposal = make_test_proposal(Epoch(0));
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+
+        let promised = make_test_proposal(Epoch(1));
+        store.set_promised_sync(&gid, &promised).unwrap();
+
+        let all = store.get_accepted_from_sync(&gid, Epoch(0));
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0.epoch, Epoch(0));
+    }
+
+    #[test]
+    fn promised_sentinel_matching_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([4u8; 32]);
+
+        let proposal = make_test_proposal(Epoch(5));
+        store.set_promised_sync(&gid, &proposal).unwrap();
+
+        let loaded = store.get_promised_sync(&gid, Epoch(5));
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().epoch, Epoch(5));
+
+        let wrong_epoch = store.get_promised_sync(&gid, Epoch(6));
+        assert!(wrong_epoch.is_none());
+    }
+
+    #[test]
+    fn snapshot_crud() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([5u8; 32]);
+
+        store.store_snapshot_sync(&gid, Epoch(0), b"snap0").unwrap();
+        store.store_snapshot_sync(&gid, Epoch(5), b"snap5").unwrap();
+        store
+            .store_snapshot_sync(&gid, Epoch(10), b"snap10")
+            .unwrap();
+
+        let (epoch, bytes) = store.get_latest_snapshot_sync(&gid).unwrap();
+        assert_eq!(epoch, Epoch(10));
+        assert_eq!(bytes, b"snap10");
+
+        let (epoch, bytes) = store
+            .get_snapshot_at_or_before_sync(&gid, Epoch(7))
+            .unwrap();
+        assert_eq!(epoch, Epoch(5));
+        assert_eq!(bytes, b"snap5");
+
+        let (epoch, bytes) = store
+            .get_snapshot_at_or_before_sync(&gid, Epoch(5))
+            .unwrap();
+        assert_eq!(epoch, Epoch(5));
+        assert_eq!(bytes, b"snap5");
+
+        assert!(
+            store
+                .get_snapshot_at_or_before_sync(&gid, Epoch(0))
+                .is_some()
         );
+    }
 
-        let bytes = roster.to_bytes();
-        let decoded = EpochRoster::from_bytes(&bytes).unwrap();
+    #[test]
+    fn logarithmic_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([6u8; 32]);
 
-        assert_eq!(decoded.epoch, Epoch(5));
-        assert_eq!(decoded.get_member_key(MemberId(0)), Some(&[1, 2, 3, 4][..]));
-        assert_eq!(decoded.get_member_key(MemberId(1)), Some(&[5, 6, 7, 8][..]));
-        assert_eq!(decoded.get_member_key(MemberId(2)), None);
+        for e in 0..=20 {
+            store
+                .store_snapshot_sync(&gid, Epoch(e), format!("snap{e}").as_bytes())
+                .unwrap();
+        }
+
+        store.prune_snapshots_sync(&gid, Epoch(20)).unwrap();
+
+        // Verify kept epochs: {0 (oldest), 20, 19, 18, 16, 12, 4}
+        let remaining: Vec<u64> = (0..=20)
+            .filter(|&e| {
+                store
+                    .get_snapshot_at_or_before_sync(&gid, Epoch(e))
+                    .is_some()
+                    && store
+                        .get_snapshot_at_or_before_sync(&gid, Epoch(e))
+                        .unwrap()
+                        .0
+                        == Epoch(e)
+            })
+            .collect();
+
+        assert!(remaining.contains(&0), "oldest must be kept");
+        assert!(remaining.contains(&20), "current must be kept");
+        assert!(remaining.contains(&19), "E-1 must be kept");
+        assert!(remaining.contains(&18), "E-2 must be kept");
+        assert!(remaining.contains(&16), "E-4 must be kept");
+        assert!(remaining.contains(&12), "E-8 must be kept");
+        assert!(remaining.contains(&4), "E-16 must be kept");
+    }
+
+    #[test]
+    fn list_groups_from_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+
+        let gid1 = GroupId::new([1u8; 32]);
+        let gid2 = GroupId::new([2u8; 32]);
+
+        store.store_snapshot_sync(&gid1, Epoch(0), b"snap").unwrap();
+        store.store_snapshot_sync(&gid1, Epoch(1), b"snap").unwrap();
+        store.store_snapshot_sync(&gid2, Epoch(0), b"snap").unwrap();
+
+        let groups = store.list_groups_sync();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&gid1));
+        assert!(groups.contains(&gid2));
+    }
+
+    #[test]
+    fn highest_accepted_excludes_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([7u8; 32]);
+        let message = make_test_message();
+
+        let proposal = make_test_proposal(Epoch(5));
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+
+        let promised = make_test_proposal(Epoch(10));
+        store.set_promised_sync(&gid, &promised).unwrap();
+
+        let highest = store.highest_accepted_round_sync(&gid).unwrap();
+        assert_eq!(highest, Epoch(5));
     }
 
     #[test]
@@ -852,11 +1071,9 @@ mod tests {
         store.store_app_message(&gid, &id1, &msg).unwrap();
         store.store_app_message(&gid, &id2, &msg).unwrap();
 
-        // Empty state vector → get all
         let all = store.get_messages_after(&gid, &StateVector::default());
         assert_eq!(all.len(), 2);
 
-        // State vector covering seq 1 → only seq 2 returned
         let mut sv = StateVector::default();
         sv.insert(sender, 1);
         let after = store.get_messages_after(&gid, &sv);
@@ -876,7 +1093,6 @@ mod tests {
             ciphertext: vec![1],
         };
 
-        // Store messages from two senders
         for seq in 1..=5 {
             let id = MessageId {
                 group_id: gid,
@@ -894,16 +1110,15 @@ mod tests {
             store.store_app_message(&gid, &id, &msg).unwrap();
         }
 
-        // Delete sender_a up to seq 3, sender_b up to seq 1
         let mut watermark = StateVector::default();
         watermark.insert(sender_a, 3);
         watermark.insert(sender_b, 1);
 
         let deleted = store.delete_before_watermark(&gid, &watermark).unwrap();
-        assert_eq!(deleted, 4); // 3 from sender_a + 1 from sender_b
+        assert_eq!(deleted, 4);
 
         let remaining = store.get_messages_after(&gid, &StateVector::default());
-        assert_eq!(remaining.len(), 4); // sender_a: 4,5 + sender_b: 2,3
+        assert_eq!(remaining.len(), 4);
     }
 
     #[test]
@@ -945,29 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn check_sender_in_roster_accepts_current_member() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
-        let gid = GroupId::new([1u8; 32]);
-
-        let alice_key = vec![1, 2, 3, 4];
-        let bob_key = vec![5, 6, 7, 8];
-
-        let roster = EpochRoster::new(
-            Epoch(1),
-            vec![
-                (MemberId(0), test_roster_member(&alice_key)),
-                (MemberId(1), test_roster_member(&bob_key)),
-            ],
-        );
-        let group_store = GroupStateStore::new(store, gid);
-        group_store.store_epoch_roster(&roster).unwrap();
-
-        let alice_fp = MemberFingerprint::from_key(&gid, &alice_key, 0);
-        assert!(group_store.check_sender_in_roster(alice_fp));
-    }
-
-    #[test]
     fn storage_versioned_encode_decode_roundtrip() {
         let payload = b"test data";
         let encoded = super::storage_versioned_encode(1, payload);
@@ -982,34 +1174,5 @@ mod tests {
         let (version, decoded) = super::storage_versioned_decode(legacy);
         assert_eq!(version, 1);
         assert_eq!(decoded, legacy.as_slice());
-    }
-
-    #[test]
-    fn check_sender_in_roster_rejects_removed_member() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
-        let gid = GroupId::new([1u8; 32]);
-
-        let alice_key = vec![1, 2, 3, 4];
-        let bob_key = vec![5, 6, 7, 8];
-
-        let roster_v1 = EpochRoster::new(
-            Epoch(1),
-            vec![
-                (MemberId(0), test_roster_member(&alice_key)),
-                (MemberId(1), test_roster_member(&bob_key)),
-            ],
-        );
-        let group_store = GroupStateStore::new(store, gid);
-        group_store.store_epoch_roster(&roster_v1).unwrap();
-
-        let roster_v2 = EpochRoster::new(
-            Epoch(2),
-            vec![(MemberId(0), test_roster_member(&alice_key))],
-        );
-        group_store.store_epoch_roster(&roster_v2).unwrap();
-
-        let bob_fp = MemberFingerprint::from_key(&gid, &bob_key, 0);
-        assert!(!group_store.check_sender_in_roster(bob_fp));
     }
 }

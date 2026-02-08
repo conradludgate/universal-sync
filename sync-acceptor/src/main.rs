@@ -10,7 +10,7 @@ use mls_rs::{CipherSuite, CryptoProvider};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tracing::{error, info};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
-use universal_sync_core::{PAXOS_ALPN, load_secret_key};
+use universal_sync_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE, load_secret_key};
 
 #[derive(Parser, Debug)]
 #[command(name = "acceptor")]
@@ -67,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external_client = ExternalClient::builder()
         .crypto_provider(crypto)
         .identity_provider(BasicIdentityProvider::new())
+        .extension_type(SYNC_EXTENSION_TYPE)
+        .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
         .build();
 
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()

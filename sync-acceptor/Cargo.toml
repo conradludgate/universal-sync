@@ -28,6 +28,7 @@ iroh.workspace = true
 bytes.workspace = true
 pin-project-lite.workspace = true
 error-stack.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

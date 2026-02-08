@@ -49,6 +49,10 @@ where
     let mut sync = pin!(initial_subscription.fuse());
     let mut conn = pin!(conn);
 
+    // Track the epoch the handler has actually applied up to, so we can
+    // replay any learned values the handler missed between proposals.
+    let mut handler_applied_epoch = handler.acceptor().current_round();
+
     loop {
         let msg = select! {
             msg = conn.next() => msg,
@@ -86,17 +90,25 @@ where
                         }
                         let new_epoch = current_epoch_fn();
                         if new_epoch >= proposal_round {
-                            debug!(epoch = ?new_epoch, "caught up, applying learned values");
-                            let learned = handler.state().get_accepted_from(current).await;
-                            for (p, m) in learned {
-                                if let Err(e) = handler.acceptor_mut().apply(p, m).await {
-                                    warn!(?e, "failed to apply learned value");
-                                }
-                            }
                             current = new_epoch;
                             break;
                         }
                     }
+                }
+
+                // Replay any learned values the handler hasn't applied yet.
+                if handler_applied_epoch < current {
+                    debug!(from = ?handler_applied_epoch, to = ?current, "applying learned values");
+                    let learned = handler
+                        .state()
+                        .get_accepted_from(handler_applied_epoch)
+                        .await;
+                    for (p, m) in learned {
+                        if let Err(e) = handler.acceptor_mut().apply(p, m).await {
+                            warn!(?e, "failed to apply learned value");
+                        }
+                    }
+                    handler_applied_epoch = current;
                 }
 
                 let response = match handler.handle_prepare(&proposal).await {
@@ -151,17 +163,25 @@ where
                         }
                         let new_epoch = current_epoch_fn();
                         if new_epoch >= proposal_round {
-                            debug!(epoch = ?new_epoch, "caught up, applying learned values");
-                            let learned = handler.state().get_accepted_from(current).await;
-                            for (p, m) in learned {
-                                if let Err(e) = handler.acceptor_mut().apply(p, m).await {
-                                    warn!(?e, "failed to apply learned value");
-                                }
-                            }
                             current = new_epoch;
                             break;
                         }
                     }
+                }
+
+                // Replay any learned values the handler hasn't applied yet.
+                if handler_applied_epoch < current {
+                    debug!(from = ?handler_applied_epoch, to = ?current, "applying learned values for accept");
+                    let learned = handler
+                        .state()
+                        .get_accepted_from(handler_applied_epoch)
+                        .await;
+                    for (p, m) in learned {
+                        if let Err(e) = handler.acceptor_mut().apply(p, m).await {
+                            warn!(?e, "failed to apply learned value");
+                        }
+                    }
+                    handler_applied_epoch = current;
                 }
 
                 let response = match handler.handle_accept(&proposal, &message).await {

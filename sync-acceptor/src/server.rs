@@ -274,7 +274,7 @@ where
                 };
 
                 let request = request.change_context(ConnectorError)?;
-                handle_message_request(&group_id, &subscriber, request, &mut connection, &registry).await?;
+                handle_message_request(&group_id, &subscriber, request, &mut connection, &registry, &acceptor).await?;
             }
 
             msg = subscription.recv() => {
@@ -304,6 +304,7 @@ async fn handle_message_request<C, CS>(
     request: MessageRequest,
     connection: &mut IrohMessageConnection,
     registry: &AcceptorRegistry<C, CS>,
+    acceptor: &GroupAcceptor<C, CS>,
 ) -> Result<(), Report<ConnectorError>>
 where
     C: ExternalMlsConfig + Clone + Send + Sync + 'static,
@@ -311,7 +312,7 @@ where
 {
     match request {
         MessageRequest::Send { id, message } => {
-            if !registry.check_sender_in_roster(group_id, id.sender) {
+            if !acceptor.is_fingerprint_in_roster(group_id, id.sender) {
                 debug!(sender = ?id.sender, "rejecting message from sender not in roster");
                 connection
                     .send(MessageResponse::Error("sender not in roster".into()))

@@ -10,8 +10,8 @@ use mls_rs::crypto::SignaturePublicKey;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::external_client::{ExternalGroup, ExternalReceivedMessage};
 use universal_sync_core::{
-    AcceptorId, Attempt, Epoch, GroupContextExt, GroupMessage, GroupProposal, LeafNodeExt,
-    MemberId, SyncProposal, UnsignedProposal,
+    AcceptorId, Attempt, Epoch, GroupContextExt, GroupId, GroupMessage, GroupProposal, LeafNodeExt,
+    MemberFingerprint, MemberId, SyncProposal, UnsignedProposal,
 };
 
 /// Error marker for `GroupAcceptor` operations.
@@ -113,22 +113,19 @@ where
             .ok()
     }
 
-    /// Looks up the signing key for a member at a specific epoch,
-    /// falling back to the current roster if no historical data is available.
+    /// Looks up the signing key for a member at a specific epoch.
+    ///
+    /// For current or future epochs, uses the in-memory roster (membership changes only take
+    /// effect after the commit is applied, so the current roster is valid for upcoming rounds).
+    /// For past epochs: would reconstruct from the nearest snapshot + replaying accepted values.
+    // TODO: implement historical roster reconstruction from snapshots with throttling/caching
     fn get_member_public_key_for_epoch(
         &self,
         member_id: MemberId,
         epoch: Epoch,
     ) -> Option<SignaturePublicKey> {
-        if let Some(ref store) = self.state_store
-            && let Some(roster) = store.get_epoch_roster_at_or_before(epoch)
-            && let Some(key_bytes) = roster.get_member_key(member_id)
-        {
-            return Some(SignaturePublicKey::new_slice(key_bytes));
-        }
-
         let current_epoch = Epoch(self.external_group.group_context().epoch);
-        if epoch == current_epoch {
+        if epoch >= current_epoch {
             return self.get_member_public_key(member_id);
         }
 
@@ -137,6 +134,27 @@ where
 
     fn is_known_acceptor(&self, id: &AcceptorId) -> bool {
         self.acceptors.contains_key(id)
+    }
+
+    pub(crate) fn is_fingerprint_in_roster(
+        &self,
+        group_id: &GroupId,
+        fingerprint: MemberFingerprint,
+    ) -> bool {
+        self.external_group.roster().members_iter().any(|member| {
+            let binding_id = member
+                .extensions
+                .get_as::<LeafNodeExt>()
+                .ok()
+                .flatten()
+                .map_or(0, |ext| ext.binding_id);
+            let fp = MemberFingerprint::from_key(
+                group_id,
+                &member.signing_identity.signature_key,
+                binding_id,
+            );
+            fp == fingerprint
+        })
     }
 }
 
@@ -287,7 +305,7 @@ where
                     }
                 }
 
-                self.store_current_epoch_roster(new_epoch);
+                self.store_snapshot(new_epoch);
             }
             ExternalReceivedMessage::Proposal(_) => {
                 tracing::debug!("learned proposal");
@@ -380,43 +398,25 @@ where
         changes
     }
 
-    fn store_current_epoch_roster(&self, epoch: Epoch) {
+    fn store_snapshot(&self, epoch: Epoch) {
         if let Some(ref store) = self.state_store {
-            use crate::state_store::{EpochRoster, RosterMember};
-
-            let members: Vec<_> = self
-                .external_group
-                .roster()
-                .members_iter()
-                .map(|m| {
-                    let binding_id = m
-                        .extensions
-                        .get_as::<LeafNodeExt>()
-                        .ok()
-                        .flatten()
-                        .map_or(0, |ext| ext.binding_id);
-                    (
-                        MemberId(m.index),
-                        RosterMember {
-                            signing_key: m.signing_identity.signature_key.as_bytes().to_vec(),
-                            binding_id,
-                        },
-                    )
-                })
-                .collect();
-
-            let roster = EpochRoster::new(epoch, members);
-
-            if let Err(e) = store.store_epoch_roster(&roster) {
-                tracing::warn!(?e, ?epoch, "failed to store epoch roster");
-            } else {
-                tracing::debug!(?epoch, "stored epoch roster");
+            match self.external_group.snapshot().to_bytes() {
+                Ok(snapshot_bytes) => {
+                    if let Err(e) = store.store_snapshot(epoch, &snapshot_bytes) {
+                        tracing::warn!(?e, ?epoch, "failed to store snapshot");
+                    } else {
+                        tracing::debug!(?epoch, "stored snapshot");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(?e, ?epoch, "failed to serialize snapshot");
+                }
             }
         }
     }
 
-    pub(crate) fn store_initial_epoch_roster(&self) {
+    pub(crate) fn store_initial_snapshot(&self) {
         let epoch = Epoch(self.external_group.group_context().epoch);
-        self.store_current_epoch_roster(epoch);
+        self.store_snapshot(epoch);
     }
 }
