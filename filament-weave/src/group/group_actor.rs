@@ -1755,7 +1755,20 @@ mod tests {
 
     /// Helper: 3-level config for tests (L0, L1 at threshold 10, L2 at threshold 5).
     fn test_config_3() -> CompactionConfig {
-        default_compaction_config()
+        vec![
+            CompactionLevel {
+                threshold: 0,
+                replication: 1,
+            },
+            CompactionLevel {
+                threshold: 10,
+                replication: 2,
+            },
+            CompactionLevel {
+                threshold: 5,
+                replication: 0,
+            },
+        ]
     }
 
     #[test]
