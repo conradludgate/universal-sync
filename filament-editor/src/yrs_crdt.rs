@@ -2,7 +2,6 @@
 //!
 //! Wire messages use `postcard` serialisation of [`CrdtMessage`], which pairs
 //! a [`PeerAwareness`] header with an optional Yrs V2 doc update.
-//! Snapshots (`snapshot` / `merge`) use raw (unwrapped) Yrs bytes.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -11,7 +10,7 @@ use error_stack::{Report, ResultExt};
 use filament_core::{Crdt, CrdtError};
 use serde::{Deserialize, Serialize};
 use yrs::updates::decoder::Decode;
-use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
+use yrs::{Doc, ReadTxn, Snapshot, StateVector, Transact, Update};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerAwareness {
@@ -49,8 +48,12 @@ mod option_yrs_update {
 pub struct YrsCrdt {
     doc: Doc,
     client_id: u64,
-    last_flushed_sv: StateVector,
-    dirty: bool,
+    /// Snapshots confirmed received by a spool, per level.
+    /// A `Snapshot` tracks both inserts (state vector) and deletes (delete set).
+    flushed: Vec<Snapshot>,
+    /// Snapshots of the last flush attempt, per level.
+    /// Equal to flushed when nothing is in-flight.
+    inflight: Vec<Snapshot>,
     awareness_states: HashMap<u64, PeerAwareness>,
     awareness_last_seen: HashMap<u64, Instant>,
     awareness_dirty: bool,
@@ -61,12 +64,12 @@ impl YrsCrdt {
     pub fn new() -> Self {
         let doc = Doc::new();
         let client_id = doc.client_id();
-        let last_flushed_sv = doc.transact().state_vector();
+        let initial = doc.transact().snapshot();
         Self {
             doc,
             client_id,
-            last_flushed_sv,
-            dirty: false,
+            flushed: vec![initial.clone()],
+            inflight: vec![initial],
             awareness_states: HashMap::new(),
             awareness_last_seen: HashMap::new(),
             awareness_dirty: false,
@@ -76,25 +79,45 @@ impl YrsCrdt {
     #[must_use]
     pub fn with_client_id(client_id: u64) -> Self {
         let doc = Doc::with_client_id(client_id);
-        let last_flushed_sv = doc.transact().state_vector();
+        let initial = doc.transact().snapshot();
         Self {
             doc,
             client_id,
-            last_flushed_sv,
-            dirty: false,
+            flushed: vec![initial.clone()],
+            inflight: vec![initial],
             awareness_states: HashMap::new(),
             awareness_last_seen: HashMap::new(),
             awareness_dirty: false,
         }
     }
 
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
     #[must_use]
     pub fn doc(&self) -> &Doc {
         &self.doc
+    }
+
+    /// Encode the full current state as raw Yrs V2 bytes (no framing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError`] if encoding fails.
+    pub fn snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
+        let txn = self.doc.transact();
+        Ok(txn.encode_state_as_update_v2(&StateVector::default()))
+    }
+
+    /// Apply a raw Yrs V2 snapshot (no framing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError`] if the bytes cannot be decoded or applied.
+    pub fn merge(&mut self, snapshot: &[u8]) -> Result<(), Report<CrdtError>> {
+        let update = Update::decode_v2(snapshot).change_context(CrdtError)?;
+        self.doc
+            .transact_mut()
+            .apply_update(update)
+            .change_context(CrdtError)?;
+        Ok(())
     }
 
     /// # Errors
@@ -104,6 +127,13 @@ impl YrsCrdt {
         let mut crdt = Self::with_client_id(client_id);
         crdt.merge(snapshot)?;
         Ok(crdt)
+    }
+
+    fn ensure_level(&mut self, level: usize) {
+        while self.flushed.len() <= level {
+            self.flushed.push(Snapshot::default());
+            self.inflight.push(Snapshot::default());
+        }
     }
 
     pub fn set_cursor(&mut self, cursor: u32, selection_end: u32) {
@@ -195,47 +225,30 @@ impl Crdt for YrsCrdt {
         Ok(())
     }
 
-    fn merge(&mut self, snapshot: &[u8]) -> Result<(), Report<CrdtError>> {
-        let update = Update::decode_v2(snapshot).change_context(CrdtError)?;
-        self.doc
-            .transact_mut()
-            .apply_update(update)
-            .change_context(CrdtError)?;
-        Ok(())
-    }
-
-    fn snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
+    fn flush(&mut self, level: usize) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
+        self.ensure_level(level);
         let txn = self.doc.transact();
-        Ok(txn.encode_state_as_update_v2(&StateVector::default()))
-    }
+        let current = txn.snapshot();
 
-    fn wire_snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
-        let snapshot = self.snapshot()?;
-        let msg = CrdtMessage {
-            awareness: self.local_awareness(),
-            doc_update: Some(snapshot),
-        };
-        postcard::to_allocvec(&msg).change_context(CrdtError)
-    }
-
-    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
-        if !self.dirty && !self.awareness_dirty {
+        let has_doc_changes = current != self.flushed[level];
+        if level == 0 && !has_doc_changes && !self.awareness_dirty {
+            return Ok(None);
+        }
+        if level > 0 && !has_doc_changes {
             return Ok(None);
         }
 
-        let doc_update = if self.dirty {
-            self.dirty = false;
-            let txn = self.doc.transact();
-            let current_sv = txn.state_vector();
-            let update = txn.encode_diff_v2(&self.last_flushed_sv);
-            drop(txn);
-            self.last_flushed_sv = current_sv;
-            Some(update)
+        let doc_update = if has_doc_changes {
+            Some(txn.encode_diff_v2(&self.flushed[level].state_map))
         } else {
             None
         };
+        drop(txn);
 
-        self.awareness_dirty = false;
+        self.inflight[level] = current;
+        if level == 0 {
+            self.awareness_dirty = false;
+        }
 
         let msg = CrdtMessage {
             awareness: self.local_awareness(),
@@ -243,6 +256,12 @@ impl Crdt for YrsCrdt {
         };
         let encoded = postcard::to_allocvec(&msg).change_context(CrdtError)?;
         Ok(Some(encoded))
+    }
+
+    fn confirm_flush(&mut self, level: usize) {
+        if level < self.flushed.len() {
+            self.flushed[level] = self.inflight[level].clone();
+        }
     }
 }
 
@@ -252,6 +271,18 @@ mod tests {
     use yrs::{Any, GetString, Map, Text, Transact};
 
     use super::*;
+
+    fn insert_text(crdt: &YrsCrdt, pos: u32, content: &str) {
+        let text = crdt.doc().get_or_insert_text("doc");
+        let mut txn = crdt.doc().transact_mut();
+        text.insert(&mut txn, pos, content);
+    }
+
+    fn get_text(crdt: &YrsCrdt) -> String {
+        let text = crdt.doc().get_or_insert_text("doc");
+        let txn = crdt.doc().transact();
+        text.get_string(&txn)
+    }
 
     #[test]
     fn test_yrs_crdt_basic() {
@@ -330,17 +361,11 @@ mod tests {
     #[test]
     fn test_from_snapshot_inherent() {
         let crdt = YrsCrdt::with_client_id(1);
-        {
-            let text = crdt.doc().get_or_insert_text("doc");
-            let mut txn = crdt.doc().transact_mut();
-            text.insert(&mut txn, 0, "Hello");
-        }
+        insert_text(&crdt, 0, "Hello");
         let snapshot = crdt.snapshot().unwrap();
 
         let crdt2 = YrsCrdt::from_snapshot(&snapshot, 2).unwrap();
-        let text = crdt2.doc().get_or_insert_text("doc");
-        let txn = crdt2.doc().transact();
-        assert_eq!(text.get_string(&txn), "Hello");
+        assert_eq!(get_text(&crdt2), "Hello");
     }
 
     #[test]
@@ -348,12 +373,10 @@ mod tests {
         let mut crdt = YrsCrdt::with_client_id(1);
 
         let insert_and_flush = |crdt: &mut YrsCrdt, pos: u32, text: &str| {
-            let t = crdt.doc().get_or_insert_text("doc");
-            let mut txn = crdt.doc().transact_mut();
-            t.insert(&mut txn, pos, text);
-            drop(txn);
-            crdt.mark_dirty();
-            crdt.flush_update().unwrap().unwrap()
+            insert_text(crdt, pos, text);
+            let data = crdt.flush(0).unwrap().unwrap();
+            crdt.confirm_flush(0);
+            data
         };
 
         insert_and_flush(&mut crdt, 0, "aaa");
@@ -362,9 +385,7 @@ mod tests {
 
         let snapshot = crdt.snapshot().unwrap();
         let fresh = YrsCrdt::from_snapshot(&snapshot, 99).unwrap();
-        let text = fresh.doc().get_or_insert_text("doc");
-        let txn = fresh.doc().transact();
-        assert_eq!(text.get_string(&txn), "aaabbbccc");
+        assert_eq!(get_text(&fresh), "aaabbbccc");
     }
 
     #[test]
@@ -380,41 +401,20 @@ mod tests {
         let mut crdt1 = YrsCrdt::with_client_id(1);
         let mut crdt2 = YrsCrdt::with_client_id(2);
 
-        {
-            let text = crdt1.doc().get_or_insert_text("doc");
-            let mut txn = crdt1.doc().transact_mut();
-            text.insert(&mut txn, 0, "ABC");
-        }
+        insert_text(&crdt1, 0, "ABC");
         let initial = crdt1.snapshot().unwrap();
         crdt2.merge(&initial).unwrap();
 
-        {
-            let text = crdt1.doc().get_or_insert_text("doc");
-            let mut txn = crdt1.doc().transact_mut();
-            text.insert(&mut txn, 1, "X");
-        }
-
-        {
-            let text = crdt2.doc().get_or_insert_text("doc");
-            let mut txn = crdt2.doc().transact_mut();
-            text.insert(&mut txn, 2, "Y");
-        }
+        insert_text(&crdt1, 1, "X");
+        insert_text(&crdt2, 2, "Y");
 
         let update1 = crdt1.snapshot().unwrap();
         let update2 = crdt2.snapshot().unwrap();
         crdt1.merge(&update2).unwrap();
         crdt2.merge(&update1).unwrap();
 
-        let text1 = {
-            let text = crdt1.doc().get_or_insert_text("doc");
-            let txn = crdt1.doc().transact();
-            text.get_string(&txn)
-        };
-        let text2 = {
-            let text = crdt2.doc().get_or_insert_text("doc");
-            let txn = crdt2.doc().transact();
-            text.get_string(&txn)
-        };
+        let text1 = get_text(&crdt1);
+        let text2 = get_text(&crdt2);
 
         assert_eq!(text1, text2);
         assert!(text1.contains('A'));
@@ -427,22 +427,13 @@ mod tests {
     #[test]
     fn test_echo_idempotent() {
         let mut alice = YrsCrdt::with_client_id(12345);
+        insert_text(&alice, 0, "Hello");
 
-        {
-            let text = alice.doc().get_or_insert_text("doc");
-            let mut txn = alice.doc().transact_mut();
-            text.insert(&mut txn, 0, "Hello");
-        }
-
-        alice.mark_dirty();
-        let diff = alice.flush_update().unwrap().unwrap();
+        let diff = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
         alice.apply(&diff).unwrap();
 
-        {
-            let text = alice.doc().get_or_insert_text("doc");
-            let txn = alice.doc().transact();
-            assert_eq!(text.get_string(&txn), "Hello", "echo should be idempotent");
-        }
+        assert_eq!(get_text(&alice), "Hello", "echo should be idempotent");
     }
 
     #[test]
@@ -450,51 +441,27 @@ mod tests {
         let mut alice_crdt = YrsCrdt::with_client_id(111);
         let mut bob_crdt = YrsCrdt::with_client_id(222);
 
-        {
-            let text = alice_crdt.doc().get_or_insert_text("doc");
-            let mut txn = alice_crdt.doc().transact_mut();
-            text.insert(&mut txn, 0, "Hello");
-        }
-        alice_crdt.mark_dirty();
-        let alice_update = alice_crdt.flush_update().unwrap().unwrap();
+        insert_text(&alice_crdt, 0, "Hello");
+        let alice_update = alice_crdt.flush(0).unwrap().unwrap();
+        alice_crdt.confirm_flush(0);
 
         bob_crdt.apply(&alice_update).unwrap();
-        {
-            let text = bob_crdt.doc().get_or_insert_text("doc");
-            let txn = bob_crdt.doc().transact();
-            assert_eq!(text.get_string(&txn), "Hello");
-        }
+        assert_eq!(get_text(&bob_crdt), "Hello");
 
         alice_crdt.apply(&alice_update).unwrap();
-        {
-            let text = alice_crdt.doc().get_or_insert_text("doc");
-            let txn = alice_crdt.doc().transact();
-            assert_eq!(text.get_string(&txn), "Hello", "echo should not duplicate");
-        }
+        assert_eq!(get_text(&alice_crdt), "Hello", "echo should not duplicate");
 
-        {
-            let text = bob_crdt.doc().get_or_insert_text("doc");
-            let mut txn = bob_crdt.doc().transact_mut();
-            text.insert(&mut txn, 5, " World");
-        }
-        bob_crdt.mark_dirty();
-        let bob_update = bob_crdt.flush_update().unwrap().unwrap();
+        insert_text(&bob_crdt, 5, " World");
+        let bob_update = bob_crdt.flush(0).unwrap().unwrap();
+        bob_crdt.confirm_flush(0);
 
         alice_crdt.apply(&bob_update).unwrap();
-        {
-            let text = alice_crdt.doc().get_or_insert_text("doc");
-            let txn = alice_crdt.doc().transact();
-            assert_eq!(text.get_string(&txn), "Hello World");
-        }
+        assert_eq!(get_text(&alice_crdt), "Hello World");
 
         let mut alice2 = YrsCrdt::with_client_id(111);
         alice2.apply(&bob_update).unwrap();
         alice2.apply(&alice_update).unwrap();
-        {
-            let text = alice2.doc().get_or_insert_text("doc");
-            let txn = alice2.doc().transact();
-            assert_eq!(text.get_string(&txn), "Hello World");
-        }
+        assert_eq!(get_text(&alice2), "Hello World");
     }
 
     #[test]
@@ -502,22 +469,16 @@ mod tests {
         let mut alice = YrsCrdt::with_client_id(1);
         let mut bob = YrsCrdt::with_client_id(2);
 
-        {
-            let text = alice.doc().get_or_insert_text("doc");
-            let mut txn = alice.doc().transact_mut();
-            text.insert(&mut txn, 0, "Hello");
-        }
-        alice.mark_dirty();
-        let update = alice.flush_update().unwrap().unwrap();
+        insert_text(&alice, 0, "Hello");
+        let update = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
 
         let msg: CrdtMessage = postcard::from_bytes(&update).unwrap();
         assert!(msg.doc_update.is_some());
         assert_eq!(msg.awareness.client_id, 1);
 
         bob.apply(&update).unwrap();
-        let text = bob.doc().get_or_insert_text("doc");
-        let txn = bob.doc().transact();
-        assert_eq!(text.get_string(&txn), "Hello");
+        assert_eq!(get_text(&bob), "Hello");
     }
 
     #[test]
@@ -526,7 +487,8 @@ mod tests {
         let mut bob = YrsCrdt::with_client_id(2);
 
         alice.set_cursor(5, 5);
-        let awareness_msg = alice.flush_update().unwrap().unwrap();
+        let awareness_msg = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
 
         let msg: CrdtMessage = postcard::from_bytes(&awareness_msg).unwrap();
         assert!(msg.doc_update.is_none());
@@ -544,12 +506,14 @@ mod tests {
         let mut bob = YrsCrdt::with_client_id(2);
 
         alice.set_cursor(0, 0);
-        let msg1 = alice.flush_update().unwrap().unwrap();
+        let msg1 = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
         bob.apply(&msg1).unwrap();
         assert!(bob.awareness_states().get(&1).unwrap().cursor.is_some());
 
         alice.clear_local_state();
-        let msg2 = alice.flush_update().unwrap().unwrap();
+        let msg2 = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
         bob.apply(&msg2).unwrap();
         assert!(bob.awareness_states().get(&1).unwrap().cursor.is_none());
     }
@@ -558,75 +522,27 @@ mod tests {
     fn test_flush_returns_combined_then_none() {
         let mut crdt = YrsCrdt::with_client_id(1);
 
-        {
-            let text = crdt.doc().get_or_insert_text("doc");
-            let mut txn = crdt.doc().transact_mut();
-            text.insert(&mut txn, 0, "hi");
-        }
-        crdt.mark_dirty();
+        insert_text(&crdt, 0, "hi");
         crdt.set_cursor(2, 2);
 
-        let first = crdt.flush_update().unwrap().unwrap();
+        let first = crdt.flush(0).unwrap().unwrap();
+        crdt.confirm_flush(0);
         let msg: CrdtMessage = postcard::from_bytes(&first).unwrap();
         assert!(msg.doc_update.is_some());
         assert_eq!(msg.awareness.cursor, Some(2));
 
-        assert!(crdt.flush_update().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_awareness_excluded_from_compaction() {
-        let mut alice = YrsCrdt::with_client_id(1);
-
-        {
-            let text = alice.doc().get_or_insert_text("doc");
-            let mut txn = alice.doc().transact_mut();
-            text.insert(&mut txn, 0, "Hello");
-        }
-        alice.mark_dirty();
-        alice.set_cursor(5, 5);
-        let update = alice.flush_update().unwrap().unwrap();
-
-        let mut temp = YrsCrdt::with_client_id(0);
-        temp.apply(&update).unwrap();
-        assert!(temp.awareness_states().contains_key(&1));
-
-        let compacted = temp.wire_snapshot().unwrap();
-
-        let mut fresh = YrsCrdt::with_client_id(99);
-        fresh.apply(&compacted).unwrap();
-        // wire_snapshot carries temp's awareness (client 0), not alice's
-        assert!(!fresh.awareness_states().contains_key(&1));
-
-        let text = fresh.doc().get_or_insert_text("doc");
-        let txn = fresh.doc().transact();
-        assert_eq!(text.get_string(&txn), "Hello");
-    }
-
-    #[test]
-    fn test_wire_snapshot_is_postcard() {
-        let crdt = YrsCrdt::with_client_id(1);
-        let wire = crdt.wire_snapshot().unwrap();
-        let msg: CrdtMessage = postcard::from_bytes(&wire).unwrap();
-        assert!(msg.doc_update.is_some());
-        assert_eq!(msg.awareness.client_id, 1);
+        assert!(crdt.flush(0).unwrap().is_none());
     }
 
     #[test]
     fn test_merge_takes_raw_bytes() {
         let crdt1 = YrsCrdt::with_client_id(1);
-        {
-            let text = crdt1.doc().get_or_insert_text("doc");
-            let mut txn = crdt1.doc().transact_mut();
-            text.insert(&mut txn, 0, "raw");
-        }
+        insert_text(&crdt1, 0, "raw");
         let raw = crdt1.snapshot().unwrap();
 
         let mut crdt2 = YrsCrdt::with_client_id(2);
         crdt2.merge(&raw).unwrap();
-        let text = crdt2.doc().get_or_insert_text("doc");
-        let txn = crdt2.doc().transact();
-        assert_eq!(text.get_string(&txn), "raw");
+        assert_eq!(get_text(&crdt2), "raw");
     }
 
     #[test]
@@ -635,14 +551,133 @@ mod tests {
         assert!(crdt.apply(&[0x42, 0x00]).is_err());
     }
 
+    #[test]
+    fn test_flush_noop_when_no_changes() {
+        let mut crdt = YrsCrdt::with_client_id(1);
+        assert!(crdt.flush(0).unwrap().is_none());
+        assert!(crdt.flush(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_retry_no_new_edits() {
+        let mut alice = YrsCrdt::with_client_id(1);
+        let mut bob = YrsCrdt::with_client_id(2);
+
+        insert_text(&alice, 0, "hello");
+
+        let _lost = alice.flush(0).unwrap().unwrap();
+        // Don't confirm — simulating send failure
+
+        let retry = alice.flush(0).unwrap().unwrap();
+        bob.apply(&retry).unwrap();
+        assert_eq!(get_text(&bob), "hello");
+    }
+
+    #[test]
+    fn test_retry_with_new_edits() {
+        let mut alice = YrsCrdt::with_client_id(1);
+        let mut bob = YrsCrdt::with_client_id(2);
+
+        insert_text(&alice, 0, "hello");
+        let _lost = alice.flush(0).unwrap().unwrap();
+
+        insert_text(&alice, 5, " world");
+        let retry = alice.flush(0).unwrap().unwrap();
+
+        bob.apply(&retry).unwrap();
+        assert_eq!(get_text(&bob), "hello world");
+    }
+
+    #[test]
+    fn test_batching() {
+        let mut alice = YrsCrdt::with_client_id(1);
+        let mut bob = YrsCrdt::with_client_id(2);
+
+        insert_text(&alice, 0, "hello");
+        let first = alice.flush(0).unwrap().unwrap();
+        bob.apply(&first).unwrap();
+        alice.confirm_flush(0);
+
+        insert_text(&alice, 5, " world");
+        let second = alice.flush(0).unwrap().unwrap();
+        bob.apply(&second).unwrap();
+        alice.confirm_flush(0);
+
+        assert_eq!(get_text(&bob), "hello world");
+    }
+
+    #[test]
+    fn test_incremental_compaction() {
+        let mut alice = YrsCrdt::with_client_id(1);
+
+        insert_text(&alice, 0, &"a".repeat(1000));
+        let l1_first = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        insert_text(&alice, 1000, "b");
+        let l1_second = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        assert!(
+            l1_second.len() < l1_first.len(),
+            "second compaction should be smaller (incremental, not full snapshot)"
+        );
+
+        // Both together reconstruct full state
+        let mut full = YrsCrdt::with_client_id(2);
+        full.apply(&l1_first).unwrap();
+        full.apply(&l1_second).unwrap();
+        assert_eq!(get_text(&full), get_text(&alice));
+
+        // Order doesn't matter (yrs resolves pending items)
+        let mut reversed = YrsCrdt::with_client_id(3);
+        reversed.apply(&l1_second).unwrap();
+        reversed.apply(&l1_first).unwrap();
+        assert_eq!(get_text(&reversed), get_text(&alice));
+    }
+
+    #[test]
+    fn test_l0_and_l1_independent() {
+        let mut alice = YrsCrdt::with_client_id(1);
+
+        insert_text(&alice, 0, "hello");
+        let _l0 = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
+
+        insert_text(&alice, 5, " world");
+        let _l0 = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
+
+        // L1 hasn't been flushed yet, so it covers everything
+        let l1 = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        let mut bob = YrsCrdt::with_client_id(2);
+        bob.apply(&l1).unwrap();
+        assert_eq!(get_text(&bob), "hello world");
+    }
+
+    #[test]
+    fn test_compaction_at_level_includes_awareness() {
+        let mut alice = YrsCrdt::with_client_id(1);
+        insert_text(&alice, 0, "Hello");
+        alice.set_cursor(5, 5);
+
+        let update = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        let msg: CrdtMessage = postcard::from_bytes(&update).unwrap();
+        assert!(msg.doc_update.is_some());
+        assert_eq!(msg.awareness.client_id, 1);
+        assert_eq!(msg.awareness.cursor, Some(5));
+
+        let mut bob = YrsCrdt::with_client_id(2);
+        bob.apply(&update).unwrap();
+        assert_eq!(get_text(&bob), "Hello");
+    }
+
     /// yrs 0.25: V2 delete markers silently truncate the *referenced item's*
-    /// client ID to 32 bits. Inserts, full-state diffs, and the deleting
-    /// client's own ID are all fine — only the delete target reference breaks.
-    ///
-    /// - Items created by a >32-bit client can be inserted and synced correctly.
-    /// - Deleting those items produces a diff that decodes without error but
-    ///   silently refers to the wrong (truncated) client ID, so the delete
-    ///   is a no-op on the receiving peer.
+    /// client ID to 32 bits.
     ///
     /// Workaround: mask `as_client_id()` to 32 bits (`& 0xFFFF_FFFF`).
     #[test]
@@ -650,7 +685,6 @@ mod tests {
         let large_cid: u64 = 0x0000_0001_CAFE_BABE; // 33 bits
         let small_cid: u64 = 42;
 
-        // Insert with large CID works
         let doc = Doc::with_client_id(large_cid);
         let t = doc.get_or_insert_text("doc");
         t.insert(&mut doc.transact_mut(), 0, "Hello");
@@ -666,22 +700,17 @@ mod tests {
             "insert with large CID should work"
         );
 
-        // Delete of items created by large CID: diff decodes but delete is no-op
         let sv = doc.transact().state_vector();
         t.remove_range(&mut doc.transact_mut(), 0, 5);
         let del = doc.transact().encode_diff_v2(&sv);
-        // Decodes successfully — no error
         let del_update = Update::decode_v2(&del).unwrap();
         doc2.transact_mut().apply_update(del_update).unwrap();
-        // BUG: delete silently failed — text is still "Hello"
         assert_eq!(
             doc2.get_or_insert_text("doc").get_string(&doc2.transact()),
             "Hello",
             "yrs bug: delete of >32-bit CID items is silently ignored"
         );
 
-        // When a small-CID client deletes items created by a large-CID client,
-        // the same bug occurs: the delete target reference is truncated.
         let bob = Doc::with_client_id(small_cid);
         bob.get_or_insert_text("doc");
         bob.transact_mut()
@@ -709,7 +738,6 @@ mod tests {
             "yrs bug: small-CID client deleting large-CID items also silently fails"
         );
 
-        // Sanity: 32-bit CID deletes work correctly
         let doc32 = Doc::with_client_id(0xCAFE_BABE);
         let t32 = doc32.get_or_insert_text("doc");
         t32.insert(&mut doc32.transact_mut(), 0, "Hello");

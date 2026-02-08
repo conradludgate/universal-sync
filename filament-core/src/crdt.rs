@@ -1,7 +1,7 @@
 //! CRDT integration for MLS groups.
 //!
-//! Operations are sent as application messages, snapshots are included in
-//! Welcome messages for new members.
+//! Updates are sent as application messages. New members bootstrap via
+//! backfill from acceptors (including compaction entries).
 
 use std::fmt;
 
@@ -20,6 +20,10 @@ impl fmt::Display for CrdtError {
 impl std::error::Error for CrdtError {}
 
 /// Trait for CRDTs that can be synchronized across group members.
+///
+/// Uses a two-phase flush/confirm protocol: [`Crdt::flush`] encodes a diff
+/// but does not advance internal state until [`Crdt::confirm_flush`] is called
+/// after the send succeeds. This provides automatic retry and batching.
 pub trait Crdt: Send + Sync + 'static {
     fn protocol_name(&self) -> &str;
 
@@ -28,35 +32,24 @@ pub trait Crdt: Send + Sync + 'static {
     /// Returns [`CrdtError`] if the operation bytes cannot be decoded or applied.
     fn apply(&mut self, operation: &[u8]) -> Result<(), Report<CrdtError>>;
 
-    /// # Errors
+    /// Produce a diff at the given compaction level.
     ///
-    /// Returns [`CrdtError`] if the snapshot bytes cannot be decoded or merged.
-    fn merge(&mut self, snapshot: &[u8]) -> Result<(), Report<CrdtError>>;
-
-    /// # Errors
+    /// Level 0 is for incremental L0 updates. Higher levels are for
+    /// compaction. Returns `None` if there are no changes at this level
+    /// since the last confirmed flush.
     ///
-    /// Returns [`CrdtError`] if encoding the current state fails.
-    fn snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>>;
-
-    /// Returns `None` if there are no changes since the last flush.
+    /// The caller must call [`Crdt::confirm_flush`] after the send succeeds.
+    /// If the send fails, calling `flush` again will re-encode from the
+    /// last confirmed state, automatically including any new edits.
     ///
     /// # Errors
     ///
     /// Returns [`CrdtError`] if encoding the diff fails.
-    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>>;
+    fn flush(&mut self, level: usize) -> Result<Option<Vec<u8>>, Report<CrdtError>>;
 
-    /// Snapshot suitable for sending over the wire (may include framing).
-    ///
-    /// Defaults to [`Crdt::snapshot`]. Implementations that use prefix
-    /// framing in [`Crdt::apply`] should override this to wrap the snapshot
-    /// so that receivers can decode it via `apply()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CrdtError`] if encoding the snapshot fails.
-    fn wire_snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
-        self.snapshot()
-    }
+    /// Confirm that the last [`Crdt::flush`] at the given level was
+    /// successfully sent. Advances the internal state vector for that level.
+    fn confirm_flush(&mut self, level: usize);
 }
 
 /// Configuration for a single compaction level.
@@ -110,17 +103,11 @@ impl Crdt for NoCrdt {
         Ok(())
     }
 
-    fn merge(&mut self, _snapshot: &[u8]) -> Result<(), Report<CrdtError>> {
-        Ok(())
-    }
-
-    fn snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
-        Ok(Vec::new())
-    }
-
-    fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
+    fn flush(&mut self, _level: usize) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
         Ok(None)
     }
+
+    fn confirm_flush(&mut self, _level: usize) {}
 }
 
 #[cfg(test)]
@@ -133,20 +120,10 @@ mod tests {
 
         assert_eq!(Crdt::protocol_name(&crdt), "none");
         assert!(crdt.apply(b"anything").is_ok());
-        assert!(crdt.merge(b"anything").is_ok());
-
-        let snapshot = crdt.snapshot().unwrap();
-        assert!(snapshot.is_empty());
-
-        assert!(crdt.flush_update().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_wire_snapshot_default() {
-        let crdt = NoCrdt;
-        let wire = crdt.wire_snapshot().unwrap();
-        let snap = crdt.snapshot().unwrap();
-        assert_eq!(wire, snap);
+        assert!(crdt.flush(0).unwrap().is_none());
+        crdt.confirm_flush(0);
+        assert!(crdt.flush(1).unwrap().is_none());
+        crdt.confirm_flush(1);
     }
 
     #[test]

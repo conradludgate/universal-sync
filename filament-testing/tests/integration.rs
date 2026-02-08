@@ -787,7 +787,6 @@ async fn test_crdt_operations_sent_and_received() {
     }
 
     // Send the update
-    alice_crdt.mark_dirty();
     alice_group
         .send_update(&mut alice_crdt)
         .await
@@ -856,7 +855,6 @@ async fn test_crdt_bidirectional_message_exchange() {
         let mut txn = alice_crdt.doc().transact_mut();
         text.insert(&mut txn, 0, "Hello");
     }
-    alice_crdt.mark_dirty();
     alice_group
         .send_update(&mut alice_crdt)
         .await
@@ -882,7 +880,6 @@ async fn test_crdt_bidirectional_message_exchange() {
         let mut txn = bob_crdt.doc().transact_mut();
         text.insert(&mut txn, 5, " World");
     }
-    bob_crdt.mark_dirty();
     bob_group
         .send_update(&mut bob_crdt)
         .await
@@ -937,7 +934,6 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
         let mut txn = alice_crdt.doc().transact_mut();
         text.insert(&mut txn, 0, "Initial content");
     }
-    alice_crdt.mark_dirty();
     alice_group
         .send_update(&mut alice_crdt)
         .await
@@ -959,7 +955,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1007,7 +1003,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1050,7 +1046,6 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
         let mut txn = alice_crdt.doc().transact_mut();
         text.insert(&mut txn, 15, " + update");
     }
-    alice_crdt.mark_dirty();
     alice_group
         .send_update(&mut alice_crdt)
         .await
@@ -1094,7 +1089,6 @@ async fn yrs_insert_and_send(
         let mut txn = crdt.doc().transact_mut();
         text_ref.insert(&mut txn, position, text);
     }
-    crdt.mark_dirty();
     group.send_update(crdt).await.expect("send update");
 }
 
@@ -1176,7 +1170,7 @@ fn test_compaction_config(threshold: u32) -> Vec<CompactionLevel> {
 #[allow(dead_code)]
 async fn drive_compaction(
     group: &mut filament_weave::Weaver,
-    crdt: &impl filament_core::Crdt,
+    crdt: &mut impl filament_core::Crdt,
     events: &mut tokio::sync::broadcast::Receiver<WeaverEvent>,
 ) {
     while let Ok(event) = events.try_recv() {
@@ -1237,7 +1231,7 @@ async fn test_welcome_force_compaction_verified() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1306,7 +1300,7 @@ async fn test_welcome_after_threshold_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1339,7 +1333,7 @@ async fn test_welcome_after_threshold_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1411,7 +1405,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1445,7 +1439,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1509,7 +1503,7 @@ async fn test_post_compaction_bidirectional() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1589,7 +1583,7 @@ async fn test_welcome_force_compaction_empty() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1677,7 +1671,7 @@ async fn test_compaction_threshold_boundary() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1735,7 +1729,7 @@ async fn test_multiple_compaction_rounds() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1764,7 +1758,7 @@ async fn test_multiple_compaction_rounds() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1792,7 +1786,7 @@ async fn test_multiple_compaction_rounds() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1852,7 +1846,7 @@ async fn test_compaction_deletion_late_joiner() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1881,7 +1875,7 @@ async fn test_compaction_deletion_late_joiner() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1939,7 +1933,7 @@ async fn test_concurrent_writers_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -1970,7 +1964,7 @@ async fn test_concurrent_writers_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2000,7 +1994,10 @@ async fn test_concurrent_writers_compaction() {
     )
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        bob_group.compact(&bob_crdt, level).await.expect("compact");
+        bob_group
+            .compact(&mut bob_crdt, level)
+            .await
+            .expect("compact");
     }
 
     // Wait for Bob's compaction
@@ -2035,7 +2032,7 @@ async fn test_concurrent_writers_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2101,7 +2098,7 @@ async fn test_key_update_then_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2129,7 +2126,7 @@ async fn test_key_update_then_compaction() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2239,7 +2236,7 @@ async fn test_compaction_after_member_removal() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2277,7 +2274,7 @@ async fn test_compaction_after_member_removal() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = compaction_event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2305,7 +2302,7 @@ async fn test_compaction_after_member_removal() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2451,7 +2448,7 @@ async fn test_multi_acceptor_message_delivery() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }
@@ -2512,7 +2509,7 @@ async fn test_empty_snapshot_join() {
     .await;
     if let WeaverEvent::CompactionNeeded { level } = event {
         alice_group
-            .compact(&alice_crdt, level)
+            .compact(&mut alice_crdt, level)
             .await
             .expect("compact");
     }

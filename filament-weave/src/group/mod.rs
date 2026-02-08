@@ -579,30 +579,36 @@ impl Weaver {
 
     /// Flush local CRDT changes and broadcast. No-op if no pending changes.
     ///
+    /// Uses a two-phase protocol: the CRDT's internal state vector is only
+    /// advanced after the send succeeds. If the send fails, the next call
+    /// will re-encode from the last confirmed state, automatically including
+    /// any new edits (batching).
+    ///
     /// # Errors
     ///
     /// Returns [`WeaverError`] if flushing the CRDT or sending the message fails.
     pub async fn send_update(&mut self, crdt: &mut impl Crdt) -> Result<(), Report<WeaverError>> {
-        loop {
-            let update = crdt.flush_update().change_context(WeaverError)?;
+        let update = crdt.flush(0).change_context(WeaverError)?;
 
-            let Some(data) = update else {
-                return Ok(());
-            };
+        let Some(data) = update else {
+            return Ok(());
+        };
 
-            let (reply_tx, reply_rx) = oneshot::channel();
-            self.request_tx
-                .send(GroupRequest::SendMessage {
-                    data,
-                    reply: reply_tx,
-                })
-                .await
-                .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::SendMessage {
+                data,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
 
-            reply_rx
-                .await
-                .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
-        }
+        reply_rx
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+
+        crdt.confirm_flush(0);
+        Ok(())
     }
 
     /// Non-blocking: drain and apply pending CRDT updates. Returns `true` if any applied.
@@ -628,18 +634,28 @@ impl Weaver {
         Some(())
     }
 
-    /// Snapshot the caller's CRDT and send it to the actor for encryption,
-    /// distribution to acceptors, and `CompactionComplete` consensus.
+    /// Flush the CRDT at the given compaction level and send the resulting
+    /// snapshot to acceptors for encryption, distribution, and
+    /// `CompactionComplete` consensus.
+    ///
+    /// Unlike [`Weaver::send_update`], compaction does **not** confirm the
+    /// flush. This means each compaction always produces a full snapshot
+    /// (from `StateVector::default()`), which is needed for re-encryption
+    /// when new members join.
     ///
     /// # Errors
     ///
-    /// Returns [`WeaverError`] if snapshotting, encryption, or consensus fails.
+    /// Returns [`WeaverError`] if flushing, encryption, or consensus fails.
     pub async fn compact(
         &mut self,
-        crdt: &impl Crdt,
+        crdt: &mut impl Crdt,
         level: u8,
     ) -> Result<(), Report<WeaverError>> {
-        let snapshot = bytes::Bytes::from(crdt.wire_snapshot().change_context(WeaverError)?);
+        let data = crdt.flush(usize::from(level)).change_context(WeaverError)?;
+        let Some(data) = data else {
+            return Ok(());
+        };
+        let snapshot = bytes::Bytes::from(data);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::CompactSnapshot {
@@ -652,7 +668,9 @@ impl Weaver {
 
         reply_rx
             .await
-            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
+            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+
+        Ok(())
     }
 
     /// Proposes adding a spool via consensus, then registers the group with it.
