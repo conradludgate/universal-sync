@@ -295,3 +295,42 @@ where
         tracing::debug!(?group_id, "spawned learning actor");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_error_display() {
+        let err = RegistryError;
+        assert_eq!(err.to_string(), "registry operation failed");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn group_epoch_watcher_new_and_notify() {
+        let watcher = GroupEpochWatcher::new(Epoch(0));
+        assert_eq!(*watcher.rx.borrow(), Epoch(0));
+
+        watcher.notify(Epoch(5));
+        assert_eq!(*watcher.rx.borrow(), Epoch(5));
+
+        watcher.notify(Epoch(10));
+        assert_eq!(*watcher.rx.borrow(), Epoch(10));
+    }
+
+    fn extract_acceptors(extensions: &ExtensionList) -> Vec<EndpointAddr> {
+        extensions
+            .get_as::<GroupInfoExt>()
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |info| info.acceptors)
+    }
+
+    #[test]
+    fn extract_acceptors_empty_extensions() {
+        let empty = ExtensionList::default();
+        let addrs = extract_acceptors(&empty);
+        assert!(addrs.is_empty());
+    }
+}

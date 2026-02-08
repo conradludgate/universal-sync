@@ -285,4 +285,77 @@ mod tests {
         let seq = storage.get_message_seq(&[1u8; 32]).unwrap();
         assert_eq!(seq, None);
     }
+
+    #[test]
+    fn parse_epoch_wrong_length() {
+        assert!(FjallGroupStateStorage::parse_epoch(&[], 0).is_none());
+        assert!(FjallGroupStateStorage::parse_epoch(&[1; 4], 0).is_none());
+        assert!(FjallGroupStateStorage::parse_epoch(&[1; 10], 4).is_none());
+    }
+
+    #[test]
+    fn parse_epoch_valid() {
+        let group_id = b"grp";
+        let mut key = group_id.to_vec();
+        key.extend_from_slice(&42u64.to_be_bytes());
+        let epoch = FjallGroupStateStorage::parse_epoch(&key, group_id.len());
+        assert_eq!(epoch, Some(42));
+    }
+
+    #[tokio::test]
+    async fn max_epoch_id_empty() {
+        let dir = TempDir::new().unwrap();
+        let storage = FjallGroupStateStorage::open(dir.path()).await.unwrap();
+        let max = storage.max_epoch_id(b"nonexistent").unwrap();
+        assert_eq!(max, None);
+    }
+
+    #[tokio::test]
+    async fn get_message_seq_invalid_length() {
+        let dir = TempDir::new().unwrap();
+        let storage = FjallGroupStateStorage::open(dir.path()).await.unwrap();
+        let key = FjallGroupStateStorage::message_seq_key(b"grp");
+        storage.inner.proposer_meta.insert(key, [1, 2, 3]).unwrap();
+        let seq = storage.get_message_seq(b"grp").unwrap();
+        assert_eq!(seq, None);
+    }
+
+    #[tokio::test]
+    async fn epoch_update_in_write() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = FjallGroupStateStorage::open(dir.path()).await.unwrap();
+        let group_id = b"test-group";
+
+        let state = GroupState {
+            id: group_id.to_vec(),
+            data: Zeroizing::new(vec![1]),
+        };
+        let inserts = vec![EpochRecord::new(1, Zeroizing::new(b"e1".to_vec()))];
+        storage.write(state, inserts, vec![]).unwrap();
+
+        let state = GroupState {
+            id: group_id.to_vec(),
+            data: Zeroizing::new(vec![2]),
+        };
+        let updates = vec![EpochRecord::new(1, Zeroizing::new(b"e1-updated".to_vec()))];
+        storage.write(state, vec![], updates).unwrap();
+
+        let loaded = storage.epoch(group_id, 1).unwrap().unwrap();
+        assert_eq!(&*loaded, b"e1-updated");
+    }
+
+    #[test]
+    fn group_state_error_display() {
+        let err = GroupStateError;
+        assert_eq!(err.to_string(), "group state storage error");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn group_state_error_into_any() {
+        use mls_rs_core::error::IntoAnyError;
+        let err = GroupStateError;
+        let dyn_err = err.into_dyn_error().unwrap();
+        assert_eq!(dyn_err.to_string(), "group state storage error");
+    }
 }

@@ -417,3 +417,206 @@ where
         self.store_snapshot(epoch);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use filament_warp::Learner;
+    use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+    use mls_rs::{CipherSuite, CryptoProvider, ExtensionList};
+    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+    use super::*;
+
+    fn make_external_client() -> mls_rs::external_client::ExternalClient<impl ExternalMlsConfig> {
+        let crypto = RustCryptoProvider::default();
+        mls_rs::external_client::ExternalClient::builder()
+            .crypto_provider(crypto)
+            .identity_provider(BasicIdentityProvider::new())
+            .extension_type(filament_core::SYNC_EXTENSION_TYPE)
+            .custom_proposal_types(Some(filament_core::SYNC_PROPOSAL_TYPE))
+            .build()
+    }
+
+    fn make_cipher_suite() -> impl CipherSuiteProvider + Clone {
+        let crypto = RustCryptoProvider::default();
+        crypto
+            .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+            .unwrap()
+    }
+
+    fn make_group_info_and_sk() -> (Vec<u8>, SecretKey) {
+        let crypto = RustCryptoProvider::default();
+        let cs = crypto
+            .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+            .unwrap();
+        let (secret_key, public_key) = cs.signature_key_generate().unwrap();
+        let credential = BasicCredential::new(b"test-member".to_vec());
+        let signing_identity =
+            mls_rs::identity::SigningIdentity::new(credential.into_credential(), public_key);
+
+        let client = mls_rs::Client::builder()
+            .crypto_provider(crypto)
+            .identity_provider(BasicIdentityProvider::new())
+            .extension_type(filament_core::SYNC_EXTENSION_TYPE)
+            .custom_proposal_types(Some(filament_core::SYNC_PROPOSAL_TYPE))
+            .signing_identity(
+                signing_identity,
+                secret_key.clone(),
+                CipherSuite::CURVE25519_AES128,
+            )
+            .build();
+
+        let group = client
+            .create_group(ExtensionList::default(), ExtensionList::default(), None)
+            .unwrap();
+        let group_info = group.group_info_message(true).unwrap().to_bytes().unwrap();
+
+        let sk = SecretKey::from_bytes(&secret_key.as_ref()[..32].try_into().unwrap());
+        (group_info, sk)
+    }
+
+    fn make_acceptor() -> (
+        GroupAcceptor<impl ExternalMlsConfig, impl CipherSuiteProvider + Clone>,
+        SecretKey,
+    ) {
+        let external_client = make_external_client();
+        let cs = make_cipher_suite();
+        let (group_info_bytes, sk) = make_group_info_and_sk();
+
+        let mls_message = mls_rs::MlsMessage::from_bytes(&group_info_bytes).unwrap();
+        let external_group = external_client
+            .observe_group(mls_message, None, None)
+            .unwrap();
+
+        let acceptor_sk = SecretKey::generate(&mut rand::rng());
+        let acceptor_addr = EndpointAddr::new(acceptor_sk.public());
+
+        let acceptor =
+            GroupAcceptor::new(external_group, cs, acceptor_sk.clone(), vec![acceptor_addr]);
+
+        (acceptor, sk)
+    }
+
+    #[test]
+    fn acceptor_error_display() {
+        let err = AcceptorError;
+        assert_eq!(err.to_string(), "acceptor operation failed");
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn acceptor_change_event_debug() {
+        let id = AcceptorId::from_bytes([1u8; 32]);
+        let event = AcceptorChangeEvent::Added { id };
+        let _ = format!("{event:?}");
+
+        let event2 = event.clone();
+        assert!(matches!(event2, AcceptorChangeEvent::Added { .. }));
+    }
+
+    #[test]
+    fn node_id_is_max() {
+        let (acceptor, _) = make_acceptor();
+        assert_eq!(acceptor.node_id(), MemberId(u32::MAX));
+    }
+
+    #[test]
+    fn current_round_returns_epoch() {
+        let (acceptor, _) = make_acceptor();
+        let round = acceptor.current_round();
+        assert_eq!(round, Epoch(0));
+    }
+
+    #[test]
+    fn acceptors_returns_known_ids() {
+        let (acceptor, _) = make_acceptor();
+        let ids: Vec<_> = acceptor.acceptors().into_iter().collect();
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn validate_sync_proposal_unknown_acceptor() {
+        let (acceptor, _) = make_acceptor();
+
+        let unknown_key = SecretKey::generate(&mut rand::rng());
+        let unsigned = UnsignedProposal::new(
+            MemberId(u32::MAX),
+            Epoch(0),
+            Attempt(0),
+            *unknown_key.public().as_bytes(),
+        );
+        let data = unsigned.to_bytes();
+        let signature = unknown_key.sign(&data);
+        let proposal = unsigned.with_signature(signature.to_bytes().to_vec());
+
+        let result = acceptor.validate(&proposal);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_sync_proposal_invalid_signature_length() {
+        let (acceptor, _) = make_acceptor();
+
+        let acceptor_id = acceptor.acceptors().into_iter().next().unwrap();
+        let addr = acceptor.acceptors.get(&acceptor_id).unwrap();
+
+        let unsigned = UnsignedProposal::new(
+            MemberId(u32::MAX),
+            Epoch(0),
+            Attempt(0),
+            *addr.id.as_bytes(),
+        );
+        let proposal = unsigned.with_signature(vec![1, 2, 3]);
+
+        let result = acceptor.validate(&proposal);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_sync_proposal_success() {
+        let (acceptor, _) = make_acceptor();
+
+        let proposal = acceptor.propose(Attempt(0));
+        let result = acceptor.validate(&proposal);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_member_proposal_unknown_member() {
+        let (acceptor, _) = make_acceptor();
+
+        let unsigned = UnsignedProposal::new(MemberId(999), Epoch(0), Attempt(0), [0u8; 32]);
+        let proposal = unsigned.with_signature(vec![0; 64]);
+
+        let result = acceptor.validate(&proposal);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_member_proposal_past_epoch() {
+        let (acceptor, _) = make_acceptor();
+
+        let unsigned = UnsignedProposal::new(MemberId(0), Epoch(100), Attempt(0), [0u8; 32]);
+        let proposal = unsigned.with_signature(vec![0; 64]);
+
+        let result = acceptor.validate(&proposal);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_known_acceptor_yes_and_no() {
+        let (acceptor, _) = make_acceptor();
+        let known_id = acceptor.acceptors().into_iter().next().unwrap();
+        assert!(acceptor.is_known_acceptor(&known_id));
+
+        let unknown_id = AcceptorId::from_bytes([0xFF; 32]);
+        assert!(!acceptor.is_known_acceptor(&unknown_id));
+    }
+
+    #[test]
+    fn store_snapshot_no_state_store() {
+        let (acceptor, _) = make_acceptor();
+        assert!(acceptor.state_store.is_none());
+        acceptor.store_snapshot(Epoch(0));
+    }
+}

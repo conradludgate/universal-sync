@@ -1258,6 +1258,55 @@ mod tests {
     }
 
     #[test]
+    fn decode_slim_accepted_invalid_bytes() {
+        assert!(FjallStateStore::decode_slim_accepted(&[], Epoch(0)).is_none());
+        assert!(FjallStateStore::decode_slim_accepted(b"garbage", Epoch(0)).is_none());
+
+        let versioned_garbage = storage_versioned_encode(1, b"not valid postcard");
+        assert!(FjallStateStore::decode_slim_accepted(&versioned_garbage, Epoch(0)).is_none());
+    }
+
+    #[test]
+    fn message_id_from_key_too_short() {
+        let gid = GroupId::new([0u8; 32]);
+        assert!(FjallStateStore::message_id_from_key(&gid, &[]).is_none());
+        assert!(FjallStateStore::message_id_from_key(&gid, &[1; 15]).is_none());
+    }
+
+    #[test]
+    fn disk_space_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let gid = GroupId::new([0xDD; 32]);
+
+        store
+            .store_snapshot_sync(&gid, Epoch(0), b"some snapshot data")
+            .unwrap();
+        let ks = store.get_keyspaces(&gid);
+        let _sizes = ks.disk_space();
+    }
+
+    #[test]
+    fn parse_epoch_from_key_wrong_length() {
+        assert!(FjallStateStore::parse_epoch_from_key(&[]).is_none());
+        assert!(FjallStateStore::parse_epoch_from_key(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn deserialize_proposal_invalid() {
+        assert!(FjallStateStore::deserialize_proposal(&[]).is_none());
+        assert!(FjallStateStore::deserialize_proposal(b"not valid").is_none());
+        let versioned_bad = storage_versioned_encode(1, b"bad postcard");
+        assert!(FjallStateStore::deserialize_proposal(&versioned_bad).is_none());
+    }
+
+    #[test]
+    fn deserialize_app_message_invalid() {
+        assert!(FjallStateStore::deserialize_app_message(&[]).is_none());
+        assert!(FjallStateStore::deserialize_app_message(b"nope").is_none());
+    }
+
+    #[test]
     fn group_state_store_wrappers() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_test_store(dir.path());

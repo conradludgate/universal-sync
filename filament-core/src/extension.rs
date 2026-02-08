@@ -667,4 +667,17 @@ mod tests {
         use crate::codec::Versioned;
         assert!(SyncProposal::deserialize_versioned(99, &[0]).is_err());
     }
+
+    #[test]
+    fn read_protocol_version_short_input() {
+        assert!(super::read_protocol_version(&[]).is_err());
+        assert!(super::read_protocol_version(&[1]).is_err());
+        assert!(super::read_protocol_version(&[1, 2]).is_err());
+        assert!(super::read_protocol_version(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn group_context_ext_decode_short_input() {
+        assert!(GroupContextExt::mls_decode(&mut [1u8, 2].as_slice()).is_err());
+    }
 }

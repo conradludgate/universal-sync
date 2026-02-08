@@ -142,6 +142,14 @@ mod tests {
     }
 
     #[test]
+    fn test_wire_snapshot_default() {
+        let crdt = NoCrdt;
+        let wire = crdt.wire_snapshot().unwrap();
+        let snap = crdt.snapshot().unwrap();
+        assert_eq!(wire, snap);
+    }
+
+    #[test]
     fn test_compaction_config_default() {
         let config = default_compaction_config();
         assert_eq!(config.len(), 3);
