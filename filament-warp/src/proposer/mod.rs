@@ -426,7 +426,7 @@ mod tests {
         };
         let message = TestMessage("hello".into());
 
-        proposer.propose(&learner, 0, message.clone());
+        let _ = proposer.propose(&learner, 0, message.clone());
 
         // Promise succeeds → moves to accept phase
         let promise_response = AcceptorMessage {
@@ -476,7 +476,7 @@ mod tests {
         };
         let message = TestMessage("hello".into());
 
-        proposer.propose(&learner, 0, message.clone());
+        let _ = proposer.propose(&learner, 0, message.clone());
 
         // Promise
         let r = proposer.receive(
