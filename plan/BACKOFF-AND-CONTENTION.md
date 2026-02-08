@@ -43,7 +43,7 @@ sleep(10ms * (retries + 1))
 
 ## Current Design
 
-Location: `sync-proposer/src/group/group_actor.rs`
+Location: `filament-weave/src/group/group_actor.rs`
 
 ### Backoff Function
 

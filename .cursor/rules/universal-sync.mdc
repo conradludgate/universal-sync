@@ -1,15 +1,16 @@
-# Universal Sync Code Standards
+# Filament Code Standards
 
-Code quality standards for the Universal Sync project - a federated sync engine using MLS, Paxos, iroh, and CRDTs.
+Code quality standards for the Filament project - a federated sync engine using MLS, Paxos, iroh, and CRDTs.
 
 ## Architecture
 
 ```
-paxos/           - Core Paxos consensus library (generic traits)
-sync-core/       - Shared types (GroupProposal, Handshake, utilities)
-sync-proposer/   - Client/device library (Group, GroupLearner, actors)
-sync-acceptor/   - Server/federation library (GroupAcceptor, registry)
-sync-testing/    - Integration tests
+filament-warp/    - Core Paxos consensus library (generic traits)
+filament-core/    - Shared types (GroupProposal, Handshake, utilities)
+filament-weave/   - Client/device library (Group, GroupLearner, actors)
+filament-spool/   - Server/federation library (GroupAcceptor, registry)
+filament-testing/  - Integration tests
+filament-editor/   - Tauri desktop editor application
 ```
 
 ## Error Handling
@@ -47,7 +48,7 @@ let data = foo().map_err(|e| Report::new(GroupError).attach(format!("{e:?}")))?;
 
 - `.attach("static context")` for simple string context
 - `.attach_lazy(|| format!("dynamic: {x}"))` for formatted context (avoids allocation on success)
-- `.attach(OperationContext::CREATING_GROUP)` for structured context types from `sync-core/error.rs`
+- `.attach(OperationContext::CREATING_GROUP)` for structured context types from `filament-core/error.rs`
 
 ```rust
 // GOOD: lazy formatting
@@ -92,7 +93,7 @@ Use native async-fn-in-trait (no `#[async_trait]` macro).
 - Include `# Example` for complex APIs
 
 ### Shared Utilities
-Put cross-crate utilities in `sync-core` (e.g., `load_secret_key` in `util.rs`).
+Put cross-crate utilities in `filament-core` (e.g., `load_secret_key` in `util.rs`).
 
 ## Testing
 

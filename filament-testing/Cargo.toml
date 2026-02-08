@@ -1,0 +1,22 @@
+[package]
+name = "filament-testing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+filament-core = { path = "../filament-core" }
+filament-weave = { path = "../filament-weave" }
+filament-spool = { path = "../filament-spool" }
+filament-warp = { path = "../filament-warp" }
+mls-rs = { workspace = true, features = ["prior_epoch"] }
+mls-rs-crypto-rustcrypto.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+yrs.workspace = true
+bs58.workspace = true
+postcard.workspace = true
+serde.workspace = true
+error-stack.workspace = true

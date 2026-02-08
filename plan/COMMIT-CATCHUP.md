@@ -64,7 +64,7 @@ and constructs the struct-variant handshake.
 `handle_proposal_stream()` accepts `since_epoch: Epoch` and passes it to
 `run_acceptor_with_epoch_waiter()`.
 
-The acceptor runner (`paxos/src/acceptor/runner.rs`) accepts
+The acceptor runner (`filament-warp/src/acceptor/runner.rs`) accepts
 `since_round: RoundId` and uses it for the initial subscription:
 
 ```rust
@@ -76,14 +76,14 @@ the proposer's known epoch, avoiding resend of already-processed commits.
 
 #### Acceptor-to-Acceptor Learning
 
-`sync-acceptor/src/learner.rs` also uses the struct-variant handshake,
+`filament-spool/src/learner.rs` also uses the struct-variant handshake,
 passing `current_round` as `since_epoch`.
 
 ### Part B: `message_seq` Persistence
 
 #### Storage
 
-`FjallGroupStateStorage` (`sync-proposer/src/group_state.rs`) has a
+`FjallGroupStateStorage` (`filament-weave/src/group_state.rs`) has a
 `proposer_meta` keyspace:
 
 ```rust
@@ -113,16 +113,16 @@ pre-migration state). This prevents sequence number reuse after crashes.
 
 | File | Change |
 |------|--------|
-| `sync-core/src/protocol.rs` | `JoinProposals` changed from tuple to struct variant with `since_epoch` |
-| `sync-proposer/src/connection.rs` | `open_proposal_stream` accepts `since_epoch: Epoch` |
-| `sync-proposer/src/connector.rs` | `IrohConnector` stores `since_epoch: Arc<AtomicU64>` |
-| `sync-proposer/src/group/acceptor_actor.rs` | `AcceptorActor` stores `current_epoch: Epoch` |
-| `sync-proposer/src/group/group_actor.rs` | Passes `learner.mls_epoch()` when spawning `AcceptorActor` |
-| `sync-acceptor/src/server.rs` | Extracts `since_epoch`, passes to runner |
-| `sync-acceptor/src/learner.rs` | Uses `current_round` as `since_epoch` |
-| `paxos/src/acceptor/runner.rs` | `run_acceptor_with_epoch_waiter` accepts `since_round` |
-| `sync-proposer/src/group_state.rs` | `proposer_meta` keyspace with `get/set_message_seq` |
-| `sync-proposer/src/lib.rs` | Added `group_state` module |
+| `filament-core/src/protocol.rs` | `JoinProposals` changed from tuple to struct variant with `since_epoch` |
+| `filament-weave/src/connection.rs` | `open_proposal_stream` accepts `since_epoch: Epoch` |
+| `filament-weave/src/connector.rs` | `IrohConnector` stores `since_epoch: Arc<AtomicU64>` |
+| `filament-weave/src/group/acceptor_actor.rs` | `AcceptorActor` stores `current_epoch: Epoch` |
+| `filament-weave/src/group/group_actor.rs` | Passes `learner.mls_epoch()` when spawning `AcceptorActor` |
+| `filament-spool/src/server.rs` | Extracts `since_epoch`, passes to runner |
+| `filament-spool/src/learner.rs` | Uses `current_round` as `since_epoch` |
+| `filament-warp/src/acceptor/runner.rs` | `run_acceptor_with_epoch_waiter` accepts `since_round` |
+| `filament-weave/src/group_state.rs` | `proposer_meta` keyspace with `get/set_message_seq` |
+| `filament-weave/src/lib.rs` | Added `group_state` module |
 
 ### Not Yet Implemented
 

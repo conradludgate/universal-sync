@@ -1,0 +1,28 @@
+[package]
+name = "filament-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+yrs = ["dep:yrs"]
+
+[dependencies]
+filament-warp = { path = "../filament-warp" }
+mls-rs.workspace = true
+mls-rs-core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+iroh.workspace = true
+error-stack.workspace = true
+bs58.workspace = true
+sha2.workspace = true
+rand.workspace = true
+pin-project-lite.workspace = true
+tokio-util.workspace = true
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+
+# Optional CRDT implementations
+yrs = { version = "0.25", optional = true }

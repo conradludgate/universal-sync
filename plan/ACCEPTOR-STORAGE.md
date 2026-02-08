@@ -178,12 +178,12 @@ causing `LeafNodeExt.binding_id` to be missing and fingerprint mismatches.
 
 | File | Change |
 |------|--------|
-| `sync-acceptor/src/state_store.rs` | Removed `promised`, `groups`, `epoch_rosters` keyspaces. Added `snapshots`. `SlimAccepted` struct. Sentinel promised. Logarithmic pruning. |
-| `sync-acceptor/src/acceptor.rs` | `store_snapshot` / `store_initial_snapshot` using `ExternalSnapshot`. Roster lookup `>=` for future epochs. `is_fingerprint_in_roster` for message sender validation. |
-| `sync-acceptor/src/registry.rs` | `create_acceptor_from_snapshot`. `get_group` loads from snapshot + replay (from `snapshot_epoch` inclusive). Removed `check_sender_in_roster` stub. |
-| `sync-acceptor/src/server.rs` | `handle_message_request` takes `GroupAcceptor` reference for roster check. |
-| `sync-acceptor/src/main.rs` | `ExternalClient` registers `SYNC_EXTENSION_TYPE` and `SYNC_PROPOSAL_TYPE`. |
-| `sync-acceptor/Cargo.toml` | Added `sha2` dependency. |
-| `paxos/src/acceptor/runner.rs` | `handler_applied_epoch` tracking for catch-up. |
-| `paxos/src/acceptor/handler.rs` | Added `acceptor()` immutable accessor. |
-| `sync-testing/tests/integration.rs` | `test_state_store_snapshot_persistence` replacing old group persistence test. |
+| `filament-spool/src/state_store.rs` | Removed `promised`, `groups`, `epoch_rosters` keyspaces. Added `snapshots`. `SlimAccepted` struct. Sentinel promised. Logarithmic pruning. |
+| `filament-spool/src/acceptor.rs` | `store_snapshot` / `store_initial_snapshot` using `ExternalSnapshot`. Roster lookup `>=` for future epochs. `is_fingerprint_in_roster` for message sender validation. |
+| `filament-spool/src/registry.rs` | `create_acceptor_from_snapshot`. `get_group` loads from snapshot + replay (from `snapshot_epoch` inclusive). Removed `check_sender_in_roster` stub. |
+| `filament-spool/src/server.rs` | `handle_message_request` takes `GroupAcceptor` reference for roster check. |
+| `filament-spool/src/main.rs` | `ExternalClient` registers `SYNC_EXTENSION_TYPE` and `SYNC_PROPOSAL_TYPE`. |
+| `filament-spool/Cargo.toml` | Added `sha2` dependency. |
+| `filament-warp/src/acceptor/runner.rs` | `handler_applied_epoch` tracking for catch-up. |
+| `filament-warp/src/acceptor/handler.rs` | Added `acceptor()` immutable accessor. |
+| `filament-testing/tests/integration.rs` | `test_state_store_snapshot_persistence` replacing old group persistence test. |

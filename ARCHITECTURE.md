@@ -1,6 +1,6 @@
 # Architecture Details
 
-Implementation details for the universal-sync protocol. For a high-level
+Implementation details for the filament protocol. For a high-level
 overview, see [README.md](README.md).
 
 ## MLS Extensions and Proposals

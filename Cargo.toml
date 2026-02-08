@@ -1,5 +1,5 @@
 [workspace]
-members = ["paxos", "sync-core", "sync-proposer", "sync-acceptor", "sync-testing", "sync-editor"]
+members = ["filament-warp", "filament-core", "filament-weave", "filament-spool", "filament-testing", "filament-editor"]
 resolver = "3"
 
 [workspace.dependencies]

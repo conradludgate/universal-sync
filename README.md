@@ -1,4 +1,4 @@
-# universal-sync
+# filament
 
 Federated sync engine built on MLS, Paxos, iroh, and CRDTs.
 
@@ -41,12 +41,12 @@ deterministic subset of acceptors; commits go to all of them.
 
 | Crate | Role |
 |-------|------|
-| `paxos` | Core Multi-Paxos state machines (pure + async runtime) |
-| `sync-core` | Shared types, protocol messages, CRDT traits, MLS extensions |
-| `sync-proposer` | Device/client library — group management, message routing |
-| `sync-acceptor` | Server library — Paxos acceptor, message storage, backfill |
-| `sync-testing` | Integration test harness |
-| `sync-editor` | Tauri desktop editor application |
+| `filament-warp` | Core Multi-Paxos state machines (pure + async runtime) |
+| `filament-core` | Shared types, protocol messages, CRDT traits, MLS extensions |
+| `filament-weave` | Device/client library — group management, message routing |
+| `filament-spool` | Server library — Paxos acceptor, message storage, backfill |
+| `filament-testing` | Integration test harness |
+| `filament-editor` | Tauri desktop editor application |
 
 ## MLS ([Messaging Layer Security](https://en.wikipedia.org/wiki/Messaging_Layer_Security))
 
@@ -145,3 +145,15 @@ compromise message contents. Metadata (group membership, message timing and
 frequency) is visible to acceptors.
 
 Members within a group are fully trusted.
+
+## Why "Filament"?
+
+A filament is a thin, strong thread that conducts and connects. The sub-crate
+names extend the textile metaphor:
+
+- **warp** — the structural threads held taut on a loom. The Paxos consensus
+  layer provides the fixed ordering that everything else is woven around.
+- **weave** — the act of passing thread through the warp. The proposer layer
+  weaves application messages and commits through the consensus scaffold.
+- **spool** — where thread is wound for storage. The acceptor layer stores and
+  serves encrypted messages on behalf of the group.

@@ -120,7 +120,7 @@ filter (see "Security" section above). See
 ### Device: log level change
 
 Change the `warn!("sender not found in roster, dropping message")` in
-`handle_decrypted_message` (`sync-proposer/src/group/group_actor.rs`) to
+`handle_decrypted_message` (`filament-weave/src/group/group_actor.rs`) to
 `debug!`. Dropping messages from removed members is now expected behaviour,
 not a bug.
 

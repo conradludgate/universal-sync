@@ -21,7 +21,7 @@ configurable duration.
 
 ### Configuration
 
-Stored in `GroupContextExt` (`sync-core/src/extension.rs`):
+Stored in `GroupContextExt` (`filament-core/src/extension.rs`):
 
 ```rust
 pub struct GroupContextExt {
@@ -40,7 +40,7 @@ the same configuration.
 
 ### Timer Mechanism
 
-`GroupActor` (`sync-proposer/src/group/group_actor.rs`) has two fields:
+`GroupActor` (`filament-weave/src/group/group_actor.rs`) has two fields:
 
 ```rust
 last_epoch_advance: std::time::Instant,

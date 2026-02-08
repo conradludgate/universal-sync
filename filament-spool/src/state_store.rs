@@ -1,0 +1,1183 @@
+//! Persistent acceptor state store using fjall.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
+
+use filament_core::{
+    Attempt, EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint,
+    MemberId, MessageId, StateVector,
+};
+use filament_warp::acceptor::RoundState;
+use filament_warp::core::decision;
+use filament_warp::{AcceptorStateStore, Learner, Proposal};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use futures::{Stream, StreamExt, stream};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::broadcast;
+
+const STORAGE_MAGIC: [u8; 2] = [0xFF, 0xFE];
+const STORAGE_VERSION: u8 = 1;
+
+fn storage_versioned_encode(version: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + payload.len());
+    out.extend_from_slice(&STORAGE_MAGIC);
+    out.push(version);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn storage_versioned_decode(bytes: &[u8]) -> (u8, &[u8]) {
+    if bytes.len() >= 3 && bytes[..2] == STORAGE_MAGIC {
+        (bytes[2], &bytes[3..])
+    } else {
+        (1, bytes)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlimAccepted {
+    member_id: MemberId,
+    attempt: Attempt,
+    signature: Vec<u8>,
+    message: GroupMessage,
+}
+
+const PROMISED_SENTINEL_EPOCH: u64 = u64::MAX;
+
+type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
+type MessageBroadcasts =
+    RwLock<HashMap<[u8; 32], broadcast::Sender<(MessageId, EncryptedAppMessage)>>>;
+
+pub(crate) struct FjallStateStore {
+    db: Database,
+    accepted: Keyspace,
+    messages: Keyspace,
+    snapshots: Keyspace,
+    broadcasts: GroupBroadcasts,
+    message_broadcasts: MessageBroadcasts,
+}
+
+impl FjallStateStore {
+    pub(crate) async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
+        let path = path.as_ref().to_owned();
+        tokio::task::spawn_blocking(move || Self::open_sync(&path))
+            .await
+            .expect("spawn_blocking panicked")
+    }
+
+    fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
+        let db = Database::builder(path).open()?;
+
+        let opts = || {
+            KeyspaceCreateOptions::default()
+                .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+        };
+
+        let accepted = db.keyspace("accepted", opts)?;
+        let messages = db.keyspace("messages", opts)?;
+        let snapshots = db.keyspace("snapshots", opts)?;
+
+        Ok(Self {
+            db,
+            accepted,
+            messages,
+            snapshots,
+            broadcasts: RwLock::new(HashMap::new()),
+            message_broadcasts: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn build_key(group_id: &GroupId, epoch: Epoch) -> [u8; 40] {
+        let mut key = [0u8; 40];
+        key[..32].copy_from_slice(group_id.as_bytes());
+        key[32..].copy_from_slice(&epoch.0.to_be_bytes());
+        key
+    }
+
+    fn build_group_prefix(group_id: &GroupId) -> [u8; 32] {
+        *group_id.as_bytes()
+    }
+
+    fn parse_epoch_from_key(key: &[u8]) -> Option<Epoch> {
+        if key.len() < 40 {
+            return None;
+        }
+        let epoch_bytes: [u8; 8] = key[32..40].try_into().ok()?;
+        Some(Epoch(u64::from_be_bytes(epoch_bytes)))
+    }
+
+    fn serialize_proposal(proposal: &GroupProposal) -> Vec<u8> {
+        let data = postcard::to_allocvec(proposal).expect("serialization should not fail");
+        storage_versioned_encode(STORAGE_VERSION, &data)
+    }
+
+    fn deserialize_proposal(bytes: &[u8]) -> Option<GroupProposal> {
+        let (_, payload) = storage_versioned_decode(bytes);
+        postcard::from_bytes(payload).ok()
+    }
+
+    /// Message key: `group_id` (32) || `sender_fingerprint` (8) || `seq` (8) = 48 bytes.
+    fn build_message_key(group_id: &GroupId, sender: MemberFingerprint, seq: u64) -> [u8; 48] {
+        let mut key = [0u8; 48];
+        key[..32].copy_from_slice(group_id.as_bytes());
+        key[32..40].copy_from_slice(sender.as_bytes());
+        key[40..48].copy_from_slice(&seq.to_be_bytes());
+        key
+    }
+
+    fn message_id_from_key(group_id: &GroupId, key: &[u8]) -> Option<MessageId> {
+        if key.len() < 48 {
+            return None;
+        }
+        let mut fp = [0u8; 8];
+        fp.copy_from_slice(&key[32..40]);
+        let seq = u64::from_be_bytes(key[40..48].try_into().ok()?);
+        Some(MessageId {
+            group_id: *group_id,
+            sender: MemberFingerprint(fp),
+            seq,
+        })
+    }
+
+    fn serialize_app_message(msg: &EncryptedAppMessage) -> Vec<u8> {
+        let data = postcard::to_allocvec(msg).expect("serialization should not fail");
+        storage_versioned_encode(STORAGE_VERSION, &data)
+    }
+
+    fn deserialize_app_message(bytes: &[u8]) -> Option<EncryptedAppMessage> {
+        let (_, payload) = storage_versioned_decode(bytes);
+        postcard::from_bytes(payload).ok()
+    }
+
+    pub(crate) fn store_app_message(
+        &self,
+        group_id: &GroupId,
+        id: &MessageId,
+        msg: &EncryptedAppMessage,
+    ) -> Result<(), fjall::Error> {
+        let msg_key = Self::build_message_key(group_id, id.sender, id.seq);
+        let msg_bytes = Self::serialize_app_message(msg);
+        self.messages.insert(msg_key, &msg_bytes)?;
+
+        self.db.persist(PersistMode::SyncAll)?;
+
+        if let Ok(broadcasts) = self.message_broadcasts.read()
+            && let Some(tx) = broadcasts.get(group_id.as_bytes())
+        {
+            let _ = tx.send((*id, msg.clone()));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn get_messages_after(
+        &self,
+        group_id: &GroupId,
+        state_vector: &StateVector,
+    ) -> Vec<(MessageId, EncryptedAppMessage)> {
+        let prefix = Self::build_group_prefix(group_id);
+        let start_key = prefix;
+
+        let mut messages = Vec::new();
+
+        for guard in self.messages.range(start_key..) {
+            let Ok((key, value)) = guard.into_inner() else {
+                continue;
+            };
+
+            if key.len() < 32 || &key[..32] != prefix.as_slice() {
+                break;
+            }
+
+            if let Some(msg_id) = Self::message_id_from_key(group_id, &key) {
+                let covered = state_vector
+                    .get(&msg_id.sender)
+                    .is_some_and(|&hw| msg_id.seq <= hw);
+                if !covered && let Some(msg) = Self::deserialize_app_message(&value) {
+                    messages.push((msg_id, msg));
+                }
+            }
+        }
+
+        messages
+    }
+
+    pub(crate) fn delete_before_watermark(
+        &self,
+        group_id: &GroupId,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut deleted = 0;
+
+        for guard in self.messages.range(prefix..) {
+            let Ok((key, _)) = guard.into_inner() else {
+                continue;
+            };
+
+            if key.len() < 32 || &key[..32] != prefix.as_slice() {
+                break;
+            }
+
+            if let Some(msg_id) = Self::message_id_from_key(group_id, &key)
+                && watermark
+                    .get(&msg_id.sender)
+                    .is_some_and(|&hw| msg_id.seq <= hw)
+            {
+                self.messages.remove(&*key)?;
+                deleted += 1;
+            }
+        }
+
+        if deleted > 0 {
+            self.db.persist(PersistMode::SyncAll)?;
+        }
+
+        Ok(deleted)
+    }
+
+    pub(crate) fn subscribe_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
+        let mut broadcasts = self.message_broadcasts.write().unwrap();
+        let key = *group_id.as_bytes();
+
+        broadcasts
+            .entry(key)
+            .or_insert_with(|| broadcast::channel(256).0)
+            .subscribe()
+    }
+
+    fn get_promised_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<GroupProposal> {
+        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
+        self.accepted
+            .get(key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| Self::deserialize_proposal(&bytes))
+            .filter(|p| p.epoch == epoch)
+    }
+
+    fn get_accepted_sync(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+    ) -> Option<(GroupProposal, GroupMessage)> {
+        let key = Self::build_key(group_id, epoch);
+        let bytes = self.accepted.get(key).ok()??;
+        Self::decode_slim_accepted(&bytes, epoch)
+    }
+
+    fn decode_slim_accepted(bytes: &[u8], epoch: Epoch) -> Option<(GroupProposal, GroupMessage)> {
+        let (_, payload) = storage_versioned_decode(bytes);
+        let slim: SlimAccepted = postcard::from_bytes(payload).ok()?;
+
+        let message_bytes =
+            postcard::to_allocvec(&slim.message).expect("serialization should not fail");
+        let message_hash: [u8; 32] = Sha256::digest(&message_bytes).into();
+
+        let proposal = GroupProposal {
+            member_id: slim.member_id,
+            epoch,
+            attempt: slim.attempt,
+            message_hash,
+            signature: slim.signature,
+        };
+        Some((proposal, slim.message))
+    }
+
+    fn set_promised_sync(
+        &self,
+        group_id: &GroupId,
+        proposal: &GroupProposal,
+    ) -> Result<(), fjall::Error> {
+        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
+        let value = Self::serialize_proposal(proposal);
+        self.accepted.insert(key, &value)?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    fn set_accepted_sync(
+        &self,
+        group_id: &GroupId,
+        proposal: &GroupProposal,
+        message: &GroupMessage,
+    ) -> Result<(), fjall::Error> {
+        let key = Self::build_key(group_id, proposal.epoch);
+
+        let slim = SlimAccepted {
+            member_id: proposal.member_id,
+            attempt: proposal.attempt,
+            signature: proposal.signature.clone(),
+            message: message.clone(),
+        };
+        let data = postcard::to_allocvec(&slim).expect("serialization should not fail");
+        let value = storage_versioned_encode(STORAGE_VERSION, &data);
+
+        self.accepted.insert(key, &value)?;
+        self.db.persist(PersistMode::SyncAll)?;
+        Ok(())
+    }
+
+    fn get_accepted_from_sync(
+        &self,
+        group_id: &GroupId,
+        from_epoch: Epoch,
+    ) -> Vec<(GroupProposal, GroupMessage)> {
+        let start_key = Self::build_key(group_id, from_epoch);
+        let prefix = Self::build_group_prefix(group_id);
+
+        self.accepted
+            .range(start_key..)
+            .filter_map(|guard| {
+                let (key, value) = guard.into_inner().ok()?;
+                if !key.starts_with(&prefix) {
+                    return None;
+                }
+                let epoch = Self::parse_epoch_from_key(&key)?;
+                if epoch < from_epoch || epoch.0 == PROMISED_SENTINEL_EPOCH {
+                    return None;
+                }
+                Self::decode_slim_accepted(&value, epoch)
+            })
+            .collect()
+    }
+
+    fn highest_accepted_round_sync(&self, group_id: &GroupId) -> Option<Epoch> {
+        let prefix = Self::build_group_prefix(group_id);
+
+        let mut end_key = prefix;
+        for byte in end_key.iter_mut().rev() {
+            if *byte < 0xFF {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+
+        let mut highest: Option<Epoch> = None;
+        for guard in self.accepted.range(prefix..end_key) {
+            if let Ok((key, _)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+                && epoch.0 != PROMISED_SENTINEL_EPOCH
+            {
+                highest = Some(epoch);
+            }
+        }
+        highest
+    }
+
+    fn get_broadcast(
+        &self,
+        group_id: &GroupId,
+    ) -> broadcast::Sender<(GroupProposal, GroupMessage)> {
+        if let Some(sender) = self.broadcasts.read().unwrap().get(&group_id.0) {
+            return sender.clone();
+        }
+
+        let mut broadcasts = self.broadcasts.write().unwrap();
+        broadcasts
+            .entry(group_id.0)
+            .or_insert_with(|| broadcast::channel(64).0)
+            .clone()
+    }
+
+    fn store_snapshot_sync(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        let key = Self::build_key(group_id, epoch);
+        self.snapshots.insert(key, snapshot_bytes)?;
+        Ok(())
+    }
+
+    fn get_latest_snapshot_sync(&self, group_id: &GroupId) -> Option<(Epoch, Vec<u8>)> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut end_key = prefix;
+        for byte in end_key.iter_mut().rev() {
+            if *byte < 0xFF {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+
+        for guard in self.snapshots.range(prefix..end_key).rev() {
+            if let Ok((key, value)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+            {
+                return Some((epoch, value.to_vec()));
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    fn get_snapshot_at_or_before_sync(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+    ) -> Option<(Epoch, Vec<u8>)> {
+        let prefix = Self::build_group_prefix(group_id);
+        let target_key = Self::build_key(group_id, epoch);
+
+        for guard in self
+            .snapshots
+            .range(prefix.as_slice()..=target_key.as_slice())
+            .rev()
+        {
+            if let Ok((key, value)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+            {
+                return Some((epoch, value.to_vec()));
+            }
+        }
+        None
+    }
+
+    fn prune_snapshots_sync(
+        &self,
+        group_id: &GroupId,
+        current_epoch: Epoch,
+    ) -> Result<(), fjall::Error> {
+        let prefix = Self::build_group_prefix(group_id);
+        let mut end_key = prefix;
+        for byte in end_key.iter_mut().rev() {
+            if *byte < 0xFF {
+                *byte += 1;
+                break;
+            }
+            *byte = 0;
+        }
+
+        let mut kept_epochs = std::collections::HashSet::new();
+        kept_epochs.insert(current_epoch.0);
+        if current_epoch.0 >= 1 {
+            kept_epochs.insert(current_epoch.0 - 1);
+        }
+        if current_epoch.0 >= 2 {
+            kept_epochs.insert(current_epoch.0 - 2);
+        }
+        let mut gap = 4u64;
+        while gap <= current_epoch.0 {
+            kept_epochs.insert(current_epoch.0 - gap);
+            gap = gap.saturating_mul(2);
+        }
+
+        let mut oldest_epoch: Option<u64> = None;
+        let mut to_delete = Vec::new();
+
+        for guard in self.snapshots.range(prefix.as_slice()..end_key.as_slice()) {
+            if let Ok((key, _)) = guard.into_inner()
+                && let Some(epoch) = Self::parse_epoch_from_key(&key)
+            {
+                if oldest_epoch.is_none() {
+                    oldest_epoch = Some(epoch.0);
+                }
+                if Some(epoch.0) != oldest_epoch && !kept_epochs.contains(&epoch.0) {
+                    to_delete.push(key.to_vec());
+                }
+            }
+        }
+
+        for key in to_delete {
+            self.snapshots.remove(&key)?;
+        }
+
+        Ok(())
+    }
+
+    fn list_groups_sync(&self) -> Vec<GroupId> {
+        let mut groups = Vec::new();
+        let mut last_group: Option<[u8; 32]> = None;
+
+        for guard in self.snapshots.iter() {
+            let Ok((key, _)) = guard.into_inner() else {
+                continue;
+            };
+            if key.len() < 32 {
+                continue;
+            }
+            let mut group_bytes = [0u8; 32];
+            group_bytes.copy_from_slice(&key[..32]);
+
+            if last_group.as_ref() == Some(&group_bytes) {
+                continue;
+            }
+            last_group = Some(group_bytes);
+            groups.push(GroupId::new(group_bytes));
+        }
+        groups
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedFjallStateStore {
+    inner: Arc<FjallStateStore>,
+}
+
+impl SharedFjallStateStore {
+    /// # Errors
+    ///
+    /// Returns [`fjall::Error`] if opening the database fails.
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, fjall::Error> {
+        let store = FjallStateStore::open(path).await?;
+        Ok(Self {
+            inner: Arc::new(store),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn for_group(&self, group_id: GroupId) -> GroupStateStore {
+        GroupStateStore {
+            inner: self.inner.clone(),
+            group_id,
+        }
+    }
+
+    #[must_use]
+    pub fn list_groups(&self) -> Vec<GroupId> {
+        self.inner.list_groups_sync()
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`fjall::Error`] if storing the snapshot fails.
+    pub fn store_snapshot(
+        &self,
+        group_id: &GroupId,
+        epoch: Epoch,
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        self.inner
+            .store_snapshot_sync(group_id, epoch, snapshot_bytes)
+    }
+
+    #[must_use]
+    pub fn get_latest_snapshot(&self, group_id: &GroupId) -> Option<(Epoch, Vec<u8>)> {
+        self.inner.get_latest_snapshot_sync(group_id)
+    }
+
+    pub(crate) fn store_app_message(
+        &self,
+        group_id: &GroupId,
+        id: &MessageId,
+        msg: &EncryptedAppMessage,
+    ) -> Result<(), fjall::Error> {
+        self.inner.store_app_message(group_id, id, msg)
+    }
+
+    #[must_use]
+    pub(crate) fn get_messages_after(
+        &self,
+        group_id: &GroupId,
+        state_vector: &StateVector,
+    ) -> Vec<(MessageId, EncryptedAppMessage)> {
+        self.inner.get_messages_after(group_id, state_vector)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn delete_before_watermark(
+        &self,
+        group_id: &GroupId,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        self.inner.delete_before_watermark(group_id, watermark)
+    }
+
+    #[must_use]
+    pub(crate) fn subscribe_messages(
+        &self,
+        group_id: &GroupId,
+    ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
+        self.inner.subscribe_messages(group_id)
+    }
+}
+
+#[derive(Clone)]
+pub struct GroupStateStore {
+    inner: Arc<FjallStateStore>,
+    group_id: GroupId,
+}
+
+impl GroupStateStore {
+    #[must_use]
+    pub(crate) fn get_accepted_from(
+        &self,
+        from_epoch: Epoch,
+    ) -> Vec<(GroupProposal, GroupMessage)> {
+        self.inner
+            .get_accepted_from_sync(&self.group_id, from_epoch)
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`fjall::Error`] if storing the snapshot fails.
+    pub(crate) fn store_snapshot(
+        &self,
+        epoch: Epoch,
+        snapshot_bytes: &[u8],
+    ) -> Result<(), fjall::Error> {
+        self.inner
+            .store_snapshot_sync(&self.group_id, epoch, snapshot_bytes)?;
+        self.inner.prune_snapshots_sync(&self.group_id, epoch)?;
+        Ok(())
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn get_latest_snapshot(&self) -> Option<(Epoch, Vec<u8>)> {
+        self.inner.get_latest_snapshot_sync(&self.group_id)
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn get_snapshot_at_or_before(&self, epoch: Epoch) -> Option<(Epoch, Vec<u8>)> {
+        self.inner
+            .get_snapshot_at_or_before_sync(&self.group_id, epoch)
+    }
+
+    pub(crate) fn delete_before_watermark(
+        &self,
+        watermark: &StateVector,
+    ) -> Result<usize, fjall::Error> {
+        self.inner
+            .delete_before_watermark(&self.group_id, watermark)
+    }
+}
+
+pub struct GroupReceiver {
+    inner: tokio_stream::wrappers::BroadcastStream<(GroupProposal, GroupMessage)>,
+}
+
+impl Stream for GroupReceiver {
+    type Item = (GroupProposal, GroupMessage);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match std::task::ready!(Pin::new(&mut self.get_mut().inner).poll_next(cx)) {
+            Some(Ok(item)) => Poll::Ready(Some(item)),
+            _ => Poll::Ready(None),
+        }
+    }
+}
+
+pub type HistoricalStream = stream::Iter<std::vec::IntoIter<(GroupProposal, GroupMessage)>>;
+pub type GroupSubscription = stream::Chain<HistoricalStream, GroupReceiver>;
+
+impl<L> AcceptorStateStore<L> for GroupStateStore
+where
+    L: Learner<Proposal = GroupProposal, Message = GroupMessage>,
+{
+    type Subscription = GroupSubscription;
+
+    async fn get(&self, round: Epoch) -> RoundState<L> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+
+        tokio::task::spawn_blocking(move || {
+            let promised = inner.get_promised_sync(&group_id, round);
+            let accepted = inner.get_accepted_sync(&group_id, round);
+            RoundState { promised, accepted }
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn promise(&self, proposal: &GroupProposal) -> Result<(), RoundState<L>> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+        let proposal = proposal.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let epoch = proposal.epoch;
+            let key = proposal.key();
+
+            let current_promised = inner.get_promised_sync(&group_id, epoch);
+            let current_accepted = inner.get_accepted_sync(&group_id, epoch);
+
+            let promised_key = current_promised.as_ref().map(Proposal::key);
+            let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
+
+            if !decision::should_promise(&key, promised_key.as_ref(), accepted_key.as_ref()) {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
+
+            inner
+                .set_promised_sync(&group_id, &proposal)
+                .map_err(|_| RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                })?;
+
+            Ok(())
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn accept(
+        &self,
+        proposal: &GroupProposal,
+        message: &GroupMessage,
+    ) -> Result<(), RoundState<L>> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+        let proposal = proposal.clone();
+        let message = message.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let epoch = proposal.epoch;
+            let key = proposal.key();
+
+            let current_promised = inner.get_promised_sync(&group_id, epoch);
+            let current_accepted = inner.get_accepted_sync(&group_id, epoch);
+
+            let promised_key = current_promised.as_ref().map(Proposal::key);
+            let accepted_key = current_accepted.as_ref().map(|(p, _)| p.key());
+
+            if !decision::should_accept(&key, promised_key.as_ref(), accepted_key.as_ref()) {
+                return Err(RoundState {
+                    promised: current_promised,
+                    accepted: current_accepted,
+                });
+            }
+
+            inner
+                .set_accepted_sync(&group_id, &proposal, &message)
+                .map_err(|_| RoundState {
+                    promised: current_promised.clone(),
+                    accepted: current_accepted.clone(),
+                })?;
+
+            let _ = inner.get_broadcast(&group_id).send((proposal, message));
+
+            Ok(())
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn subscribe_from(&self, from_round: Epoch) -> Self::Subscription {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+
+        let historical = tokio::task::spawn_blocking(move || {
+            inner.get_accepted_from_sync(&group_id, from_round)
+        })
+        .await
+        .expect("spawn_blocking panicked");
+
+        let live = GroupReceiver {
+            inner: tokio_stream::wrappers::BroadcastStream::new(
+                self.inner.get_broadcast(&self.group_id).subscribe(),
+            ),
+        };
+
+        stream::iter(historical).chain(live)
+    }
+
+    async fn highest_accepted_round(&self) -> Option<Epoch> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+
+        tokio::task::spawn_blocking(move || inner.highest_accepted_round_sync(&group_id))
+            .await
+            .expect("spawn_blocking panicked")
+    }
+
+    async fn get_accepted_from(&self, from_round: Epoch) -> Vec<(GroupProposal, GroupMessage)> {
+        let inner = self.inner.clone();
+        let group_id = self.group_id;
+
+        tokio::task::spawn_blocking(move || inner.get_accepted_from_sync(&group_id, from_round))
+            .await
+            .expect("spawn_blocking panicked")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mls_rs::ExtensionList;
+
+    use super::*;
+
+    fn make_test_message() -> GroupMessage {
+        use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+        use mls_rs::{CipherSuite, CipherSuiteProvider, CryptoProvider};
+        use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+        let cipher_suite = CipherSuite::CURVE25519_AES128;
+        let crypto = RustCryptoProvider::default();
+        let cs = crypto.cipher_suite_provider(cipher_suite).unwrap();
+
+        let (secret_key, public_key) = cs.signature_key_generate().unwrap();
+        let credential = BasicCredential::new(b"test".to_vec());
+        let signing_identity =
+            mls_rs::identity::SigningIdentity::new(credential.into_credential(), public_key);
+
+        let client = mls_rs::Client::builder()
+            .crypto_provider(crypto)
+            .identity_provider(BasicIdentityProvider::new())
+            .signing_identity(signing_identity, secret_key, cipher_suite)
+            .build();
+
+        let mut group = client
+            .create_group(ExtensionList::default(), ExtensionList::default(), None)
+            .unwrap();
+        let commit = group.commit_builder().build().unwrap();
+        GroupMessage::new(commit.commit_message)
+    }
+
+    fn make_test_proposal(epoch: Epoch) -> GroupProposal {
+        GroupProposal {
+            member_id: MemberId(1),
+            epoch,
+            attempt: Attempt(0),
+            message_hash: [0u8; 32],
+            signature: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[test]
+    fn slim_accepted_roundtrip() {
+        let message = make_test_message();
+        let epoch = Epoch(42);
+
+        let slim = SlimAccepted {
+            member_id: MemberId(5),
+            attempt: Attempt(3),
+            signature: vec![10, 20, 30],
+            message: message.clone(),
+        };
+
+        let data = postcard::to_allocvec(&slim).expect("serialize");
+        let encoded = storage_versioned_encode(STORAGE_VERSION, &data);
+        let decoded = FjallStateStore::decode_slim_accepted(&encoded, epoch).unwrap();
+
+        assert_eq!(decoded.0.member_id, MemberId(5));
+        assert_eq!(decoded.0.epoch, epoch);
+        assert_eq!(decoded.0.attempt, Attempt(3));
+        assert_eq!(decoded.0.signature, vec![10, 20, 30]);
+
+        let message_bytes = postcard::to_allocvec(&message).expect("serialization should not fail");
+        let expected_hash: [u8; 32] = Sha256::digest(&message_bytes).into();
+        assert_eq!(decoded.0.message_hash, expected_hash);
+    }
+
+    #[test]
+    fn accepted_set_get_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([1u8; 32]);
+        let message = make_test_message();
+        let proposal = make_test_proposal(Epoch(10));
+
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+        let (loaded_proposal, _loaded_message) = store.get_accepted_sync(&gid, Epoch(10)).unwrap();
+
+        assert_eq!(loaded_proposal.member_id, proposal.member_id);
+        assert_eq!(loaded_proposal.epoch, Epoch(10));
+        assert_eq!(loaded_proposal.attempt, proposal.attempt);
+        assert_eq!(loaded_proposal.signature, proposal.signature);
+    }
+
+    #[test]
+    fn accepted_from_range_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([2u8; 32]);
+        let message = make_test_message();
+
+        for e in 0..5 {
+            let proposal = make_test_proposal(Epoch(e));
+            store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+        }
+
+        let from_2 = store.get_accepted_from_sync(&gid, Epoch(2));
+        assert_eq!(from_2.len(), 3);
+        assert_eq!(from_2[0].0.epoch, Epoch(2));
+        assert_eq!(from_2[2].0.epoch, Epoch(4));
+    }
+
+    #[test]
+    fn accepted_from_excludes_promised_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([3u8; 32]);
+        let message = make_test_message();
+
+        let proposal = make_test_proposal(Epoch(0));
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+
+        let promised = make_test_proposal(Epoch(1));
+        store.set_promised_sync(&gid, &promised).unwrap();
+
+        let all = store.get_accepted_from_sync(&gid, Epoch(0));
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0.epoch, Epoch(0));
+    }
+
+    #[test]
+    fn promised_sentinel_matching_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([4u8; 32]);
+
+        let proposal = make_test_proposal(Epoch(5));
+        store.set_promised_sync(&gid, &proposal).unwrap();
+
+        let loaded = store.get_promised_sync(&gid, Epoch(5));
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().epoch, Epoch(5));
+
+        let wrong_epoch = store.get_promised_sync(&gid, Epoch(6));
+        assert!(wrong_epoch.is_none());
+    }
+
+    #[test]
+    fn snapshot_crud() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([5u8; 32]);
+
+        store.store_snapshot_sync(&gid, Epoch(0), b"snap0").unwrap();
+        store.store_snapshot_sync(&gid, Epoch(5), b"snap5").unwrap();
+        store
+            .store_snapshot_sync(&gid, Epoch(10), b"snap10")
+            .unwrap();
+
+        let (epoch, bytes) = store.get_latest_snapshot_sync(&gid).unwrap();
+        assert_eq!(epoch, Epoch(10));
+        assert_eq!(bytes, b"snap10");
+
+        let (epoch, bytes) = store
+            .get_snapshot_at_or_before_sync(&gid, Epoch(7))
+            .unwrap();
+        assert_eq!(epoch, Epoch(5));
+        assert_eq!(bytes, b"snap5");
+
+        let (epoch, bytes) = store
+            .get_snapshot_at_or_before_sync(&gid, Epoch(5))
+            .unwrap();
+        assert_eq!(epoch, Epoch(5));
+        assert_eq!(bytes, b"snap5");
+
+        assert!(
+            store
+                .get_snapshot_at_or_before_sync(&gid, Epoch(0))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn logarithmic_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([6u8; 32]);
+
+        for e in 0..=20 {
+            store
+                .store_snapshot_sync(&gid, Epoch(e), format!("snap{e}").as_bytes())
+                .unwrap();
+        }
+
+        store.prune_snapshots_sync(&gid, Epoch(20)).unwrap();
+
+        // Verify kept epochs: {0 (oldest), 20, 19, 18, 16, 12, 4}
+        let remaining: Vec<u64> = (0..=20)
+            .filter(|&e| {
+                store
+                    .get_snapshot_at_or_before_sync(&gid, Epoch(e))
+                    .is_some()
+                    && store
+                        .get_snapshot_at_or_before_sync(&gid, Epoch(e))
+                        .unwrap()
+                        .0
+                        == Epoch(e)
+            })
+            .collect();
+
+        assert!(remaining.contains(&0), "oldest must be kept");
+        assert!(remaining.contains(&20), "current must be kept");
+        assert!(remaining.contains(&19), "E-1 must be kept");
+        assert!(remaining.contains(&18), "E-2 must be kept");
+        assert!(remaining.contains(&16), "E-4 must be kept");
+        assert!(remaining.contains(&12), "E-8 must be kept");
+        assert!(remaining.contains(&4), "E-16 must be kept");
+    }
+
+    #[test]
+    fn list_groups_from_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+
+        let gid1 = GroupId::new([1u8; 32]);
+        let gid2 = GroupId::new([2u8; 32]);
+
+        store.store_snapshot_sync(&gid1, Epoch(0), b"snap").unwrap();
+        store.store_snapshot_sync(&gid1, Epoch(1), b"snap").unwrap();
+        store.store_snapshot_sync(&gid2, Epoch(0), b"snap").unwrap();
+
+        let groups = store.list_groups_sync();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains(&gid1));
+        assert!(groups.contains(&gid2));
+    }
+
+    #[test]
+    fn highest_accepted_excludes_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([7u8; 32]);
+        let message = make_test_message();
+
+        let proposal = make_test_proposal(Epoch(5));
+        store.set_accepted_sync(&gid, &proposal, &message).unwrap();
+
+        let promised = make_test_proposal(Epoch(10));
+        store.set_promised_sync(&gid, &promised).unwrap();
+
+        let highest = store.highest_accepted_round_sync(&gid).unwrap();
+        assert_eq!(highest, Epoch(5));
+    }
+
+    #[test]
+    fn test_store_and_get_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([1u8; 32]);
+        let sender = MemberFingerprint([2u8; 8]);
+
+        let id1 = MessageId {
+            group_id: gid,
+            sender,
+            seq: 1,
+        };
+        let id2 = MessageId {
+            group_id: gid,
+            sender,
+            seq: 2,
+        };
+        let msg = EncryptedAppMessage {
+            ciphertext: vec![10, 20],
+        };
+
+        store.store_app_message(&gid, &id1, &msg).unwrap();
+        store.store_app_message(&gid, &id2, &msg).unwrap();
+
+        let all = store.get_messages_after(&gid, &StateVector::default());
+        assert_eq!(all.len(), 2);
+
+        let mut sv = StateVector::default();
+        sv.insert(sender, 1);
+        let after = store.get_messages_after(&gid, &sv);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0.seq, 2);
+    }
+
+    #[test]
+    fn test_delete_before_watermark_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([3u8; 32]);
+
+        let sender_a = MemberFingerprint([10u8; 8]);
+        let sender_b = MemberFingerprint([20u8; 8]);
+        let msg = EncryptedAppMessage {
+            ciphertext: vec![1],
+        };
+
+        for seq in 1..=5 {
+            let id = MessageId {
+                group_id: gid,
+                sender: sender_a,
+                seq,
+            };
+            store.store_app_message(&gid, &id, &msg).unwrap();
+        }
+        for seq in 1..=3 {
+            let id = MessageId {
+                group_id: gid,
+                sender: sender_b,
+                seq,
+            };
+            store.store_app_message(&gid, &id, &msg).unwrap();
+        }
+
+        let mut watermark = StateVector::default();
+        watermark.insert(sender_a, 3);
+        watermark.insert(sender_b, 1);
+
+        let deleted = store.delete_before_watermark(&gid, &watermark).unwrap();
+        assert_eq!(deleted, 4);
+
+        let remaining = store.get_messages_after(&gid, &StateVector::default());
+        assert_eq!(remaining.len(), 4);
+    }
+
+    #[test]
+    fn test_delete_before_watermark_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let gid = GroupId::new([4u8; 32]);
+
+        let deleted = store
+            .delete_before_watermark(&gid, &StateVector::default())
+            .unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_message_key_ordering() {
+        let gid = GroupId::new([1u8; 32]);
+        let sender = MemberFingerprint([2u8; 8]);
+
+        let key1 = FjallStateStore::build_message_key(&gid, sender, 1);
+        let key2 = FjallStateStore::build_message_key(&gid, sender, 2);
+        let key3 = FjallStateStore::build_message_key(&gid, sender, 100);
+
+        assert!(key1 < key2);
+        assert!(key2 < key3);
+    }
+
+    #[test]
+    fn test_message_id_from_key_roundtrip() {
+        let gid = GroupId::new([5u8; 32]);
+        let sender = MemberFingerprint([6u8; 8]);
+
+        let key = FjallStateStore::build_message_key(&gid, sender, 42);
+        let id = FjallStateStore::message_id_from_key(&gid, &key).unwrap();
+
+        assert_eq!(id.group_id, gid);
+        assert_eq!(id.sender, sender);
+        assert_eq!(id.seq, 42);
+    }
+
+    #[test]
+    fn storage_versioned_encode_decode_roundtrip() {
+        let payload = b"test data";
+        let encoded = super::storage_versioned_encode(1, payload);
+        let (version, decoded) = super::storage_versioned_decode(&encoded);
+        assert_eq!(version, 1);
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn storage_versioned_decode_legacy_data() {
+        let legacy = b"raw postcard bytes";
+        let (version, decoded) = super::storage_versioned_decode(legacy);
+        assert_eq!(version, 1);
+        assert_eq!(decoded, legacy.as_slice());
+    }
+}

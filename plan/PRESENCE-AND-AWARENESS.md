@@ -7,7 +7,7 @@
 ## Original Plan Design
 
 Awareness is entirely encapsulated inside the CRDT implementation. No other
-layer (sync-core, sync-acceptor, GroupActor) knows about it.
+layer (filament-core, filament-spool, GroupActor) knows about it.
 
 ### Message framing
 
@@ -52,7 +52,7 @@ Awareness messages participate in compaction naturally:
 
 ## What was implemented (prior session)
 
-### sync-testing/src/yrs_crdt.rs
+### filament-testing/src/yrs_crdt.rs
 
 - `YrsCrdt` was restructured. Originally planned to wrap `yrs::sync::awareness::Awareness`,
   but `Awareness` is `!Send + !Sync`, violating the `Crdt` trait bounds.
@@ -64,39 +64,39 @@ Awareness messages participate in compaction naturally:
 - `merge()` decodes without prefix (raw yrs update).
 - `snapshot()` returns doc-only state (no prefix, no awareness).
 
-### sync-core/src/crdt.rs
+### filament-core/src/crdt.rs
 
 - Added `CrdtFactory::wrap_snapshot_for_wire()` with default identity impl.
   `YrsCrdtFactory` overrides it to prepend `DOC_PREFIX`.
 
-### sync-proposer/src/group/mod.rs
+### filament-weave/src/group/mod.rs
 
 - `Group::send_update()` changed to loop calling `flush_update()` until `None`.
 
-### sync-proposer/src/group/group_actor.rs
+### filament-weave/src/group/group_actor.rs
 
 - `perform_compaction` calls `wrap_snapshot_for_wire()` before sending compacted
   snapshots to acceptors.
 
-### sync-editor/src/types.rs
+### filament-editor/src/types.rs
 
 - Added `AwarenessPeer`, `AwarenessPayload`, `EventEmitter::emit_awareness_changed()`.
 
-### sync-editor/src/document.rs
+### filament-editor/src/document.rs
 
 - `DocumentActor` sets local awareness state on startup, has heartbeat tick in
   `select!` loop, emits awareness events after `wait_for_update()`.
 - Added `last_emitted_text` field to deduplicate text update events.
 - On shutdown: cleans local awareness state, sends final `send_update()`.
 
-### sync-editor UI
+### filament-editor UI
 
 - Added presence bar in toolbar (later moved to share modal).
 
 ### Tests
 
-- 19 unit tests in sync-testing (prefix roundtrip, awareness timing, etc.)
-- Integration test `awareness_heartbeat_received_by_peer` in sync-editor.
+- 19 unit tests in filament-testing (prefix roundtrip, awareness timing, etc.)
+- Integration test `awareness_heartbeat_received_by_peer` in filament-editor.
 
 ---
 

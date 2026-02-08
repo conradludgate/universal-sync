@@ -1,6 +1,6 @@
 # Design Review — Findings Summary
 
-Review of the universal-sync architecture against the README design claims,
+Review of the filament architecture against the README design claims,
 cross-referenced with the actual codebase.
 
 ## Trust Model
