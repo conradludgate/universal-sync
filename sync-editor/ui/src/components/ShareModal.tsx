@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import * as tauri from "../tauri";
 import { useToast } from "../hooks/useToast";
-import type { GroupStatePayload, PeerEntry } from "../types";
+import type { AwarenessPeer, GroupStatePayload, PeerEntry, SyncStatus } from "../types";
 
 function shortId(id: string): string {
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-8)}` : id;
@@ -10,10 +10,12 @@ function shortId(id: string): string {
 interface ShareModalProps {
   groupId: string;
   groupState: GroupStatePayload | null;
+  awarenessPeers: AwarenessPeer[];
+  syncStatus: SyncStatus;
   onClose: () => void;
 }
 
-export function ShareModal({ groupId, groupState, onClose }: ShareModalProps) {
+export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, onClose }: ShareModalProps) {
   const showToast = useToast();
   const [peers, setPeers] = useState<PeerEntry[]>([]);
   const [peerInput, setPeerInput] = useState("");
@@ -100,6 +102,8 @@ export function ShareModal({ groupId, groupState, onClose }: ShareModalProps) {
     }
   }, [groupState, showToast]);
 
+  const onlineClientIds = new Set(awarenessPeers.map((p) => p.client_id));
+
   const members = peers.filter(
     (p): p is Extract<PeerEntry, { kind: "Member" }> => p.kind === "Member",
   );
@@ -169,6 +173,9 @@ export function ShareModal({ groupId, groupState, onClose }: ShareModalProps) {
                     {members.map((m) => (
                       <div key={m.index} className="peer-item">
                         <div className="peer-item-info">
+                          <span
+                            className={`peer-status-dot ${(m.is_self ? syncStatus === "synced" : onlineClientIds.has(m.client_id)) ? "online" : "offline"}`}
+                          />
                           <span className="peer-item-id" title={m.identity}>
                             {shortId(m.identity)}
                             {m.is_self && (

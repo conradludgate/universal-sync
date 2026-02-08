@@ -79,9 +79,13 @@ pub async fn apply_delta(
     state: tauri::State<'_, AppState>,
     group_id: String,
     delta: Delta,
+    anchor: u32,
+    head: u32,
 ) -> Result<(), String> {
     doc_request(&state, &group_id, |reply| DocRequest::ApplyDelta {
         delta,
+        anchor,
+        head,
         reply,
     })
     .await

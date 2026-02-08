@@ -140,7 +140,10 @@ impl MemberFingerprint {
     /// fit in 63 bits. We mask off the high bit to stay in range.
     #[must_use]
     pub fn as_client_id(&self) -> u64 {
-        u64::from_le_bytes(self.0) & 0x7FFF_FFFF_FFFF_FFFF
+        // Mask to 32 bits: Yrs internally uses u32 client IDs despite
+        // accepting u64 in its API. Values above 2^32 cause silent
+        // encoding failures in V2 update format.
+        u64::from_le_bytes(self.0) & 0xFFFF_FFFF
     }
 }
 
@@ -374,8 +377,8 @@ mod tests {
         let gid = GroupId::new([1u8; 32]);
         let fp = MemberFingerprint::from_key(&gid, b"key", 42);
         let cid = fp.as_client_id();
-        assert_eq!(cid & 0x8000_0000_0000_0000, 0, "high bit must be cleared");
-        assert_eq!(cid, u64::from_le_bytes(fp.0) & 0x7FFF_FFFF_FFFF_FFFF);
+        assert_eq!(cid & !0xFFFF_FFFFu64, 0, "must fit in 32 bits");
+        assert_eq!(cid, u64::from_le_bytes(fp.0) & 0xFFFF_FFFF);
     }
 
     #[test]

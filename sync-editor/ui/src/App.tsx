@@ -226,6 +226,8 @@ export function App() {
         <ShareModal
           groupId={currentGroupId}
           groupState={groupState}
+          awarenessPeers={awarenessPeers}
+          syncStatus={syncStatus}
           onClose={handleCloseShareModal}
         />
       )}

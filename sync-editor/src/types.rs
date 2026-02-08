@@ -42,6 +42,7 @@ pub enum PeerEntry {
         index: u32,
         identity: String,
         is_self: bool,
+        client_id: u64,
     },
     Acceptor {
         id: String,
@@ -123,6 +124,8 @@ pub enum CoordinatorRequest {
 pub enum DocRequest {
     ApplyDelta {
         delta: Delta,
+        anchor: u32,
+        head: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
     GetText {

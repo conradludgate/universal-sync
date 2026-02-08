@@ -13,8 +13,8 @@ export const recvWelcome = () =>
 export const joinDocumentBytes = (welcomeB58: string) =>
   invoke<DocumentInfo>("join_document_bytes", { welcomeB58 });
 
-export const applyDelta = (groupId: string, delta: Delta) =>
-  invoke<void>("apply_delta", { groupId, delta });
+export const applyDelta = (groupId: string, delta: Delta, anchor: number, head: number) =>
+  invoke<void>("apply_delta", { groupId, delta, anchor, head });
 
 export const getDocumentText = (groupId: string) =>
   invoke<string>("get_document_text", { groupId });

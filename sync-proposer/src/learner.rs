@@ -134,9 +134,7 @@ where
         let member = self
             .group
             .roster()
-            .members()
-            .iter()
-            .find(|m| m.index == member_index)
+            .member_with_index(member_index)
             .expect("own member must be in roster")
             .clone();
         fingerprint_of_member(&group_id, &member)
@@ -243,11 +241,7 @@ where
 
     /// Check if a member ID is in the current roster
     fn is_member(&self, member_id: MemberId) -> bool {
-        self.group
-            .roster()
-            .members()
-            .iter()
-            .any(|m| m.index == member_id.0)
+        self.group.roster().member_with_index(member_id.0).is_ok()
     }
 
     /// Sign data using this member's signing key
@@ -284,10 +278,9 @@ where
     fn get_member_public_key(&self, member_id: MemberId) -> Option<SignaturePublicKey> {
         self.group
             .roster()
-            .members()
-            .iter()
-            .find(|m| m.index == member_id.0)
+            .member_with_index(member_id.0)
             .map(|m| m.signing_identity.signature_key.clone())
+            .ok()
     }
 
     /// Verify a proposal's signature

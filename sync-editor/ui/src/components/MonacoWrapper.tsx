@@ -92,7 +92,13 @@ export function MonacoWrapper({
           continue;
         }
 
-        tauri.applyDelta(groupIdRef.current, delta).catch((error) => {
+        const editor = editorRef.current;
+        const sel = editor?.getSelection();
+        const model = editor?.getModel();
+        const anchor = sel && model ? model.getOffsetAt(sel.getStartPosition()) : 0;
+        const head = sel && model ? model.getOffsetAt(sel.getEndPosition()) : 0;
+
+        tauri.applyDelta(groupIdRef.current, delta, anchor, head).catch((error) => {
           console.error("Failed to apply delta:", error);
         });
       }

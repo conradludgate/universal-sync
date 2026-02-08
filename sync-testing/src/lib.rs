@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use universal_sync_acceptor::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
 use universal_sync_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use universal_sync_proposer::{GroupClient, ReplContext};
-pub use yrs_crdt::YrsCrdt;
+pub use yrs_crdt::{AWARENESS_TIMEOUT, YrsCrdt};
 
 pub const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 

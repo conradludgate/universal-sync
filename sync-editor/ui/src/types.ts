@@ -10,7 +10,7 @@ export type Delta =
   | { type: "Replace"; position: number; length: number; text: string };
 
 export type PeerEntry =
-  | { kind: "Member"; index: number; identity: string; is_self: boolean }
+  | { kind: "Member"; index: number; identity: string; is_self: boolean; client_id: number }
   | { kind: "Acceptor"; id: string };
 
 export interface DocumentUpdatedPayload {

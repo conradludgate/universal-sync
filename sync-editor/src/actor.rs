@@ -102,7 +102,7 @@ where
             .await
             .map_err(|e| format!("failed to create group: {e:?}"))?;
 
-        let crdt = YrsCrdt::new();
+        let crdt = YrsCrdt::with_client_id(group.my_client_id());
         self.register_document(group, crdt)
     }
 
@@ -147,11 +147,12 @@ where
             .await
             .map_err(|e| format!("failed to join group: {e:?}"))?;
 
+        let client_id = join_info.group.my_client_id();
         let crdt = if let Some(snapshot) = join_info.snapshot {
-            YrsCrdt::from_snapshot(&snapshot, rand::random())
+            YrsCrdt::from_snapshot(&snapshot, client_id)
                 .map_err(|e| format!("failed to create CRDT from snapshot: {e:?}"))?
         } else {
-            YrsCrdt::new()
+            YrsCrdt::with_client_id(client_id)
         };
 
         self.register_document(join_info.group, crdt)

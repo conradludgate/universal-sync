@@ -1,27 +1,58 @@
 //! Yrs (Yjs) CRDT implementation — wraps `yrs::Doc` for the [`Crdt`] trait.
 //!
-//! Wire messages use a prefix byte to distinguish document updates (`0x00`)
-//! from ephemeral awareness updates (`0x01`). Snapshots and merges use raw
-//! (unprefixed) yrs bytes. See [`DOC_PREFIX`] and [`AWARENESS_PREFIX`].
+//! Wire messages use `postcard` serialisation of [`CrdtMessage`], which pairs
+//! a [`PeerAwareness`] header with an optional Yrs V2 doc update.
+//! Snapshots (`snapshot` / `merge`) use raw (unwrapped) Yrs bytes.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use error_stack::{Report, ResultExt};
+use serde::{Deserialize, Serialize};
 use universal_sync_core::{Crdt, CrdtError};
 use yrs::updates::decoder::Decode;
 use yrs::{Doc, ReadTxn, StateVector, Transact, Update};
 
-pub const DOC_PREFIX: u8 = 0x00;
-pub const AWARENESS_PREFIX: u8 = 0x01;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerAwareness {
+    pub client_id: u64,
+    pub cursor: Option<u32>,
+    pub selection_end: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CrdtMessage {
+    pub awareness: PeerAwareness,
+    #[serde(with = "option_yrs_update")]
+    pub doc_update: Option<Vec<u8>>,
+}
+
+mod option_yrs_update {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use yrs::updates::decoder::Decode;
+
+    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let v: Option<Vec<u8>> = Option::deserialize(d)?;
+        if let Some(ref bytes) = v {
+            yrs::Update::decode_v2(bytes).map_err(serde::de::Error::custom)?;
+        }
+        Ok(v)
+    }
+}
+
+pub const AWARENESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct YrsCrdt {
     doc: Doc,
     client_id: u64,
-    /// For computing diffs since the last flush
     last_flushed_sv: StateVector,
     dirty: bool,
-    /// Ephemeral per-peer state keyed by client ID.
-    awareness_states: HashMap<u64, String>,
+    awareness_states: HashMap<u64, PeerAwareness>,
+    awareness_last_seen: HashMap<u64, Instant>,
     awareness_dirty: bool,
 }
 
@@ -37,11 +68,11 @@ impl YrsCrdt {
             last_flushed_sv,
             dirty: false,
             awareness_states: HashMap::new(),
+            awareness_last_seen: HashMap::new(),
             awareness_dirty: false,
         }
     }
 
-    /// Each member in a group should have a unique client ID.
     #[must_use]
     pub fn with_client_id(client_id: u64) -> Self {
         let doc = Doc::with_client_id(client_id);
@@ -52,6 +83,7 @@ impl YrsCrdt {
             last_flushed_sv,
             dirty: false,
             awareness_states: HashMap::new(),
+            awareness_last_seen: HashMap::new(),
             awareness_dirty: false,
         }
     }
@@ -93,20 +125,62 @@ impl YrsCrdt {
         Ok(crdt)
     }
 
-    pub fn set_local_state(&mut self, json: &str) {
-        self.awareness_states
-            .insert(self.client_id, json.to_string());
+    pub fn set_cursor(&mut self, cursor: u32, selection_end: u32) {
+        self.awareness_states.insert(
+            self.client_id,
+            PeerAwareness {
+                client_id: self.client_id,
+                cursor: Some(cursor),
+                selection_end: Some(selection_end),
+            },
+        );
         self.awareness_dirty = true;
     }
 
     pub fn clear_local_state(&mut self) {
-        self.awareness_states.remove(&self.client_id);
+        self.awareness_states.insert(
+            self.client_id,
+            PeerAwareness {
+                client_id: self.client_id,
+                cursor: None,
+                selection_end: None,
+            },
+        );
         self.awareness_dirty = true;
     }
 
     #[must_use]
-    pub fn awareness_states(&self) -> &HashMap<u64, String> {
+    pub fn awareness_states(&self) -> &HashMap<u64, PeerAwareness> {
         &self.awareness_states
+    }
+
+    /// Remove peers that haven't sent an awareness update within `timeout`.
+    /// Returns `true` if any peers were removed.
+    pub fn expire_stale_peers(&mut self, timeout: Duration) -> bool {
+        let now = Instant::now();
+        let stale: Vec<u64> = self
+            .awareness_last_seen
+            .iter()
+            .filter(|(cid, seen)| **cid != self.client_id && now.duration_since(**seen) > timeout)
+            .map(|(cid, _)| *cid)
+            .collect();
+        let changed = !stale.is_empty();
+        for cid in stale {
+            self.awareness_states.remove(&cid);
+            self.awareness_last_seen.remove(&cid);
+        }
+        changed
+    }
+
+    fn local_awareness(&self) -> PeerAwareness {
+        self.awareness_states
+            .get(&self.client_id)
+            .cloned()
+            .unwrap_or(PeerAwareness {
+                client_id: self.client_id,
+                cursor: None,
+                selection_end: None,
+            })
     }
 }
 
@@ -122,28 +196,21 @@ impl Crdt for YrsCrdt {
     }
 
     fn apply(&mut self, operation: &[u8]) -> Result<(), Report<CrdtError>> {
-        match operation.first() {
-            Some(&DOC_PREFIX) => {
-                let update = Update::decode_v2(&operation[1..]).change_context(CrdtError)?;
-                self.doc
-                    .transact_mut()
-                    .apply_update(update)
-                    .change_context(CrdtError)?;
-            }
-            Some(&AWARENESS_PREFIX) => {
-                if operation.len() >= 9 {
-                    let client_id =
-                        u64::from_le_bytes(operation[1..9].try_into().expect("8 bytes"));
-                    let state = std::str::from_utf8(&operation[9..]).unwrap_or("");
-                    if state.is_empty() {
-                        self.awareness_states.remove(&client_id);
-                    } else {
-                        self.awareness_states.insert(client_id, state.to_string());
-                    }
-                }
-            }
-            _ => return Err(Report::new(CrdtError).attach("unknown CRDT message prefix")),
+        let msg: CrdtMessage = postcard::from_bytes(operation).change_context(CrdtError)?;
+
+        if let Some(update_bytes) = msg.doc_update {
+            let update = Update::decode_v2(&update_bytes).change_context(CrdtError)?;
+            self.doc
+                .transact_mut()
+                .apply_update(update)
+                .change_context(CrdtError)?;
         }
+
+        self.awareness_last_seen
+            .insert(msg.awareness.client_id, Instant::now());
+        self.awareness_states
+            .insert(msg.awareness.client_id, msg.awareness);
+
         Ok(())
     }
 
@@ -163,39 +230,38 @@ impl Crdt for YrsCrdt {
 
     fn wire_snapshot(&self) -> Result<Vec<u8>, Report<CrdtError>> {
         let snapshot = self.snapshot()?;
-        let mut result = Vec::with_capacity(1 + snapshot.len());
-        result.push(DOC_PREFIX);
-        result.extend_from_slice(&snapshot);
-        Ok(result)
+        let msg = CrdtMessage {
+            awareness: self.local_awareness(),
+            doc_update: Some(snapshot),
+        };
+        postcard::to_allocvec(&msg).change_context(CrdtError)
     }
 
     fn flush_update(&mut self) -> Result<Option<Vec<u8>>, Report<CrdtError>> {
-        if self.dirty {
+        if !self.dirty && !self.awareness_dirty {
+            return Ok(None);
+        }
+
+        let doc_update = if self.dirty {
             self.dirty = false;
             let txn = self.doc.transact();
             let current_sv = txn.state_vector();
             let update = txn.encode_diff_v2(&self.last_flushed_sv);
             drop(txn);
             self.last_flushed_sv = current_sv;
-            let mut result = Vec::with_capacity(1 + update.len());
-            result.push(DOC_PREFIX);
-            result.extend_from_slice(&update);
-            return Ok(Some(result));
-        }
-        if self.awareness_dirty {
-            self.awareness_dirty = false;
-            let state = self
-                .awareness_states
-                .get(&self.client_id)
-                .cloned()
-                .unwrap_or_default();
-            let mut result = Vec::with_capacity(1 + 8 + state.len());
-            result.push(AWARENESS_PREFIX);
-            result.extend_from_slice(&self.client_id.to_le_bytes());
-            result.extend_from_slice(state.as_bytes());
-            return Ok(Some(result));
-        }
-        Ok(None)
+            Some(update)
+        } else {
+            None
+        };
+
+        self.awareness_dirty = false;
+
+        let msg = CrdtMessage {
+            awareness: self.local_awareness(),
+            doc_update,
+        };
+        let encoded = postcard::to_allocvec(&msg).change_context(CrdtError)?;
+        Ok(Some(encoded))
     }
 }
 
@@ -300,7 +366,6 @@ mod tests {
     fn test_compact_multiple_updates() {
         let mut crdt = YrsCrdt::with_client_id(1);
 
-        let mut updates = Vec::new();
         let insert_and_flush = |crdt: &mut YrsCrdt, pos: u32, text: &str| {
             let t = crdt.doc().get_or_insert_text("doc");
             let mut txn = crdt.doc().transact_mut();
@@ -310,9 +375,9 @@ mod tests {
             crdt.flush_update().unwrap().unwrap()
         };
 
-        updates.push(insert_and_flush(&mut crdt, 0, "aaa"));
-        updates.push(insert_and_flush(&mut crdt, 3, "bbb"));
-        updates.push(insert_and_flush(&mut crdt, 6, "ccc"));
+        insert_and_flush(&mut crdt, 0, "aaa");
+        insert_and_flush(&mut crdt, 3, "bbb");
+        insert_and_flush(&mut crdt, 6, "ccc");
 
         let snapshot = crdt.snapshot().unwrap();
         let fresh = YrsCrdt::from_snapshot(&snapshot, 99).unwrap();
@@ -452,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prefix_roundtrip() {
+    fn test_postcard_roundtrip() {
         let mut alice = YrsCrdt::with_client_id(1);
         let mut bob = YrsCrdt::with_client_id(2);
 
@@ -463,9 +528,12 @@ mod tests {
         }
         alice.mark_dirty();
         let update = alice.flush_update().unwrap().unwrap();
-        assert_eq!(update[0], DOC_PREFIX);
-        bob.apply(&update).unwrap();
 
+        let msg: CrdtMessage = postcard::from_bytes(&update).unwrap();
+        assert!(msg.doc_update.is_some());
+        assert_eq!(msg.awareness.client_id, 1);
+
+        bob.apply(&update).unwrap();
         let text = bob.doc().get_or_insert_text("doc");
         let txn = bob.doc().transact();
         assert_eq!(text.get_string(&txn), "Hello");
@@ -476,12 +544,17 @@ mod tests {
         let mut alice = YrsCrdt::with_client_id(1);
         let mut bob = YrsCrdt::with_client_id(2);
 
-        alice.set_local_state(r#"{"cursor":5}"#);
+        alice.set_cursor(5, 5);
         let awareness_msg = alice.flush_update().unwrap().unwrap();
-        assert_eq!(awareness_msg[0], AWARENESS_PREFIX);
+
+        let msg: CrdtMessage = postcard::from_bytes(&awareness_msg).unwrap();
+        assert!(msg.doc_update.is_none());
+        assert_eq!(msg.awareness.cursor, Some(5));
 
         bob.apply(&awareness_msg).unwrap();
-        assert_eq!(bob.awareness_states().get(&1).unwrap(), r#"{"cursor":5}"#);
+        let peer = bob.awareness_states().get(&1).unwrap();
+        assert_eq!(peer.cursor, Some(5));
+        assert_eq!(peer.selection_end, Some(5));
     }
 
     #[test]
@@ -489,19 +562,19 @@ mod tests {
         let mut alice = YrsCrdt::with_client_id(1);
         let mut bob = YrsCrdt::with_client_id(2);
 
-        alice.set_local_state(r#"{"cursor":0}"#);
+        alice.set_cursor(0, 0);
         let msg1 = alice.flush_update().unwrap().unwrap();
         bob.apply(&msg1).unwrap();
-        assert!(bob.awareness_states().contains_key(&1));
+        assert!(bob.awareness_states().get(&1).unwrap().cursor.is_some());
 
         alice.clear_local_state();
         let msg2 = alice.flush_update().unwrap().unwrap();
         bob.apply(&msg2).unwrap();
-        assert!(!bob.awareness_states().contains_key(&1));
+        assert!(bob.awareness_states().get(&1).unwrap().cursor.is_none());
     }
 
     #[test]
-    fn test_flush_returns_doc_then_awareness_then_none() {
+    fn test_flush_returns_combined_then_none() {
         let mut crdt = YrsCrdt::with_client_id(1);
 
         {
@@ -510,13 +583,12 @@ mod tests {
             text.insert(&mut txn, 0, "hi");
         }
         crdt.mark_dirty();
-        crdt.set_local_state(r#"{"cursor":2}"#);
+        crdt.set_cursor(2, 2);
 
         let first = crdt.flush_update().unwrap().unwrap();
-        assert_eq!(first[0], DOC_PREFIX);
-
-        let second = crdt.flush_update().unwrap().unwrap();
-        assert_eq!(second[0], AWARENESS_PREFIX);
+        let msg: CrdtMessage = postcard::from_bytes(&first).unwrap();
+        assert!(msg.doc_update.is_some());
+        assert_eq!(msg.awareness.cursor, Some(2));
 
         assert!(crdt.flush_update().unwrap().is_none());
     }
@@ -531,26 +603,19 @@ mod tests {
             text.insert(&mut txn, 0, "Hello");
         }
         alice.mark_dirty();
-        let doc_update = alice.flush_update().unwrap().unwrap();
+        alice.set_cursor(5, 5);
+        let update = alice.flush_update().unwrap().unwrap();
 
-        alice.set_local_state(r#"{"cursor":5}"#);
-        let awareness_update = alice.flush_update().unwrap().unwrap();
-
-        // Simulate compaction: create a temporary CRDT, apply both updates,
-        // then wire_snapshot(). The result should contain no awareness data.
         let mut temp = YrsCrdt::with_client_id(0);
-        temp.apply(&doc_update).unwrap();
-        temp.apply(&awareness_update).unwrap();
-        // Awareness was parsed into temp, but snapshot ignores it
+        temp.apply(&update).unwrap();
         assert!(temp.awareness_states().contains_key(&1));
 
         let compacted = temp.wire_snapshot().unwrap();
-        assert_eq!(compacted[0], DOC_PREFIX);
 
-        // Apply compacted snapshot to a fresh CRDT — no awareness leaks
         let mut fresh = YrsCrdt::with_client_id(99);
         fresh.apply(&compacted).unwrap();
-        assert!(fresh.awareness_states().is_empty());
+        // wire_snapshot carries temp's awareness (client 0), not alice's
+        assert!(!fresh.awareness_states().contains_key(&1));
 
         let text = fresh.doc().get_or_insert_text("doc");
         let txn = fresh.doc().transact();
@@ -558,12 +623,12 @@ mod tests {
     }
 
     #[test]
-    fn test_wire_snapshot_is_prefixed() {
+    fn test_wire_snapshot_is_postcard() {
         let crdt = YrsCrdt::with_client_id(1);
-        let raw = crdt.snapshot().unwrap();
         let wire = crdt.wire_snapshot().unwrap();
-        assert_eq!(wire[0], DOC_PREFIX);
-        assert_eq!(&wire[1..], &raw);
+        let msg: CrdtMessage = postcard::from_bytes(&wire).unwrap();
+        assert!(msg.doc_update.is_some());
+        assert_eq!(msg.awareness.client_id, 1);
     }
 
     #[test]
@@ -584,8 +649,110 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_rejects_unknown_prefix() {
+    fn test_apply_rejects_garbage() {
         let mut crdt = YrsCrdt::with_client_id(1);
         assert!(crdt.apply(&[0x42, 0x00]).is_err());
+    }
+
+    /// yrs 0.25: V2 delete markers silently truncate the *referenced item's*
+    /// client ID to 32 bits. Inserts, full-state diffs, and the deleting
+    /// client's own ID are all fine — only the delete target reference breaks.
+    ///
+    /// - Items created by a >32-bit client can be inserted and synced correctly.
+    /// - Deleting those items produces a diff that decodes without error but
+    ///   silently refers to the wrong (truncated) client ID, so the delete
+    ///   is a no-op on the receiving peer.
+    ///
+    /// Workaround: mask `as_client_id()` to 32 bits (`& 0xFFFF_FFFF`).
+    #[test]
+    fn test_v2_delete_truncates_large_client_id() {
+        let large_cid: u64 = 0x0000_0001_CAFE_BABE; // 33 bits
+        let small_cid: u64 = 42;
+
+        // Insert with large CID works
+        let doc = Doc::with_client_id(large_cid);
+        let t = doc.get_or_insert_text("doc");
+        t.insert(&mut doc.transact_mut(), 0, "Hello");
+        let full = doc.transact().encode_diff_v2(&StateVector::default());
+        let doc2 = Doc::new();
+        doc2.get_or_insert_text("doc");
+        doc2.transact_mut()
+            .apply_update(Update::decode_v2(&full).unwrap())
+            .unwrap();
+        assert_eq!(
+            doc2.get_or_insert_text("doc").get_string(&doc2.transact()),
+            "Hello",
+            "insert with large CID should work"
+        );
+
+        // Delete of items created by large CID: diff decodes but delete is no-op
+        let sv = doc.transact().state_vector();
+        t.remove_range(&mut doc.transact_mut(), 0, 5);
+        let del = doc.transact().encode_diff_v2(&sv);
+        // Decodes successfully — no error
+        let del_update = Update::decode_v2(&del).unwrap();
+        doc2.transact_mut().apply_update(del_update).unwrap();
+        // BUG: delete silently failed — text is still "Hello"
+        assert_eq!(
+            doc2.get_or_insert_text("doc").get_string(&doc2.transact()),
+            "Hello",
+            "yrs bug: delete of >32-bit CID items is silently ignored"
+        );
+
+        // When a small-CID client deletes items created by a large-CID client,
+        // the same bug occurs: the delete target reference is truncated.
+        let bob = Doc::with_client_id(small_cid);
+        bob.get_or_insert_text("doc");
+        bob.transact_mut()
+            .apply_update(Update::decode_v2(&full).unwrap())
+            .unwrap();
+        let sv_b = bob.transact().state_vector();
+        bob.get_or_insert_text("doc")
+            .remove_range(&mut bob.transact_mut(), 0, 5);
+        let del_b = bob.transact().encode_diff_v2(&sv_b);
+        let charlie = Doc::with_client_id(99);
+        charlie.get_or_insert_text("doc");
+        charlie
+            .transact_mut()
+            .apply_update(Update::decode_v2(&full).unwrap())
+            .unwrap();
+        charlie
+            .transact_mut()
+            .apply_update(Update::decode_v2(&del_b).unwrap())
+            .unwrap();
+        assert_eq!(
+            charlie
+                .get_or_insert_text("doc")
+                .get_string(&charlie.transact()),
+            "Hello",
+            "yrs bug: small-CID client deleting large-CID items also silently fails"
+        );
+
+        // Sanity: 32-bit CID deletes work correctly
+        let doc32 = Doc::with_client_id(0xCAFE_BABE);
+        let t32 = doc32.get_or_insert_text("doc");
+        t32.insert(&mut doc32.transact_mut(), 0, "Hello");
+        let full32 = doc32.transact().encode_diff_v2(&StateVector::default());
+        let sv32 = doc32.transact().state_vector();
+        t32.remove_range(&mut doc32.transact_mut(), 0, 5);
+        let del32 = doc32.transact().encode_diff_v2(&sv32);
+
+        let peer32 = Doc::new();
+        peer32.get_or_insert_text("doc");
+        peer32
+            .transact_mut()
+            .apply_update(Update::decode_v2(&full32).unwrap())
+            .unwrap();
+        peer32
+            .transact_mut()
+            .apply_update(Update::decode_v2(&del32).unwrap())
+            .unwrap();
+        assert_eq!(
+            peer32
+                .get_or_insert_text("doc")
+                .get_string(&peer32.transact()),
+            "",
+            "32-bit CID deletes should work"
+        );
     }
 }

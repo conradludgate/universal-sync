@@ -120,6 +120,8 @@ async fn doc_actor_local_edit_round_trip() {
             position: 0,
             text: "hello".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -141,6 +143,8 @@ async fn doc_actor_multiple_sequential_edits() {
             position: 0,
             text: "Hello".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -151,6 +155,8 @@ async fn doc_actor_multiple_sequential_edits() {
             position: 5,
             text: " World".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -161,6 +167,8 @@ async fn doc_actor_multiple_sequential_edits() {
             position: 11,
             text: "!".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -182,6 +190,8 @@ async fn doc_actor_delete_after_insert() {
             position: 0,
             text: "Hello World".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -192,6 +202,8 @@ async fn doc_actor_delete_after_insert() {
             position: 5,
             length: 6,
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -259,6 +271,8 @@ async fn doc_actor_remote_update_triggers_event() {
             position: 0,
             text: "Hello".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -360,6 +374,8 @@ async fn coordinator_create_multiple_documents() {
             position: 0,
             text: "doc A text".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -432,6 +448,8 @@ async fn coordinator_join_via_welcome() {
             position: 0,
             text: "Hello from Alice".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -541,6 +559,8 @@ async fn full_two_peer_sync() {
             position: 0,
             text: "Hello".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -563,6 +583,8 @@ async fn full_two_peer_sync() {
             position: 5,
             text: " World".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -661,6 +683,8 @@ async fn two_member_unidirectional_sync() {
             position: 0,
             text: "Hello".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -684,6 +708,8 @@ async fn two_member_unidirectional_sync() {
             position: 5,
             text: " World".into(),
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await
@@ -707,6 +733,8 @@ async fn two_member_unidirectional_sync() {
             position: 5,
             length: 6,
         },
+        anchor: 0,
+        head: 0,
         reply,
     })
     .await

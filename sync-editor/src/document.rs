@@ -30,8 +30,6 @@ where
     request_rx: mpsc::Receiver<DocRequest>,
     event_rx: broadcast::Receiver<GroupEvent>,
     emitter: E,
-    cursor_anchor: u32,
-    cursor_head: u32,
 }
 
 impl<C, CS, E> DocumentActor<C, CS, E>
@@ -56,14 +54,12 @@ where
             request_rx,
             event_rx,
             emitter,
-            cursor_anchor: 0,
-            cursor_head: 0,
         }
     }
 
     pub async fn run(mut self) {
         self.emit_group_state().await;
-        self.write_awareness_state();
+        self.crdt.set_cursor(0, 0);
 
         let delta_buf: Arc<Mutex<Vec<Delta>>> = Arc::new(Mutex::new(Vec::new()));
         {
@@ -97,7 +93,7 @@ where
             });
         }
 
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
         heartbeat.tick().await; // consume immediate first tick
 
         loop {
@@ -141,9 +137,12 @@ where
                     }
                 }
                 _ = heartbeat.tick() => {
-                    self.write_awareness_state();
+                    self.crdt.set_cursor(0, 0);
                     if let Err(e) = self.group.send_update(&mut self.crdt).await {
                         tracing::debug!(?e, "heartbeat send failed");
+                    }
+                    if self.crdt.expire_stale_peers(universal_sync_testing::AWARENESS_TIMEOUT) {
+                        self.emit_awareness();
                     }
                 }
             }
@@ -157,9 +156,16 @@ where
     /// Returns `true` if shutdown was requested.
     async fn handle_request(&mut self, request: DocRequest) -> bool {
         match request {
-            DocRequest::ApplyDelta { delta, reply } => {
+            DocRequest::ApplyDelta {
+                delta,
+                anchor,
+                head,
+                reply,
+            } => {
+                self.crdt.set_cursor(anchor, head);
                 let result = self.apply_delta(delta).await;
                 let _ = reply.send(result);
+                self.emit_awareness();
             }
             DocRequest::GetText { reply } => {
                 let _ = reply.send(Ok(self.get_text()));
@@ -210,9 +216,7 @@ where
                 let _ = reply.send(result);
             }
             DocRequest::UpdateCursor { anchor, head } => {
-                self.cursor_anchor = anchor;
-                self.cursor_head = head;
-                self.write_awareness_state();
+                self.crdt.set_cursor(anchor, head);
                 if let Err(e) = self.group.send_update(&mut self.crdt).await {
                     tracing::debug!(?e, "cursor update send failed");
                 }
@@ -320,6 +324,7 @@ where
                 index: m.index,
                 identity,
                 is_self: m.is_self,
+                client_id: m.client_id,
             });
         }
         for a in &ctx.acceptors {
@@ -410,27 +415,15 @@ where
         }
     }
 
-    fn write_awareness_state(&mut self) {
-        let json = format!(
-            r#"{{"cursor":{},"selection_end":{}}}"#,
-            self.cursor_anchor, self.cursor_head,
-        );
-        self.crdt.set_local_state(&json);
-    }
-
     fn emit_awareness(&self) {
         let peers: Vec<AwarenessPeer> = self
             .crdt
             .awareness_states()
-            .iter()
-            .map(|(&client_id, json)| {
-                let cursor = parse_json_u32(json, "cursor");
-                let selection_end = parse_json_u32(json, "selection_end");
-                AwarenessPeer {
-                    client_id,
-                    cursor,
-                    selection_end,
-                }
+            .values()
+            .map(|pa| AwarenessPeer {
+                client_id: pa.client_id,
+                cursor: pa.cursor,
+                selection_end: pa.selection_end,
             })
             .collect();
         let payload = AwarenessPayload {
@@ -439,12 +432,4 @@ where
         };
         self.emitter.emit_awareness_changed(&payload);
     }
-}
-
-fn parse_json_u32(json: &str, key: &str) -> Option<u32> {
-    let pattern = format!(r#""{}":"#, key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit())?;
-    rest[..end].parse().ok()
 }

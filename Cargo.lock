@@ -7133,6 +7133,7 @@ dependencies = [
  "mls-rs",
  "mls-rs-crypto-rustcrypto",
  "postcard",
+ "serde",
  "tempfile",
  "tokio",
  "tracing",

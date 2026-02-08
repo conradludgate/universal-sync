@@ -554,7 +554,16 @@ body {
     margin-bottom: 2px;
 }
 
-.peer-item-info { min-width: 0; }
+.peer-item-info { min-width: 0; display: flex; align-items: center; gap: 6px; }
+
+.peer-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.peer-status-dot.online { background-color: #22c55e; }
+.peer-status-dot.offline { background-color: #6b7280; }
 
 .peer-item-id {
     font-size: 0.75rem;

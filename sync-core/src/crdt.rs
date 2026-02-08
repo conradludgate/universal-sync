@@ -78,7 +78,7 @@ pub struct CompactionLevel {
 /// levels (L0 for raw messages + L(max) for the full compacted snapshot).
 pub type CompactionConfig = Vec<CompactionLevel>;
 
-/// Default 3-level config: L0 → L1 after 10 messages, L1 → L2 after 5.
+/// Default 3-level config: L0 → L1 after 50 messages, L1 → L2 after 10.
 #[must_use]
 pub fn default_compaction_config() -> CompactionConfig {
     vec![
@@ -87,11 +87,11 @@ pub fn default_compaction_config() -> CompactionConfig {
             replication: 1,
         },
         CompactionLevel {
-            threshold: 10,
+            threshold: 50,
             replication: 2,
         },
         CompactionLevel {
-            threshold: 5,
+            threshold: 10,
             replication: 0,
         },
     ]
@@ -147,9 +147,9 @@ mod tests {
         assert_eq!(config.len(), 3);
         assert_eq!(config[0].threshold, 0); // L0: no threshold
         assert_eq!(config[0].replication, 1);
-        assert_eq!(config[1].threshold, 10); // L0 → L1 after 10
+        assert_eq!(config[1].threshold, 50); // L0 → L1 after 50
         assert_eq!(config[1].replication, 2);
-        assert_eq!(config[2].threshold, 5); // L1 → L2 after 5
+        assert_eq!(config[2].threshold, 10); // L1 → L2 after 10
         assert_eq!(config[2].replication, 0); // L(max) → all acceptors
     }
 

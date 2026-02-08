@@ -30,7 +30,7 @@ use universal_sync_core::{
 
 use crate::connection::ConnectionManager;
 use crate::connector::ProposalRequest;
-use crate::learner::GroupLearner;
+use crate::learner::{GroupLearner, fingerprint_of_member};
 
 /// Marker error for group operations. Use `error_stack::Report<GroupError>` with
 /// context attachments for details.
@@ -173,6 +173,7 @@ pub struct MemberInfo {
     pub index: u32,
     pub identity: Vec<u8>,
     pub is_self: bool,
+    pub client_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +214,7 @@ where
     cancel_guard: tokio_util::sync::DropGuard,
     actor_handle: Option<JoinHandle<()>>,
     group_id: GroupId,
+    my_client_id: u64,
 }
 
 /// `block_in_place` on multi-threaded runtimes, direct call on single-threaded.
@@ -425,6 +427,16 @@ where
         compaction_config: CompactionConfig,
         key_rotation_interval_secs: Option<u64>,
     ) -> Self {
+        let my_client_id = {
+            let my_index = learner.group().current_member_index();
+            learner
+                .group()
+                .roster()
+                .member_with_index(my_index)
+                .map(|m| fingerprint_of_member(&group_id, &m).as_client_id())
+                .unwrap_or(0)
+        };
+
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
         let (request_tx, request_rx) = mpsc::channel(64);
@@ -456,6 +468,7 @@ where
             cancel_guard,
             actor_handle: Some(actor_handle),
             group_id,
+            my_client_id,
         }
     }
 }
@@ -675,6 +688,11 @@ where
     #[must_use]
     pub fn group_id(&self) -> GroupId {
         self.group_id
+    }
+
+    #[must_use]
+    pub fn my_client_id(&self) -> u64 {
+        self.my_client_id
     }
 
     /// Unlike `Drop`, this waits for actors to complete.

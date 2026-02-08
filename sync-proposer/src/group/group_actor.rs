@@ -25,7 +25,7 @@ use super::{
 };
 use crate::connection::ConnectionManager;
 use crate::connector::{ProposalRequest, ProposalResponse};
-use crate::learner::GroupLearner;
+use crate::learner::{GroupLearner, fingerprint_of_member};
 
 pub(crate) struct GroupActor<C, CS>
 where
@@ -478,6 +478,7 @@ where
                     .map(|b| b.identifier.clone())
                     .unwrap_or_default(),
                 is_self: m.index == my_index,
+                client_id: fingerprint_of_member(&self.group_id, m).as_client_id(),
             })
             .collect::<Vec<_>>();
         let member_count = members.len();
@@ -1277,10 +1278,9 @@ where
             self.learner
                 .group()
                 .roster()
-                .members()
-                .iter()
-                .find(|m| m.index == idx)
-                .map(|m| crate::learner::fingerprint_of_member(&self.group_id, m))
+                .member_with_index(idx)
+                .map(|m| crate::learner::fingerprint_of_member(&self.group_id, &m))
+                .ok()
         });
 
         for proposal_info in applied_proposals {
@@ -1467,10 +1467,9 @@ where
             .learner
             .group()
             .roster()
-            .members()
-            .iter()
-            .find(|m| m.index == sender_member.0)
-            .map(|m| crate::learner::fingerprint_of_member(&self.group_id, m));
+            .member_with_index(sender_member.0)
+            .map(|m| crate::learner::fingerprint_of_member(&self.group_id, &m))
+            .ok();
 
         let Some(sender_fp) = sender_fp else {
             tracing::debug!(
