@@ -85,11 +85,47 @@ where
     let remote_id = conn.remote_id();
     debug!(?remote_id, "accepted connection");
 
-    loop {
-        let (send, recv) = conn.accept_bi().await.change_context(ConnectorError)?;
+    let metrics = registry.metrics().clone();
+    metrics.metrics.connections_opened_total.inc();
 
-        tokio::spawn(handle_stream(send, recv, registry.clone()));
-    }
+    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_tx: u64 = 0;
+    let mut last_rx: u64 = 0;
+
+    let mut flush_stats = || {
+        let stats = conn.stats();
+        let tx = stats.udp_tx.bytes;
+        let rx = stats.udp_rx.bytes;
+        metrics.metrics.data_sent_bytes_total.inc_by(tx - last_tx);
+        metrics
+            .metrics
+            .data_received_bytes_total
+            .inc_by(rx - last_rx);
+        last_tx = tx;
+        last_rx = rx;
+    };
+
+    let result = loop {
+        tokio::select! {
+            incoming = conn.accept_bi() => {
+                match incoming.change_context(ConnectorError) {
+                    Ok((send, recv)) => {
+                        tokio::spawn(handle_stream(send, recv, registry.clone()));
+                    }
+                    Err(e) => break Err(e),
+                }
+            }
+            _ = stats_interval.tick() => {
+                flush_stats();
+            }
+        }
+    };
+
+    flush_stats();
+    metrics.metrics.connections_closed_total.inc();
+
+    result
 }
 
 #[instrument(skip_all, name = "stream")]

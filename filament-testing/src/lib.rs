@@ -6,7 +6,9 @@ pub mod yrs_crdt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
-use filament_spool::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
+use filament_spool::{
+    AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
+};
 use filament_weave::WeaverClient;
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use mls_rs::crypto::SignatureSecretKey;
@@ -166,8 +168,16 @@ pub async fn spawn_acceptor() -> (tokio::task::JoinHandle<()>, EndpointAddr, Tem
         .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
         .build();
 
-    let registry =
-        AcceptorRegistry::new(external_client, cipher_suite, state_store, endpoint.clone());
+    let metrics = AcceptorMetrics::new(state_store.clone());
+    let metrics_encoder = std::sync::Arc::new(MetricsEncoder::new(metrics));
+
+    let registry = AcceptorRegistry::new(
+        external_client,
+        cipher_suite,
+        state_store,
+        endpoint.clone(),
+        metrics_encoder,
+    );
 
     let task = tokio::spawn({
         let endpoint = endpoint.clone();

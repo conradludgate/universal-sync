@@ -8,7 +8,9 @@ use std::time::Duration;
 use filament_core::{
     AcceptorId, CompactionLevel, GroupId, NoCrdt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
 };
-use filament_spool::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
+use filament_spool::{
+    AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
+};
 use filament_testing::{
     YrsCrdt, init_tracing, spawn_acceptor, test_cipher_suite, test_crypto_provider, test_endpoint,
     test_identity_provider, test_weaver_client, test_yrs_weaver_client,
@@ -110,11 +112,15 @@ async fn test_alice_adds_bob_with_group_api() {
     let acceptor_task = tokio::spawn({
         let acceptor_endpoint = acceptor_endpoint.clone();
 
+        let metrics = std::sync::Arc::new(MetricsEncoder::new(AcceptorMetrics::new(
+            state_store.clone(),
+        )));
         let registry = AcceptorRegistry::new(
             external_client,
             cipher_suite.clone(),
             state_store.clone(),
             acceptor_endpoint.clone(),
+            metrics,
         );
 
         async move {
@@ -245,11 +251,15 @@ async fn test_acceptor_add_remove() {
             .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
             .build();
 
+        let metrics = std::sync::Arc::new(MetricsEncoder::new(AcceptorMetrics::new(
+            state_store1.clone(),
+        )));
         let registry = AcceptorRegistry::new(
             external_client,
             cipher_suite.clone(),
             state_store1.clone(),
             acceptor_endpoint.clone(),
+            metrics,
         );
 
         async move {
@@ -278,11 +288,15 @@ async fn test_acceptor_add_remove() {
             .custom_proposal_types(Some(SYNC_PROPOSAL_TYPE))
             .build();
 
+        let metrics = std::sync::Arc::new(MetricsEncoder::new(AcceptorMetrics::new(
+            state_store2.clone(),
+        )));
         let registry = AcceptorRegistry::new(
             external_client,
             cipher_suite.clone(),
             state_store2.clone(),
             acceptor_endpoint.clone(),
+            metrics,
         );
 
         async move {

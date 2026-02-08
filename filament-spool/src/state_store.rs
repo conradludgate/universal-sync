@@ -48,15 +48,58 @@ struct SlimAccepted {
 
 const PROMISED_SENTINEL_EPOCH: u64 = u64::MAX;
 
+fn group_keyspace_prefix(group_id: &GroupId) -> String {
+    bs58::encode(group_id.as_bytes()).into_string()
+}
+
+fn keyspace_opts() -> KeyspaceCreateOptions {
+    KeyspaceCreateOptions::default()
+        .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
+}
+
+#[derive(Clone)]
+struct GroupKeyspaces {
+    accepted: Keyspace,
+    messages: Keyspace,
+    snapshots: Keyspace,
+}
+
+impl GroupKeyspaces {
+    fn open(db: &Database, group_id: &GroupId) -> Result<Self, fjall::Error> {
+        let prefix = group_keyspace_prefix(group_id);
+        let accepted = db.keyspace(&format!("{prefix}.accepted"), keyspace_opts)?;
+        let messages = db.keyspace(&format!("{prefix}.messages"), keyspace_opts)?;
+        let snapshots = db.keyspace(&format!("{prefix}.snapshots"), keyspace_opts)?;
+        Ok(Self {
+            accepted,
+            messages,
+            snapshots,
+        })
+    }
+
+    pub fn disk_space(&self) -> GroupStorageSizes {
+        GroupStorageSizes {
+            accepted_bytes: self.accepted.disk_space(),
+            messages_bytes: self.messages.disk_space(),
+            snapshots_bytes: self.snapshots.disk_space(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GroupStorageSizes {
+    pub accepted_bytes: u64,
+    pub messages_bytes: u64,
+    pub snapshots_bytes: u64,
+}
+
 type GroupBroadcasts = RwLock<HashMap<[u8; 32], broadcast::Sender<(GroupProposal, GroupMessage)>>>;
 type MessageBroadcasts =
     RwLock<HashMap<[u8; 32], broadcast::Sender<(MessageId, EncryptedAppMessage)>>>;
 
 pub(crate) struct FjallStateStore {
     db: Database,
-    accepted: Keyspace,
-    messages: Keyspace,
-    snapshots: Keyspace,
+    keyspaces_cache: RwLock<HashMap<GroupId, GroupKeyspaces>>,
     broadcasts: GroupBroadcasts,
     message_broadcasts: MessageBroadcasts,
 }
@@ -72,41 +115,33 @@ impl FjallStateStore {
     fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
         let db = Database::builder(path).open()?;
 
-        let opts = || {
-            KeyspaceCreateOptions::default()
-                .data_block_compression_policy(fjall::config::CompressionPolicy::disabled())
-        };
-
-        let accepted = db.keyspace("accepted", opts)?;
-        let messages = db.keyspace("messages", opts)?;
-        let snapshots = db.keyspace("snapshots", opts)?;
-
         Ok(Self {
             db,
-            accepted,
-            messages,
-            snapshots,
+            keyspaces_cache: RwLock::new(HashMap::new()),
             broadcasts: RwLock::new(HashMap::new()),
             message_broadcasts: RwLock::new(HashMap::new()),
         })
     }
 
-    fn build_key(group_id: &GroupId, epoch: Epoch) -> [u8; 40] {
-        let mut key = [0u8; 40];
-        key[..32].copy_from_slice(group_id.as_bytes());
-        key[32..].copy_from_slice(&epoch.0.to_be_bytes());
-        key
+    fn get_keyspaces(&self, group_id: &GroupId) -> GroupKeyspaces {
+        if let Some(ks) = self.keyspaces_cache.read().unwrap().get(group_id) {
+            return ks.clone();
+        }
+
+        let ks = GroupKeyspaces::open(&self.db, group_id).expect("failed to open group keyspaces");
+        self.keyspaces_cache
+            .write()
+            .unwrap()
+            .insert(*group_id, ks.clone());
+        ks
     }
 
-    fn build_group_prefix(group_id: &GroupId) -> [u8; 32] {
-        *group_id.as_bytes()
+    fn build_epoch_key(epoch: Epoch) -> [u8; 8] {
+        epoch.0.to_be_bytes()
     }
 
     fn parse_epoch_from_key(key: &[u8]) -> Option<Epoch> {
-        if key.len() < 40 {
-            return None;
-        }
-        let epoch_bytes: [u8; 8] = key[32..40].try_into().ok()?;
+        let epoch_bytes: [u8; 8] = key.try_into().ok()?;
         Some(Epoch(u64::from_be_bytes(epoch_bytes)))
     }
 
@@ -120,22 +155,21 @@ impl FjallStateStore {
         postcard::from_bytes(payload).ok()
     }
 
-    /// Message key: `group_id` (32) || `sender_fingerprint` (8) || `seq` (8) = 48 bytes.
-    fn build_message_key(group_id: &GroupId, sender: MemberFingerprint, seq: u64) -> [u8; 48] {
-        let mut key = [0u8; 48];
-        key[..32].copy_from_slice(group_id.as_bytes());
-        key[32..40].copy_from_slice(sender.as_bytes());
-        key[40..48].copy_from_slice(&seq.to_be_bytes());
+    /// Message key: `sender_fingerprint` (8) || `seq` (8) = 16 bytes.
+    fn build_message_key(sender: MemberFingerprint, seq: u64) -> [u8; 16] {
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(sender.as_bytes());
+        key[8..16].copy_from_slice(&seq.to_be_bytes());
         key
     }
 
     fn message_id_from_key(group_id: &GroupId, key: &[u8]) -> Option<MessageId> {
-        if key.len() < 48 {
+        if key.len() < 16 {
             return None;
         }
         let mut fp = [0u8; 8];
-        fp.copy_from_slice(&key[32..40]);
-        let seq = u64::from_be_bytes(key[40..48].try_into().ok()?);
+        fp.copy_from_slice(&key[..8]);
+        let seq = u64::from_be_bytes(key[8..16].try_into().ok()?);
         Some(MessageId {
             group_id: *group_id,
             sender: MemberFingerprint(fp),
@@ -159,9 +193,10 @@ impl FjallStateStore {
         id: &MessageId,
         msg: &EncryptedAppMessage,
     ) -> Result<(), fjall::Error> {
-        let msg_key = Self::build_message_key(group_id, id.sender, id.seq);
+        let ks = self.get_keyspaces(group_id);
+        let msg_key = Self::build_message_key(id.sender, id.seq);
         let msg_bytes = Self::serialize_app_message(msg);
-        self.messages.insert(msg_key, &msg_bytes)?;
+        ks.messages.insert(msg_key, &msg_bytes)?;
 
         self.db.persist(PersistMode::SyncAll)?;
 
@@ -179,19 +214,13 @@ impl FjallStateStore {
         group_id: &GroupId,
         state_vector: &StateVector,
     ) -> Vec<(MessageId, EncryptedAppMessage)> {
-        let prefix = Self::build_group_prefix(group_id);
-        let start_key = prefix;
-
+        let ks = self.get_keyspaces(group_id);
         let mut messages = Vec::new();
 
-        for guard in self.messages.range(start_key..) {
+        for guard in ks.messages.iter() {
             let Ok((key, value)) = guard.into_inner() else {
                 continue;
             };
-
-            if key.len() < 32 || &key[..32] != prefix.as_slice() {
-                break;
-            }
 
             if let Some(msg_id) = Self::message_id_from_key(group_id, &key) {
                 let covered = state_vector
@@ -211,24 +240,20 @@ impl FjallStateStore {
         group_id: &GroupId,
         watermark: &StateVector,
     ) -> Result<usize, fjall::Error> {
-        let prefix = Self::build_group_prefix(group_id);
+        let ks = self.get_keyspaces(group_id);
         let mut deleted = 0;
 
-        for guard in self.messages.range(prefix..) {
+        for guard in ks.messages.iter() {
             let Ok((key, _)) = guard.into_inner() else {
                 continue;
             };
-
-            if key.len() < 32 || &key[..32] != prefix.as_slice() {
-                break;
-            }
 
             if let Some(msg_id) = Self::message_id_from_key(group_id, &key)
                 && watermark
                     .get(&msg_id.sender)
                     .is_some_and(|&hw| msg_id.seq <= hw)
             {
-                self.messages.remove(&*key)?;
+                ks.messages.remove(&*key)?;
                 deleted += 1;
             }
         }
@@ -254,8 +279,9 @@ impl FjallStateStore {
     }
 
     fn get_promised_sync(&self, group_id: &GroupId, epoch: Epoch) -> Option<GroupProposal> {
-        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
-        self.accepted
+        let ks = self.get_keyspaces(group_id);
+        let key = Self::build_epoch_key(Epoch(PROMISED_SENTINEL_EPOCH));
+        ks.accepted
             .get(key)
             .ok()
             .flatten()
@@ -268,8 +294,9 @@ impl FjallStateStore {
         group_id: &GroupId,
         epoch: Epoch,
     ) -> Option<(GroupProposal, GroupMessage)> {
-        let key = Self::build_key(group_id, epoch);
-        let bytes = self.accepted.get(key).ok()??;
+        let ks = self.get_keyspaces(group_id);
+        let key = Self::build_epoch_key(epoch);
+        let bytes = ks.accepted.get(key).ok()??;
         Self::decode_slim_accepted(&bytes, epoch)
     }
 
@@ -296,9 +323,10 @@ impl FjallStateStore {
         group_id: &GroupId,
         proposal: &GroupProposal,
     ) -> Result<(), fjall::Error> {
-        let key = Self::build_key(group_id, Epoch(PROMISED_SENTINEL_EPOCH));
+        let ks = self.get_keyspaces(group_id);
+        let key = Self::build_epoch_key(Epoch(PROMISED_SENTINEL_EPOCH));
         let value = Self::serialize_proposal(proposal);
-        self.accepted.insert(key, &value)?;
+        ks.accepted.insert(key, &value)?;
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
@@ -309,7 +337,8 @@ impl FjallStateStore {
         proposal: &GroupProposal,
         message: &GroupMessage,
     ) -> Result<(), fjall::Error> {
-        let key = Self::build_key(group_id, proposal.epoch);
+        let ks = self.get_keyspaces(group_id);
+        let key = Self::build_epoch_key(proposal.epoch);
 
         let slim = SlimAccepted {
             member_id: proposal.member_id,
@@ -320,7 +349,7 @@ impl FjallStateStore {
         let data = postcard::to_allocvec(&slim).expect("serialization should not fail");
         let value = storage_versioned_encode(STORAGE_VERSION, &data);
 
-        self.accepted.insert(key, &value)?;
+        ks.accepted.insert(key, &value)?;
         self.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
@@ -330,16 +359,13 @@ impl FjallStateStore {
         group_id: &GroupId,
         from_epoch: Epoch,
     ) -> Vec<(GroupProposal, GroupMessage)> {
-        let start_key = Self::build_key(group_id, from_epoch);
-        let prefix = Self::build_group_prefix(group_id);
+        let ks = self.get_keyspaces(group_id);
+        let start_key = Self::build_epoch_key(from_epoch);
 
-        self.accepted
+        ks.accepted
             .range(start_key..)
             .filter_map(|guard| {
                 let (key, value) = guard.into_inner().ok()?;
-                if !key.starts_with(&prefix) {
-                    return None;
-                }
                 let epoch = Self::parse_epoch_from_key(&key)?;
                 if epoch < from_epoch || epoch.0 == PROMISED_SENTINEL_EPOCH {
                     return None;
@@ -350,19 +376,10 @@ impl FjallStateStore {
     }
 
     fn highest_accepted_round_sync(&self, group_id: &GroupId) -> Option<Epoch> {
-        let prefix = Self::build_group_prefix(group_id);
-
-        let mut end_key = prefix;
-        for byte in end_key.iter_mut().rev() {
-            if *byte < 0xFF {
-                *byte += 1;
-                break;
-            }
-            *byte = 0;
-        }
+        let ks = self.get_keyspaces(group_id);
 
         let mut highest: Option<Epoch> = None;
-        for guard in self.accepted.range(prefix..end_key) {
+        for guard in ks.accepted.iter() {
             if let Ok((key, _)) = guard.into_inner()
                 && let Some(epoch) = Self::parse_epoch_from_key(&key)
                 && epoch.0 != PROMISED_SENTINEL_EPOCH
@@ -394,23 +411,16 @@ impl FjallStateStore {
         epoch: Epoch,
         snapshot_bytes: &[u8],
     ) -> Result<(), fjall::Error> {
-        let key = Self::build_key(group_id, epoch);
-        self.snapshots.insert(key, snapshot_bytes)?;
+        let ks = self.get_keyspaces(group_id);
+        let key = Self::build_epoch_key(epoch);
+        ks.snapshots.insert(key, snapshot_bytes)?;
         Ok(())
     }
 
     fn get_latest_snapshot_sync(&self, group_id: &GroupId) -> Option<(Epoch, Vec<u8>)> {
-        let prefix = Self::build_group_prefix(group_id);
-        let mut end_key = prefix;
-        for byte in end_key.iter_mut().rev() {
-            if *byte < 0xFF {
-                *byte += 1;
-                break;
-            }
-            *byte = 0;
-        }
+        let ks = self.get_keyspaces(group_id);
 
-        for guard in self.snapshots.range(prefix..end_key).rev() {
+        for guard in ks.snapshots.iter().rev() {
             if let Ok((key, value)) = guard.into_inner()
                 && let Some(epoch) = Self::parse_epoch_from_key(&key)
             {
@@ -426,14 +436,10 @@ impl FjallStateStore {
         group_id: &GroupId,
         epoch: Epoch,
     ) -> Option<(Epoch, Vec<u8>)> {
-        let prefix = Self::build_group_prefix(group_id);
-        let target_key = Self::build_key(group_id, epoch);
+        let ks = self.get_keyspaces(group_id);
+        let target_key = Self::build_epoch_key(epoch);
 
-        for guard in self
-            .snapshots
-            .range(prefix.as_slice()..=target_key.as_slice())
-            .rev()
-        {
+        for guard in ks.snapshots.range(..=target_key.as_slice()).rev() {
             if let Ok((key, value)) = guard.into_inner()
                 && let Some(epoch) = Self::parse_epoch_from_key(&key)
             {
@@ -448,15 +454,7 @@ impl FjallStateStore {
         group_id: &GroupId,
         current_epoch: Epoch,
     ) -> Result<(), fjall::Error> {
-        let prefix = Self::build_group_prefix(group_id);
-        let mut end_key = prefix;
-        for byte in end_key.iter_mut().rev() {
-            if *byte < 0xFF {
-                *byte += 1;
-                break;
-            }
-            *byte = 0;
-        }
+        let ks = self.get_keyspaces(group_id);
 
         let mut kept_epochs = std::collections::HashSet::new();
         kept_epochs.insert(current_epoch.0);
@@ -475,7 +473,7 @@ impl FjallStateStore {
         let mut oldest_epoch: Option<u64> = None;
         let mut to_delete = Vec::new();
 
-        for guard in self.snapshots.range(prefix.as_slice()..end_key.as_slice()) {
+        for guard in ks.snapshots.iter() {
             if let Ok((key, _)) = guard.into_inner()
                 && let Some(epoch) = Self::parse_epoch_from_key(&key)
             {
@@ -489,33 +487,36 @@ impl FjallStateStore {
         }
 
         for key in to_delete {
-            self.snapshots.remove(&key)?;
+            ks.snapshots.remove(&key)?;
         }
 
         Ok(())
     }
 
     fn list_groups_sync(&self) -> Vec<GroupId> {
+        let names = self.db.list_keyspace_names();
         let mut groups = Vec::new();
-        let mut last_group: Option<[u8; 32]> = None;
+        let mut seen = std::collections::HashSet::new();
 
-        for guard in self.snapshots.iter() {
-            let Ok((key, _)) = guard.into_inner() else {
-                continue;
-            };
-            if key.len() < 32 {
-                continue;
+        for name in &names {
+            let name = name.as_ref();
+            if let Some(prefix) = name.strip_suffix(".snapshots")
+                && let Ok(bytes) = bs58::decode(prefix).into_vec()
+                && bytes.len() == 32
+            {
+                let mut group_bytes = [0u8; 32];
+                group_bytes.copy_from_slice(&bytes);
+                let gid = GroupId::new(group_bytes);
+                if seen.insert(gid) {
+                    groups.push(gid);
+                }
             }
-            let mut group_bytes = [0u8; 32];
-            group_bytes.copy_from_slice(&key[..32]);
-
-            if last_group.as_ref() == Some(&group_bytes) {
-                continue;
-            }
-            last_group = Some(group_bytes);
-            groups.push(GroupId::new(group_bytes));
         }
         groups
+    }
+
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
     }
 }
 
@@ -599,6 +600,16 @@ impl SharedFjallStateStore {
         group_id: &GroupId,
     ) -> broadcast::Receiver<(MessageId, EncryptedAppMessage)> {
         self.inner.subscribe_messages(group_id)
+    }
+
+    #[must_use]
+    pub fn group_storage_sizes(&self, group_id: &GroupId) -> GroupStorageSizes {
+        self.inner.get_keyspaces(group_id).disk_space()
+    }
+
+    #[must_use]
+    pub fn database(&self) -> &Database {
+        self.inner.database()
     }
 }
 
@@ -849,6 +860,10 @@ mod tests {
         }
     }
 
+    fn open_test_store(path: &Path) -> FjallStateStore {
+        FjallStateStore::open_sync(path).unwrap()
+    }
+
     #[test]
     fn slim_accepted_roundtrip() {
         let message = make_test_message();
@@ -878,7 +893,7 @@ mod tests {
     #[test]
     fn accepted_set_get_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([1u8; 32]);
         let message = make_test_message();
         let proposal = make_test_proposal(Epoch(10));
@@ -895,7 +910,7 @@ mod tests {
     #[test]
     fn accepted_from_range_query() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([2u8; 32]);
         let message = make_test_message();
 
@@ -913,7 +928,7 @@ mod tests {
     #[test]
     fn accepted_from_excludes_promised_sentinel() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([3u8; 32]);
         let message = make_test_message();
 
@@ -931,7 +946,7 @@ mod tests {
     #[test]
     fn promised_sentinel_matching_epoch() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([4u8; 32]);
 
         let proposal = make_test_proposal(Epoch(5));
@@ -948,7 +963,7 @@ mod tests {
     #[test]
     fn snapshot_crud() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([5u8; 32]);
 
         store.store_snapshot_sync(&gid, Epoch(0), b"snap0").unwrap();
@@ -983,7 +998,7 @@ mod tests {
     #[test]
     fn logarithmic_pruning() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([6u8; 32]);
 
         for e in 0..=20 {
@@ -994,7 +1009,6 @@ mod tests {
 
         store.prune_snapshots_sync(&gid, Epoch(20)).unwrap();
 
-        // Verify kept epochs: {0 (oldest), 20, 19, 18, 16, 12, 4}
         let remaining: Vec<u64> = (0..=20)
             .filter(|&e| {
                 store
@@ -1020,7 +1034,7 @@ mod tests {
     #[test]
     fn list_groups_from_snapshots() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
 
         let gid1 = GroupId::new([1u8; 32]);
         let gid2 = GroupId::new([2u8; 32]);
@@ -1038,7 +1052,7 @@ mod tests {
     #[test]
     fn highest_accepted_excludes_sentinel() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([7u8; 32]);
         let message = make_test_message();
 
@@ -1055,7 +1069,7 @@ mod tests {
     #[test]
     fn test_store_and_get_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([1u8; 32]);
         let sender = MemberFingerprint([2u8; 8]);
 
@@ -1089,7 +1103,7 @@ mod tests {
     #[test]
     fn test_delete_before_watermark_partial() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([3u8; 32]);
 
         let sender_a = MemberFingerprint([10u8; 8]);
@@ -1129,7 +1143,7 @@ mod tests {
     #[test]
     fn test_delete_before_watermark_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let store = FjallStateStore::open_sync(dir.path()).unwrap();
+        let store = open_test_store(dir.path());
         let gid = GroupId::new([4u8; 32]);
 
         let deleted = store
@@ -1140,12 +1154,11 @@ mod tests {
 
     #[test]
     fn test_message_key_ordering() {
-        let gid = GroupId::new([1u8; 32]);
         let sender = MemberFingerprint([2u8; 8]);
 
-        let key1 = FjallStateStore::build_message_key(&gid, sender, 1);
-        let key2 = FjallStateStore::build_message_key(&gid, sender, 2);
-        let key3 = FjallStateStore::build_message_key(&gid, sender, 100);
+        let key1 = FjallStateStore::build_message_key(sender, 1);
+        let key2 = FjallStateStore::build_message_key(sender, 2);
+        let key3 = FjallStateStore::build_message_key(sender, 100);
 
         assert!(key1 < key2);
         assert!(key2 < key3);
@@ -1156,7 +1169,7 @@ mod tests {
         let gid = GroupId::new([5u8; 32]);
         let sender = MemberFingerprint([6u8; 8]);
 
-        let key = FjallStateStore::build_message_key(&gid, sender, 42);
+        let key = FjallStateStore::build_message_key(sender, 42);
         let id = FjallStateStore::message_id_from_key(&gid, &key).unwrap();
 
         assert_eq!(id.group_id, gid);

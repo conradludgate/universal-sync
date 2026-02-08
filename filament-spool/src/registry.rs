@@ -25,6 +25,7 @@ impl std::error::Error for RegistryError {}
 
 use crate::acceptor::GroupAcceptor;
 use crate::learner::GroupLearningActor;
+use crate::metrics::SharedMetrics;
 use crate::state_store::{GroupStateStore, SharedFjallStateStore};
 
 pub type EpochWatcher = (watch::Receiver<Epoch>, Box<dyn Fn() -> Epoch + Send>);
@@ -59,6 +60,7 @@ where
     state_store: SharedFjallStateStore,
     endpoint: Endpoint,
     epoch_watchers: Arc<RwLock<HashMap<GroupId, Arc<GroupEpochWatcher>>>>,
+    metrics: SharedMetrics,
 }
 
 impl<C, CS> AcceptorRegistry<C, CS>
@@ -71,6 +73,7 @@ where
         cipher_suite: CS,
         state_store: SharedFjallStateStore,
         endpoint: Endpoint,
+        metrics: SharedMetrics,
     ) -> Self {
         Self {
             external_client: Arc::new(external_client),
@@ -78,7 +81,12 @@ where
             state_store,
             endpoint,
             epoch_watchers: Arc::new(RwLock::new(HashMap::new())),
+            metrics,
         }
+    }
+
+    pub fn metrics(&self) -> &SharedMetrics {
+        &self.metrics
     }
 
     fn own_id(&self) -> AcceptorId {
@@ -197,6 +205,8 @@ where
             &acceptor,
             state.clone(),
         );
+
+        self.metrics.metrics.weavers_total.inc();
 
         Ok((group_id, acceptor, state))
     }

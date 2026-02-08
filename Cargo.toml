@@ -31,3 +31,7 @@ error-stack = "0.6"
 bs58 = "0.5"
 async-stream = "0.3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+measured = "0.0.24"
+measured-tokio = "0.0.24"
+axum = "0.8"
+serde_json = "1"

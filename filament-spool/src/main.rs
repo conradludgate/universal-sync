@@ -1,10 +1,15 @@
 //! Paxos acceptor server for Universal Sync groups.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE, load_secret_key};
-use filament_spool::{AcceptorRegistry, SharedFjallStateStore, accept_connection};
+use filament_spool::api::ApiState;
+use filament_spool::{
+    AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
+};
 use iroh::{Endpoint, SecretKey};
 use mls_rs::external_client::ExternalClient;
 use mls_rs::identity::basic::BasicIdentityProvider;
@@ -22,8 +27,11 @@ struct Args {
     #[arg(short, long)]
     key_file: Option<PathBuf>,
 
-    #[arg(short, long, default_value = "0.0.0.0:0")]
+    #[arg(short = 'B', long, default_value = "0.0.0.0:0")]
     bind: String,
+
+    #[arg(short, long, default_value = "0.0.0.0:9090")]
+    api_bind: SocketAddr,
 }
 
 #[tokio::main]
@@ -57,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_store = SharedFjallStateStore::open(&args.database).await?;
 
     let groups = state_store.list_groups();
-    info!(count = groups.len(), "Loaded existing groups");
+    info!(count = groups.len(), "Loaded existing weavers");
 
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
@@ -81,14 +89,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .secret_key(secret_key.clone())
         .alpns(vec![PAXOS_ALPN.to_vec()]);
 
-    for addr in tokio::net::lookup_host(args.bind).await? {
+    for addr in tokio::net::lookup_host(&args.bind).await? {
         endpoint_builder = endpoint_builder.bind_addr(addr)?;
     }
 
     let endpoint = endpoint_builder.bind().await?;
 
-    let registry =
-        AcceptorRegistry::new(external_client, cipher_suite, state_store, endpoint.clone());
+    let metrics = AcceptorMetrics::new(state_store.clone());
+    let metrics_encoder = Arc::new(MetricsEncoder::new(metrics));
+
+    let registry = AcceptorRegistry::new(
+        external_client,
+        cipher_suite,
+        state_store.clone(),
+        endpoint.clone(),
+        metrics_encoder.clone(),
+    );
+
+    let api_state = ApiState {
+        metrics: metrics_encoder,
+        endpoint: endpoint.clone(),
+        state_store,
+    };
+    let api_router = filament_spool::api::router(api_state);
+
+    let api_listener = tokio::net::TcpListener::bind(args.api_bind).await?;
+    info!(addr = %args.api_bind, "API server listening");
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(api_listener, api_router).await {
+            error!(error = %e, "API server error");
+        }
+    });
 
     let addr = endpoint.addr();
     info!(?addr, "Acceptor server listening");
