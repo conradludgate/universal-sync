@@ -19,7 +19,7 @@ use filament_core::{
 };
 use futures::{FutureExt, SinkExt, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, PublicKey};
+use iroh::{Endpoint, PublicKey};
 use tokio::sync::RwLock;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
@@ -34,7 +34,6 @@ pub(crate) type HandshakeWriter = FramedWrite<SendStream, LengthDelimitedCodec>;
 pub struct ConnectionManager {
     endpoint: Endpoint,
     connections: Arc<RwLock<HashMap<AcceptorId, Connection>>>,
-    address_hints: Arc<RwLock<HashMap<AcceptorId, EndpointAddr>>>,
 }
 
 impl ConnectionManager {
@@ -43,7 +42,6 @@ impl ConnectionManager {
         Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
-            address_hints: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -52,9 +50,9 @@ impl ConnectionManager {
         &self.endpoint
     }
 
-    /// Add an address hint for when iroh discovery is not available.
-    pub(crate) async fn add_address_hint(&self, acceptor_id: AcceptorId, addr: EndpointAddr) {
-        self.address_hints.write().await.insert(acceptor_id, addr);
+    fn acceptor_public_key(acceptor_id: &AcceptorId) -> PublicKey {
+        PublicKey::from_bytes(acceptor_id.as_bytes())
+            .expect("AcceptorId should be a valid public key")
     }
 
     async fn get_connection(
@@ -70,21 +68,10 @@ impl ConnectionManager {
             }
         }
 
-        let addr = self
-            .address_hints
-            .read()
-            .await
-            .get(acceptor_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
-                    .expect("AcceptorId should be a valid public key");
-                public_key.into()
-            });
-
+        let public_key = Self::acceptor_public_key(acceptor_id);
         let conn = self
             .endpoint
-            .connect(addr, PAXOS_ALPN)
+            .connect(public_key, PAXOS_ALPN)
             .await
             .change_context(ConnectorError)?;
 
@@ -129,20 +116,9 @@ impl ConnectionManager {
         &self,
         acceptor_id: &AcceptorId,
     ) -> Result<Connection, Report<ConnectorError>> {
-        let addr = self
-            .address_hints
-            .read()
-            .await
-            .get(acceptor_id)
-            .cloned()
-            .unwrap_or_else(|| {
-                let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
-                    .expect("AcceptorId should be a valid public key");
-                public_key.into()
-            });
-
+        let public_key = Self::acceptor_public_key(acceptor_id);
         self.endpoint
-            .connect(addr, PAXOS_ALPN)
+            .connect(public_key, PAXOS_ALPN)
             .await
             .change_context(ConnectorError)
     }

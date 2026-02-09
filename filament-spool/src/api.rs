@@ -43,9 +43,7 @@ async fn metrics(State(state): State<ApiState>) -> Response {
 }
 
 async fn endpoint_addr(State(state): State<ApiState>) -> impl IntoResponse {
-    let addr = state.endpoint.addr();
-    let addr_bytes = postcard::to_allocvec(&addr).expect("serialization should not fail");
-    let addr_str = bs58::encode(addr_bytes).into_string();
+    let addr_str = bs58::encode(state.endpoint.id().as_bytes()).into_string();
     axum::Json(serde_json::json!({ "addr": addr_str }))
 }
 

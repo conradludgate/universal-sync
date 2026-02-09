@@ -12,6 +12,7 @@ filament-warp = { path = "../filament-warp" }
 mls-rs = { workspace = true, features = ["prior_epoch"] }
 mls-rs-crypto-rustcrypto.workspace = true
 iroh.workspace = true
+futures.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true

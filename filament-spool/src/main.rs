@@ -10,6 +10,7 @@ use filament_spool::api::ApiState;
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
 };
+use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher};
 use iroh::{Endpoint, SecretKey};
 use mls_rs::external_client::ExternalClient;
 use mls_rs::identity::basic::BasicIdentityProvider;
@@ -87,7 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut endpoint_builder = Endpoint::builder()
         .transport_config(transport_config)
         .secret_key(secret_key.clone())
-        .alpns(vec![PAXOS_ALPN.to_vec()]);
+        .alpns(vec![PAXOS_ALPN.to_vec()])
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .address_lookup(MdnsAddressLookup::builder());
 
     for addr in tokio::net::lookup_host(&args.bind).await? {
         endpoint_builder = endpoint_builder.bind_addr(addr)?;
@@ -121,12 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let addr = endpoint.addr();
-    info!(?addr, "Acceptor server listening");
-
-    let addr_bytes = postcard::to_allocvec(&addr).expect("serialization should not fail");
-    let addr_str = bs58::encode(addr_bytes).into_string();
-    println!("Endpoint address (base58): {addr_str}");
+    let spool_address = bs58::encode(public_key.as_bytes()).into_string();
+    info!(spool_address, "Acceptor server listening");
+    println!("Spool address: {spool_address}");
 
     info!("Ready to accept connections");
     while let Some(incoming) = endpoint.accept().await {

@@ -1,6 +1,6 @@
 //! Acceptor-side learning for multi-acceptor quorum tracking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
@@ -9,7 +9,7 @@ use filament_core::{
 use filament_warp::AcceptorStateStore;
 use filament_warp::proposer::QuorumTracker;
 use futures::{SinkExt, StreamExt};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, PublicKey};
 use tokio::sync::{mpsc, watch};
 
 use crate::acceptor::GroupAcceptor;
@@ -49,7 +49,7 @@ where
     own_id: AcceptorId,
     group_id: GroupId,
     endpoint: Endpoint,
-    peer_acceptors: BTreeMap<AcceptorId, EndpointAddr>,
+    peer_acceptors: BTreeSet<AcceptorId>,
     quorum_tracker: QuorumTracker<GroupAcceptor<C, CS>>,
     peer_rx: mpsc::Receiver<PeerEvent>,
     peer_tx: mpsc::Sender<PeerEvent>,
@@ -67,14 +67,14 @@ where
         own_id: AcceptorId,
         group_id: GroupId,
         endpoint: Endpoint,
-        initial_acceptors: impl IntoIterator<Item = (AcceptorId, EndpointAddr)>,
+        initial_acceptors: impl IntoIterator<Item = AcceptorId>,
         epoch_tx: watch::Sender<Epoch>,
     ) -> Self {
         let (peer_tx, peer_rx) = mpsc::channel(256);
 
-        let peer_acceptors: BTreeMap<_, _> = initial_acceptors
+        let peer_acceptors: BTreeSet<_> = initial_acceptors
             .into_iter()
-            .filter(|(id, _)| *id != own_id)
+            .filter(|id| *id != own_id)
             .collect();
 
         let total_acceptors = peer_acceptors.len() + 1;
@@ -96,13 +96,9 @@ where
         let mut local_subscription =
             AcceptorStateStore::<GroupAcceptor<C, CS>>::subscribe_from(&state, initial_round).await;
 
-        let peers: Vec<_> = self
-            .peer_acceptors
-            .iter()
-            .map(|(id, addr)| (*id, addr.clone()))
-            .collect();
-        for (id, addr) in peers {
-            self.spawn_peer_actor(id, addr, initial_round);
+        let peers: Vec<_> = self.peer_acceptors.iter().copied().collect();
+        for id in peers {
+            self.spawn_peer_actor(id, initial_round);
         }
 
         loop {
@@ -151,13 +147,13 @@ where
         }
     }
 
-    fn spawn_peer_actor(&mut self, id: AcceptorId, addr: EndpointAddr, current_round: Epoch) {
+    fn spawn_peer_actor(&mut self, id: AcceptorId, current_round: Epoch) {
         let endpoint = self.endpoint.clone();
         let group_id = self.group_id;
         let tx = self.peer_tx.clone();
 
         let handle = tokio::spawn(async move {
-            run_peer_actor(endpoint, addr, group_id, id, current_round, tx).await;
+            run_peer_actor(endpoint, id, group_id, current_round, tx).await;
         });
 
         self.peer_handles.insert(id, handle);
@@ -170,9 +166,8 @@ const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(
 
 async fn run_peer_actor(
     endpoint: Endpoint,
-    addr: EndpointAddr,
-    group_id: GroupId,
     acceptor_id: AcceptorId,
+    group_id: GroupId,
     initial_round: Epoch,
     tx: mpsc::Sender<PeerEvent>,
 ) {
@@ -181,8 +176,7 @@ async fn run_peer_actor(
     let mut current_round = initial_round;
 
     loop {
-        match run_peer_connection(&endpoint, &addr, group_id, acceptor_id, current_round, &tx).await
-        {
+        match run_peer_connection(&endpoint, &acceptor_id, group_id, current_round, &tx).await {
             Ok(last_epoch) => {
                 current_round = last_epoch;
                 reconnect_attempts = 0;
@@ -230,9 +224,8 @@ async fn run_peer_actor(
 
 async fn run_peer_connection(
     endpoint: &Endpoint,
-    addr: &EndpointAddr,
+    acceptor_id: &AcceptorId,
     group_id: GroupId,
-    acceptor_id: AcceptorId,
     current_round: Epoch,
     tx: &mpsc::Sender<PeerEvent>,
 ) -> Result<Epoch, Report<ConnectorError>> {
@@ -242,8 +235,10 @@ async fn run_peer_connection(
 
     tracing::debug!(?acceptor_id, "connecting to peer acceptor");
 
+    let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
+        .expect("AcceptorId should be a valid public key");
     let conn = endpoint
-        .connect(addr.clone(), PAXOS_ALPN)
+        .connect(public_key, PAXOS_ALPN)
         .await
         .change_context(ConnectorError)?;
 
@@ -320,7 +315,7 @@ async fn run_peer_connection(
             }
 
             tx.send(PeerEvent::Accepted {
-                acceptor_id,
+                acceptor_id: *acceptor_id,
                 proposal,
                 message: Box::new(message),
             })

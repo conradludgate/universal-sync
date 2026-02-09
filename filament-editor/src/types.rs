@@ -145,7 +145,7 @@ pub enum DocRequest {
     ListPeers {
         reply: oneshot::Sender<Result<Vec<PeerEntry>, String>>,
     },
-    /// Auto-detect KeyPackage (member) vs EndpointAddr (spool).
+    /// Auto-detect 32-byte spool public key vs KeyPackage (member).
     AddPeer {
         input_b58: String,
         reply: oneshot::Sender<Result<(), String>>,

@@ -1,13 +1,12 @@
 //! `WeaverLearner` - implements paxos Learner for MLS group members (devices)
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
     AcceptorId, Attempt, Epoch, GroupContextExt, GroupId, GroupMessage, GroupProposal, LeafNodeExt,
     MemberFingerprint, MemberId, SyncProposal, UnsignedProposal,
 };
-use iroh::EndpointAddr;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
 use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
@@ -60,8 +59,7 @@ where
     /// Cipher suite provider for signing operations
     cipher_suite: CS,
 
-    /// Current set of acceptors with their endpoint addresses
-    acceptors: BTreeMap<AcceptorId, EndpointAddr>,
+    acceptors: BTreeSet<AcceptorId>,
 }
 
 impl<C, CS> WeaverLearner<C, CS>
@@ -75,21 +73,18 @@ where
     /// * `group` - The MLS group
     /// * `signer` - The signing secret key for this member
     /// * `cipher_suite` - Cipher suite provider for crypto operations
-    /// * `acceptors` - Initial set of acceptor endpoint addresses
+    /// * `acceptors` - Initial set of acceptor IDs
     pub(crate) fn new(
         group: Group<C>,
         signer: SignatureSecretKey,
         cipher_suite: CS,
-        acceptors: impl IntoIterator<Item = EndpointAddr>,
+        acceptors: impl IntoIterator<Item = AcceptorId>,
     ) -> Self {
         Self {
             group,
             signer,
             cipher_suite,
-            acceptors: acceptors
-                .into_iter()
-                .map(|addr| (AcceptorId::from_bytes(*addr.id.as_bytes()), addr))
-                .collect(),
+            acceptors: acceptors.into_iter().collect(),
         }
     }
 
@@ -103,24 +98,19 @@ where
         &mut self.group
     }
 
-    /// Get the current set of acceptor IDs
     pub(crate) fn acceptor_ids(&self) -> impl ExactSizeIterator<Item = AcceptorId> + '_ {
-        self.acceptors.keys().copied()
+        self.acceptors.iter().copied()
     }
 
-    /// Get the current set of acceptors with their addresses
-    pub(crate) fn acceptors(&self) -> &BTreeMap<AcceptorId, EndpointAddr> {
+    pub(crate) fn acceptors(&self) -> &BTreeSet<AcceptorId> {
         &self.acceptors
     }
 
-    /// Add an acceptor to the set by endpoint address
-    pub(crate) fn add_acceptor_addr(&mut self, addr: EndpointAddr) {
-        let id = AcceptorId::from_bytes(*addr.id.as_bytes());
-        self.acceptors.insert(id, addr);
+    pub(crate) fn add_acceptor(&mut self, id: AcceptorId) {
+        self.acceptors.insert(id);
     }
 
-    /// Remove an acceptor from the set by ID
-    pub(crate) fn remove_acceptor_id(&mut self, acceptor_id: &AcceptorId) {
+    pub(crate) fn remove_acceptor(&mut self, acceptor_id: &AcceptorId) {
         self.acceptors.remove(acceptor_id);
     }
 
@@ -186,14 +176,13 @@ where
                 && let Ok(proposal) = SyncProposal::from_custom_proposal(custom)
             {
                 match proposal {
-                    SyncProposal::AcceptorAdd(addr) => {
-                        let id = AcceptorId::from_bytes(*addr.id.as_bytes());
+                    SyncProposal::AcceptorAdd(id) => {
                         tracing::debug!(?id, "adding acceptor");
-                        self.add_acceptor_addr(addr);
+                        self.add_acceptor(id);
                     }
                     SyncProposal::AcceptorRemove(id) => {
                         tracing::debug!(?id, "removing acceptor");
-                        self.remove_acceptor_id(&id);
+                        self.remove_acceptor(&id);
                     }
                     _ => {}
                 }
@@ -326,7 +315,7 @@ where
     }
 
     fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId, IntoIter: ExactSizeIterator> {
-        self.acceptors.keys().copied()
+        self.acceptors.iter().copied()
     }
 
     fn propose(&self, attempt: Attempt) -> GroupProposal {

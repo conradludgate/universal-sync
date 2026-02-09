@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
-use filament_core::{KeyPackageExt, LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
-use iroh::{Endpoint, EndpointAddr};
+use filament_core::{
+    AcceptorId, KeyPackageExt, LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
+};
+use iroh::Endpoint;
 use mls_rs::client_builder::{BaseConfig, WithCryptoProvider, WithIdentityProvider};
 use mls_rs::crypto::SignatureSecretKey;
 use mls_rs::identity::SigningIdentity;
@@ -95,13 +97,13 @@ impl WeaverClient {
         }
     }
 
-    /// Generate a serialised key package containing this client's endpoint address.
+    /// Generate a serialised key package containing this client's endpoint identity.
     ///
     /// # Errors
     /// Returns an error if key package generation or serialisation fails.
     pub fn generate_key_package(&self) -> Result<Vec<u8>, Report<WeaverError>> {
         let kp_ext = KeyPackageExt::new(
-            self.connection_manager.endpoint().addr(),
+            *self.connection_manager.endpoint().id().as_bytes(),
             std::iter::empty::<String>(),
         );
         let mut kp_extensions = ExtensionList::default();
@@ -124,7 +126,7 @@ impl WeaverClient {
     /// Returns an error if creation fails.
     pub async fn create(
         &self,
-        acceptors: &[EndpointAddr],
+        acceptors: &[AcceptorId],
         protocol_name: &str,
     ) -> Result<Weaver, Report<WeaverError>> {
         Weaver::create(

@@ -20,7 +20,7 @@ use filament_core::{
     AcceptorId, ClientId, Crdt, EncryptedAppMessage, Epoch, GroupContextExt, GroupId, GroupInfoExt,
     Handshake, KeyPackageExt, LeafNodeExt, MessageId,
 };
-use iroh::{Endpoint, EndpointAddr};
+use iroh::Endpoint;
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::crypto::SignatureSecretKey;
 use mls_rs::{CipherSuiteProvider, Client, MlsMessage};
@@ -48,7 +48,7 @@ impl std::error::Error for WeaverError {}
 /// Build `GroupInfo` extensions containing the acceptor list.
 #[must_use]
 pub(crate) fn group_info_ext_list(
-    acceptors: impl IntoIterator<Item = EndpointAddr>,
+    acceptors: impl IntoIterator<Item = AcceptorId>,
 ) -> mls_rs::ExtensionList {
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
@@ -60,7 +60,7 @@ pub(crate) fn group_info_ext_list(
 /// Create a serialised `GroupInfo` message with a [`GroupInfoExt`] extension.
 pub(crate) fn group_info_with_ext<C: mls_rs::client_builder::MlsConfig>(
     group: &mls_rs::Group<C>,
-    acceptors: impl IntoIterator<Item = EndpointAddr>,
+    acceptors: impl IntoIterator<Item = AcceptorId>,
 ) -> Result<Vec<u8>, Report<WeaverError>> {
     let extensions = group_info_ext_list(acceptors);
     let msg = group
@@ -75,7 +75,7 @@ enum GroupRequest {
     },
     AddMember {
         key_package: Box<MlsMessage>,
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     },
     RemoveMember {
@@ -90,7 +90,7 @@ enum GroupRequest {
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     },
     AddAcceptor {
-        addr: EndpointAddr,
+        id: AcceptorId,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     },
     RemoveAcceptor {
@@ -265,14 +265,14 @@ impl Weaver {
         signer: SignatureSecretKey,
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
-        acceptors: &[EndpointAddr],
+        acceptors: &[AcceptorId],
         protocol_name: &str,
     ) -> Result<Self, Report<WeaverError>>
     where
         C: MlsConfig + Clone + Send + Sync + 'static,
         CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
     {
-        use crate::connector::register_group_with_addr;
+        use crate::connector::register_group;
 
         let protocol_name = protocol_name.to_owned();
 
@@ -297,13 +297,13 @@ impl Weaver {
             let mls_group_id = group.context().group_id.clone();
             let group_id = GroupId::from_slice(&mls_group_id);
             let learner =
-                WeaverLearner::new(group, signer, cipher_suite, acceptors.iter().cloned());
+                WeaverLearner::new(group, signer, cipher_suite, acceptors.iter().copied());
 
             let group_info_bytes = if acceptors.is_empty() {
                 None
             } else {
                 Some(
-                    group_info_with_ext(learner.group(), acceptors.iter().cloned())
+                    group_info_with_ext(learner.group(), acceptors.iter().copied())
                         .attach(OperationContext::CREATING_GROUP)?,
                 )
             };
@@ -314,15 +314,11 @@ impl Weaver {
         let endpoint = connection_manager.endpoint();
 
         if let Some(group_info_bytes) = group_info_bytes {
-            for addr in acceptors {
-                register_group_with_addr(endpoint, addr.clone(), &group_info_bytes)
+            for id in acceptors {
+                register_group(endpoint, id, &group_info_bytes)
                     .await
                     .change_context(WeaverError)?;
             }
-        }
-
-        for (id, addr) in learner.acceptors() {
-            connection_manager.add_address_hint(*id, addr.clone()).await;
         }
 
         Ok(Self::spawn_actors(
@@ -366,7 +362,7 @@ impl Weaver {
                     .change_context(WeaverError)
                     .attach(OperationContext::JOINING_GROUP)?;
 
-                let acceptors = group_info_ext
+                let acceptor_ids: Vec<AcceptorId> = group_info_ext
                     .as_ref()
                     .map(|e| e.acceptors.clone())
                     .unwrap_or_default();
@@ -388,7 +384,7 @@ impl Weaver {
                     .as_ref()
                     .and_then(|e| e.key_rotation_interval_secs);
 
-                let learner = WeaverLearner::new(group, signer, cipher_suite, acceptors);
+                let learner = WeaverLearner::new(group, signer, cipher_suite, acceptor_ids);
 
                 Ok::<_, Report<WeaverError>>((
                     learner,
@@ -398,10 +394,6 @@ impl Weaver {
                     key_rotation_interval_secs,
                 ))
             })?;
-
-        for (id, addr) in learner.acceptors() {
-            connection_manager.add_address_hint(*id, addr.clone()).await;
-        }
 
         let snapshot = match crdt_snapshot_opt {
             Some(s) if !s.is_empty() => Some(s),
@@ -494,7 +486,7 @@ impl Weaver {
     ) -> Result<(), Report<WeaverError>> {
         let key_package = MlsMessage::from_bytes(key_package_bytes).change_context(WeaverError)?;
 
-        let member_addr = key_package
+        let member_endpoint_id = key_package
             .as_key_package()
             .ok_or_else(|| Report::new(WeaverError).attach("message is not a key package"))?
             .extensions
@@ -502,15 +494,15 @@ impl Weaver {
             .change_context(WeaverError)?
             .ok_or_else(|| {
                 Report::new(WeaverError)
-                    .attach("key package missing KeyPackageExt with member's endpoint address")
+                    .attach("key package missing KeyPackageExt with member's endpoint identity")
             })?
-            .addr;
+            .endpoint_id;
 
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::AddMember {
                 key_package: Box::new(key_package),
-                member_addr,
+                member_endpoint_id,
                 reply: reply_tx,
             })
             .await
@@ -689,11 +681,11 @@ impl Weaver {
     /// # Errors
     ///
     /// Returns [`WeaverError`] if the group actor is closed or consensus fails.
-    pub async fn add_spool(&mut self, addr: EndpointAddr) -> Result<(), Report<WeaverError>> {
+    pub async fn add_spool(&mut self, id: AcceptorId) -> Result<(), Report<WeaverError>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::AddAcceptor {
-                addr,
+                id,
                 reply: reply_tx,
             })
             .await

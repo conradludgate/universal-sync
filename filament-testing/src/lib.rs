@@ -1,14 +1,17 @@
 //! Test utilities for Universal Sync integration tests.
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
 
-use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
+use filament_core::{AcceptorId, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 pub use filament_editor::{PeerAwareness, YrsCrdt};
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
 };
 use filament_weave::WeaverClient;
-use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh::address_lookup::{AddressLookup, EndpointData, Item as AddressLookupItem};
+use iroh::{Endpoint, EndpointId, RelayMode};
 use mls_rs::external_client::ExternalClient;
 use mls_rs::identity::basic::BasicIdentityProvider;
 use mls_rs::{CipherSuite, CryptoProvider};
@@ -17,6 +20,64 @@ use tempfile::TempDir;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const TEST_CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
+
+/// Shared in-memory address lookup for tests.
+///
+/// Each test endpoint publishes its addressing info here and resolves other
+/// endpoints from the same store, avoiding the need for real DNS/pkarr/mDNS.
+#[derive(Debug, Clone, Default)]
+pub struct TestAddressLookup {
+    endpoints: Arc<Mutex<HashMap<EndpointId, EndpointData>>>,
+}
+
+impl TestAddressLookup {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+type LookupStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<AddressLookupItem, iroh::address_lookup::Error>> + Send>,
+>;
+
+impl AddressLookup for TestAddressLookup {
+    fn resolve(&self, endpoint_id: EndpointId) -> Option<LookupStream> {
+        let data = self.endpoints.lock().unwrap().get(&endpoint_id).cloned();
+        match data {
+            Some(data) => {
+                let item = AddressLookupItem::new(
+                    iroh::address_lookup::EndpointInfo::from_parts(endpoint_id, data),
+                    "test",
+                    None,
+                );
+                Some(Box::pin(futures::stream::once(async { Ok(item) })))
+            }
+            None => Some(Box::pin(futures::stream::empty())),
+        }
+    }
+}
+
+/// Per-endpoint wrapper that knows the endpoint's ID for publishing.
+#[derive(Debug)]
+struct TestAddressLookupEndpoint {
+    id: EndpointId,
+    shared: TestAddressLookup,
+}
+
+impl AddressLookup for TestAddressLookupEndpoint {
+    fn publish(&self, data: &EndpointData) {
+        self.shared
+            .endpoints
+            .lock()
+            .unwrap()
+            .insert(self.id, data.clone());
+    }
+
+    fn resolve(&self, endpoint_id: EndpointId) -> Option<LookupStream> {
+        self.shared.resolve(endpoint_id)
+    }
+}
 
 #[must_use]
 pub fn test_weaver_client(name: &str, endpoint: Endpoint) -> WeaverClient {
@@ -39,36 +100,46 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Localhost-only endpoint with relays disabled for fast local testing.
+/// Localhost-only endpoint with a shared in-memory address lookup for testing.
 ///
 /// # Panics
 /// Panics if the endpoint fails to bind.
-pub async fn test_endpoint() -> Endpoint {
+pub async fn test_endpoint(discovery: &TestAddressLookup) -> Endpoint {
     let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()
         .keep_alive_interval(std::time::Duration::from_secs(5))
         .max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()))
         .build();
 
-    Endpoint::empty_builder(RelayMode::Disabled)
+    let endpoint = Endpoint::empty_builder(RelayMode::Disabled)
         .transport_config(transport_config)
         .alpns(vec![PAXOS_ALPN.to_vec()])
         .bind_addr(bind_addr)
         .expect("valid bind address")
         .bind()
         .await
-        .expect("failed to create endpoint")
+        .expect("failed to create endpoint");
+
+    let per_endpoint = TestAddressLookupEndpoint {
+        id: endpoint.id(),
+        shared: discovery.clone(),
+    };
+    endpoint.address_lookup().add(per_endpoint);
+
+    endpoint
 }
 
-/// Returns (task handle, acceptor address, temp dir).
+/// Returns (task handle, acceptor id, temp dir).
 /// Keep the `TempDir` alive for the acceptor's state store.
 ///
 /// # Panics
 /// Panics if the acceptor fails to start.
-pub async fn spawn_acceptor() -> (tokio::task::JoinHandle<()>, EndpointAddr, TempDir) {
+pub async fn spawn_acceptor(
+    discovery: &TestAddressLookup,
+) -> (tokio::task::JoinHandle<()>, AcceptorId, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let endpoint = test_endpoint().await;
-    let addr = endpoint.addr();
+    let endpoint = test_endpoint(discovery).await;
+    let acceptor_id = AcceptorId::from_bytes(*endpoint.id().as_bytes());
 
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
@@ -111,5 +182,5 @@ pub async fn spawn_acceptor() -> (tokio::task::JoinHandle<()>, EndpointAddr, Tem
         }
     });
 
-    (task, addr, temp_dir)
+    (task, acceptor_id, temp_dir)
 }

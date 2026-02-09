@@ -12,7 +12,6 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use iroh::EndpointAddr;
 use mls_rs::extension::{ExtensionType, MlsCodecExtension};
 use mls_rs::group::proposal::MlsCustomProposal;
 use mls_rs::mls_rs_codec::{self as mls_rs_codec, MlsDecode, MlsEncode, MlsSize};
@@ -151,14 +150,15 @@ impl MlsCodecExtension for GroupContextExt {
     }
 }
 
-/// Member endpoint address, supported CRDTs, and supported protocol versions
+/// Member endpoint identity, supported CRDTs, and supported protocol versions
 /// (key package extension).
 ///
 /// Included in key packages so the group leader can send the Welcome
-/// directly, verify CRDT compatibility, and check protocol version support.
+/// directly via iroh discovery, verify CRDT compatibility, and check protocol
+/// version support.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyPackageExt {
-    pub addr: EndpointAddr,
+    pub endpoint_id: [u8; 32],
     pub supported_crdts: Vec<String>,
     pub supported_protocol_versions: Vec<u32>,
 }
@@ -166,11 +166,11 @@ pub struct KeyPackageExt {
 impl KeyPackageExt {
     #[must_use]
     pub fn new(
-        addr: EndpointAddr,
+        endpoint_id: [u8; 32],
         supported_crdts: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         Self {
-            addr,
+            endpoint_id,
             supported_crdts: supported_crdts.into_iter().map(Into::into).collect(),
             supported_protocol_versions: vec![CURRENT_PROTOCOL_VERSION],
         }
@@ -260,14 +260,14 @@ impl MlsCodecExtension for LeafNodeExt {
 /// bootstrap their CRDT state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInfoExt {
-    pub acceptors: Vec<EndpointAddr>,
+    pub acceptors: Vec<AcceptorId>,
     pub snapshot: Bytes,
 }
 
 impl GroupInfoExt {
     #[must_use]
     pub fn new(
-        acceptors: impl IntoIterator<Item = EndpointAddr>,
+        acceptors: impl IntoIterator<Item = AcceptorId>,
         snapshot: impl Into<Bytes>,
     ) -> Self {
         Self {
@@ -277,11 +277,8 @@ impl GroupInfoExt {
     }
 
     #[must_use]
-    pub fn acceptor_ids(&self) -> Vec<AcceptorId> {
-        self.acceptors
-            .iter()
-            .map(|addr| AcceptorId::from_bytes(*addr.id.as_bytes()))
-            .collect()
+    pub fn acceptor_ids(&self) -> &[AcceptorId] {
+        &self.acceptors
     }
 }
 
@@ -316,7 +313,7 @@ impl MlsCodecExtension for GroupInfoExt {
 /// Unified custom proposal for all sync protocol actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncProposal {
-    AcceptorAdd(EndpointAddr),
+    AcceptorAdd(AcceptorId),
     AcceptorRemove(AcceptorId),
     CompactionClaim {
         level: u8,
@@ -331,8 +328,8 @@ pub enum SyncProposal {
 
 impl SyncProposal {
     #[must_use]
-    pub fn acceptor_add(addr: EndpointAddr) -> Self {
-        Self::AcceptorAdd(addr)
+    pub fn acceptor_add(id: AcceptorId) -> Self {
+        Self::AcceptorAdd(id)
     }
 
     #[must_use]
@@ -446,13 +443,14 @@ fn read_length_prefixed<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], mls_rs_co
 
 #[cfg(test)]
 mod tests {
-    use iroh::SecretKey;
-
     use super::*;
 
-    fn test_addr(seed: u8) -> EndpointAddr {
-        let secret = SecretKey::from_bytes(&[seed; 32]);
-        EndpointAddr::new(secret.public())
+    fn test_acceptor_id(seed: u8) -> AcceptorId {
+        AcceptorId::from_bytes([seed; 32])
+    }
+
+    fn test_endpoint_id(seed: u8) -> [u8; 32] {
+        [seed; 32]
     }
 
     #[test]
@@ -467,13 +465,13 @@ mod tests {
 
     #[test]
     fn key_package_ext_roundtrip() {
-        let addr = test_addr(42);
-        let ext = KeyPackageExt::new(addr.clone(), ["yjs", "automerge"]);
+        let eid = test_endpoint_id(42);
+        let ext = KeyPackageExt::new(eid, ["yjs", "automerge"]);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = KeyPackageExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
-        assert_eq!(decoded.addr, addr);
+        assert_eq!(decoded.endpoint_id, eid);
         assert!(decoded.supports("yjs"));
         assert!(decoded.supports("automerge"));
         assert!(!decoded.supports("unknown"));
@@ -481,8 +479,8 @@ mod tests {
 
     #[test]
     fn group_info_ext_roundtrip() {
-        let addrs = vec![test_addr(1), test_addr(2)];
-        let ext = GroupInfoExt::new(addrs, b"crdt snapshot data".to_vec());
+        let ids = vec![test_acceptor_id(1), test_acceptor_id(2)];
+        let ext = GroupInfoExt::new(ids, b"crdt snapshot data".to_vec());
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
@@ -493,7 +491,7 @@ mod tests {
 
     #[test]
     fn group_info_ext_no_snapshot() {
-        let ext = GroupInfoExt::new(Vec::<EndpointAddr>::new(), vec![]);
+        let ext = GroupInfoExt::new(Vec::<AcceptorId>::new(), vec![]);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = GroupInfoExt::mls_decode(&mut encoded.as_slice()).unwrap();
@@ -503,30 +501,28 @@ mod tests {
 
     #[test]
     fn group_info_ext_acceptor_ids() {
-        let addr1 = test_addr(1);
-        let addr2 = test_addr(2);
-        let expected_id1 = AcceptorId::from_bytes(*addr1.id.as_bytes());
-        let expected_id2 = AcceptorId::from_bytes(*addr2.id.as_bytes());
+        let id1 = test_acceptor_id(1);
+        let id2 = test_acceptor_id(2);
 
-        let ext = GroupInfoExt::new(vec![addr1, addr2], vec![]);
+        let ext = GroupInfoExt::new(vec![id1, id2], vec![]);
         let ids = ext.acceptor_ids();
 
         assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], expected_id1);
-        assert_eq!(ids[1], expected_id2);
+        assert_eq!(ids[0], id1);
+        assert_eq!(ids[1], id2);
     }
 
     #[test]
     fn sync_proposal_acceptor_add_roundtrip() {
-        let addr = test_addr(42);
-        let proposal = SyncProposal::acceptor_add(addr.clone());
+        let id = test_acceptor_id(42);
+        let proposal = SyncProposal::acceptor_add(id);
 
         let custom = proposal.to_custom_proposal().unwrap();
         assert_eq!(custom.proposal_type(), SYNC_PROPOSAL_TYPE);
 
         let decoded = SyncProposal::from_custom_proposal(&custom).unwrap();
         assert_eq!(decoded, proposal);
-        assert!(matches!(decoded, SyncProposal::AcceptorAdd(a) if a == addr));
+        assert!(matches!(decoded, SyncProposal::AcceptorAdd(a) if a == id));
     }
 
     #[test]
@@ -618,8 +614,8 @@ mod tests {
 
     #[test]
     fn key_package_ext_version_support() {
-        let addr = test_addr(42);
-        let ext = KeyPackageExt::new(addr, ["yjs"]);
+        let eid = test_endpoint_id(42);
+        let ext = KeyPackageExt::new(eid, ["yjs"]);
 
         assert!(ext.supports_version(1));
         assert!(!ext.supports_version(2));
@@ -633,8 +629,8 @@ mod tests {
     fn sync_proposal_versioned_roundtrip() {
         use crate::codec::Versioned;
 
-        let addr = test_addr(42);
-        let proposal = SyncProposal::acceptor_add(addr);
+        let id = test_acceptor_id(42);
+        let proposal = SyncProposal::acceptor_add(id);
 
         let bytes = proposal.serialize_versioned(1).unwrap();
         let decoded = SyncProposal::deserialize_versioned(1, &bytes).unwrap();

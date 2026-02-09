@@ -18,7 +18,7 @@ postcard = { version = "1", features = ["alloc"] }
 pin-project-lite = "0.2"
 fjall = { version = "3", default-features = false, features = ["metrics", "bytes_1"] }
 tempfile = "3"
-iroh = "0.96"
+iroh = { version = "0.96", features = ["address-lookup-mdns"] }
 mls-rs-crypto-rustcrypto = { version = "0.20", default-features = false }
 mls-rs-core = "0.25"
 mls-rs = { version = "0.52", default-features = false, features = ["std", "custom_proposal"] }

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use error_stack::{Report, ResultExt};
 use filament_core::{AcceptorId, Epoch, GroupId, GroupInfoExt};
 use filament_warp::Learner;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::Endpoint;
 use mls_rs::external_client::ExternalClient;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
 use mls_rs::{CipherSuiteProvider, ExtensionList, MlsMessage};
@@ -93,7 +93,7 @@ where
         AcceptorId::from_bytes(*self.endpoint.id().as_bytes())
     }
 
-    fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<EndpointAddr> {
+    fn extract_acceptors_from_extensions(extensions: &ExtensionList) -> Vec<AcceptorId> {
         extensions
             .get_as::<GroupInfoExt>()
             .ok()
@@ -272,10 +272,7 @@ where
         let watcher = Arc::new(GroupEpochWatcher::new(current_epoch));
         watchers.insert(group_id, watcher.clone());
 
-        let initial_acceptors: Vec<_> = acceptor
-            .acceptor_addrs()
-            .map(|(id, addr)| (*id, addr.clone()))
-            .collect();
+        let initial_acceptors: Vec<_> = acceptor.acceptor_ids().iter().copied().collect();
 
         let learning_actor: GroupLearningActor<C, CS> = GroupLearningActor::new(
             self.own_id(),
@@ -316,7 +313,7 @@ mod tests {
         assert_eq!(*watcher.rx.borrow(), Epoch(10));
     }
 
-    fn extract_acceptors(extensions: &ExtensionList) -> Vec<EndpointAddr> {
+    fn extract_acceptors(extensions: &ExtensionList) -> Vec<AcceptorId> {
         extensions
             .get_as::<GroupInfoExt>()
             .ok()
@@ -327,7 +324,7 @@ mod tests {
     #[test]
     fn extract_acceptors_empty_extensions() {
         let empty = ExtensionList::default();
-        let addrs = extract_acceptors(&empty);
-        assert!(addrs.is_empty());
+        let ids = extract_acceptors(&empty);
+        assert!(ids.is_empty());
     }
 }

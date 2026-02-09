@@ -9,6 +9,7 @@ use filament_core::PAXOS_ALPN;
 use filament_editor::CoordinatorActor;
 use filament_editor::types::{AppState, CoordinatorRequest};
 use filament_weave::WeaverClient;
+use iroh::address_lookup::{DnsAddressLookup, MdnsAddressLookup, PkarrPublisher};
 use iroh::{Endpoint, SecretKey};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -72,6 +73,9 @@ async fn setup_coordinator(
         .transport_config(transport_config)
         .secret_key(iroh_key.clone())
         .alpns(vec![PAXOS_ALPN.to_vec()])
+        .address_lookup(PkarrPublisher::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .address_lookup(MdnsAddressLookup::builder())
         .bind()
         .await?;
 

@@ -10,7 +10,7 @@ use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
 };
 use filament_testing::{
-    YrsCrdt, init_tracing, spawn_acceptor, test_endpoint, test_weaver_client,
+    TestAddressLookup, YrsCrdt, init_tracing, spawn_acceptor, test_endpoint, test_weaver_client,
     test_yrs_weaver_client,
 };
 use filament_weave::WeaverEvent;
@@ -71,7 +71,8 @@ async fn test_mls_group_creation_with_group_api() {
     init_tracing();
 
     // Create client using GroupClient
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let discovery = TestAddressLookup::new();
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create a group using the GroupClient API (no acceptors)
     let mut group = alice.create(&[], "none").await.expect("create group");
@@ -91,9 +92,10 @@ async fn test_alice_adds_bob_with_group_api() {
     init_tracing();
 
     // --- Setup acceptor server ---
+    let discovery = TestAddressLookup::new();
     let acceptor_dir = TempDir::new().unwrap();
-    let acceptor_endpoint = test_endpoint().await;
-    let acceptor_addr = acceptor_endpoint.addr();
+    let acceptor_endpoint = test_endpoint(&discovery).await;
+    let acceptor_id = AcceptorId::from_bytes(*acceptor_endpoint.id().as_bytes());
 
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
@@ -141,7 +143,7 @@ async fn test_alice_adds_bob_with_group_api() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // --- Alice creates a group using GroupClient ---
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group without acceptors first
     let mut alice_group = alice.create(&[], "none").await.expect("alice create group");
@@ -151,7 +153,7 @@ async fn test_alice_adds_bob_with_group_api() {
 
     // Add the acceptor
     alice_group
-        .add_spool(acceptor_addr.clone())
+        .add_spool(acceptor_id)
         .await
         .expect("add acceptor");
 
@@ -163,7 +165,7 @@ async fn test_alice_adds_bob_with_group_api() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // --- Alice adds Bob ---
-    let mut bob = test_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_key_package = bob.generate_key_package().expect("bob key package");
 
     alice_group
@@ -188,9 +190,7 @@ async fn test_alice_adds_bob_with_group_api() {
     // Verify Bob got the acceptor
     assert_eq!(bob_context.spools.len(), 1, "Bob should have 1 acceptor");
     assert!(
-        bob_context
-            .spools
-            .contains(&AcceptorId(*acceptor_addr.id.as_bytes())),
+        bob_context.spools.contains(&acceptor_id),
         "Bob should have the acceptor ID"
     );
 
@@ -229,13 +229,14 @@ async fn test_acceptor_add_remove() {
     init_tracing();
 
     // --- Setup two acceptor servers ---
+    let discovery = TestAddressLookup::new();
     let acceptor1_dir = TempDir::new().unwrap();
-    let acceptor1_endpoint = test_endpoint().await;
-    let acceptor1_addr = acceptor1_endpoint.addr();
+    let acceptor1_endpoint = test_endpoint(&discovery).await;
+    let acceptor1_id = AcceptorId::from_bytes(*acceptor1_endpoint.id().as_bytes());
 
     let acceptor2_dir = TempDir::new().unwrap();
-    let acceptor2_endpoint = test_endpoint().await;
-    let acceptor2_addr = acceptor2_endpoint.addr();
+    let acceptor2_endpoint = test_endpoint(&discovery).await;
+    let acceptor2_id = AcceptorId::from_bytes(*acceptor2_endpoint.id().as_bytes());
 
     let crypto = RustCryptoProvider::default();
     let cipher_suite = crypto
@@ -319,15 +320,12 @@ async fn test_acceptor_add_remove() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // --- Alice creates a group and manages acceptors ---
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut group = alice.create(&[], "none").await.expect("create group");
 
     // Add first acceptor
-    group
-        .add_spool(acceptor1_addr.clone())
-        .await
-        .expect("add acceptor 1");
+    group.add_spool(acceptor1_id).await.expect("add acceptor 1");
 
     let context = group.context().await.expect("context after add1");
     assert_eq!(context.spools.len(), 1);
@@ -336,10 +334,7 @@ async fn test_acceptor_add_remove() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add second acceptor
-    group
-        .add_spool(acceptor2_addr.clone())
-        .await
-        .expect("add acceptor 2");
+    group.add_spool(acceptor2_id).await.expect("add acceptor 2");
 
     let context = group.context().await.expect("context after add2");
     assert_eq!(context.spools.len(), 2);
@@ -348,7 +343,6 @@ async fn test_acceptor_add_remove() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Remove first acceptor
-    let acceptor1_id = AcceptorId(*acceptor1_addr.id.as_bytes());
     group
         .remove_spool(acceptor1_id)
         .await
@@ -373,8 +367,9 @@ async fn test_acceptor_add_remove() {
 #[tokio::test]
 async fn test_group_without_acceptors() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group without any acceptors - should still work for local operations
     let mut group = alice.create(&[], "none").await.expect("create group");
@@ -397,15 +392,16 @@ async fn test_group_without_acceptors() {
 #[tokio::test]
 async fn test_multiple_key_updates() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut group = alice.create(&[], "none").await.expect("create group");
 
-    group.add_spool(acceptor_addr).await.expect("add acceptor");
+    group.add_spool(acceptor_id).await.expect("add acceptor");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -428,24 +424,25 @@ async fn test_multiple_key_updates() {
 #[tokio::test]
 async fn test_remove_member() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice creates group
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice.create(&[], "none").await.expect("create group");
 
     alice_group
-        .add_spool(acceptor_addr)
+        .add_spool(acceptor_id)
         .await
         .expect("add acceptor");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Bob using GroupClient
-    let mut bob = test_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_key_package = bob.generate_key_package().expect("bob key package");
 
     alice_group
@@ -482,24 +479,25 @@ async fn test_remove_member() {
 #[tokio::test]
 async fn test_three_member_group() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice creates group using GroupClient
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice.create(&[], "none").await.expect("create group");
 
     alice_group
-        .add_spool(acceptor_addr.clone())
+        .add_spool(acceptor_id)
         .await
         .expect("add acceptor");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Bob using GroupClient
-    let mut bob = test_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_key_package = bob.generate_key_package().expect("bob key package");
 
     alice_group
@@ -514,7 +512,7 @@ async fn test_three_member_group() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Carol using GroupClient
-    let mut carol = test_weaver_client("carol", test_endpoint().await);
+    let mut carol = test_weaver_client("carol", test_endpoint(&discovery).await);
     let carol_key_package = carol.generate_key_package().expect("carol key package");
 
     alice_group
@@ -558,8 +556,9 @@ async fn test_three_member_group() {
 #[tokio::test]
 async fn test_send_update_no_changes() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group without acceptors
     let mut group = alice.create(&[], "none").await.expect("create group");
@@ -577,15 +576,16 @@ async fn test_send_update_no_changes() {
 #[tokio::test]
 async fn test_group_creation_with_initial_acceptor() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group WITH an initial acceptor
     let mut group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "none")
+        .create(std::slice::from_ref(&acceptor_id), "none")
         .await
         .expect("create group with acceptor");
 
@@ -596,9 +596,7 @@ async fn test_group_creation_with_initial_acceptor() {
         "Should have 1 acceptor from creation"
     );
     assert!(
-        context
-            .spools
-            .contains(&AcceptorId(*acceptor_addr.id.as_bytes())),
+        context.spools.contains(&acceptor_id),
         "Should have the correct acceptor"
     );
 
@@ -612,14 +610,15 @@ async fn test_group_creation_with_initial_acceptor() {
 #[tokio::test]
 async fn test_concurrent_operations_single_member() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut group = alice
-        .create(&[acceptor_addr], "none")
+        .create(&[acceptor_id], "none")
         .await
         .expect("create group");
 
@@ -647,8 +646,9 @@ async fn test_concurrent_operations_single_member() {
 #[tokio::test]
 async fn test_weaver_client_create_group() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group without acceptors
     let mut alice_group = alice.create(&[], "none").await.expect("alice create group");
@@ -668,15 +668,16 @@ async fn test_weaver_client_create_group() {
 #[tokio::test]
 async fn test_weaver_client_with_acceptor() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_weaver_client("alice", test_endpoint().await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     // Create group with acceptor
     let mut alice_group = alice
-        .create(&[acceptor_addr], "none")
+        .create(&[acceptor_id], "none")
         .await
         .expect("alice create group");
 
@@ -706,21 +707,22 @@ async fn test_weaver_client_with_acceptor() {
 #[tokio::test]
 async fn test_yrs_crdt_snapshot_in_welcome() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice creates a group with Yrs CRDT
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create yrs group");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob key package");
 
     alice_group.add_member(&bob_kp).await.expect("add bob");
@@ -744,15 +746,16 @@ async fn test_yrs_crdt_snapshot_in_welcome() {
 #[tokio::test]
 async fn test_crdt_operations_sent_and_received() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Alice creates group with Yrs CRDT
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -760,7 +763,7 @@ async fn test_crdt_operations_sent_and_received() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Bob joins
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob key package");
 
     alice_group.add_member(&bob_kp).await.expect("add bob");
@@ -816,21 +819,22 @@ async fn test_crdt_operations_sent_and_received() {
 #[tokio::test]
 async fn test_crdt_bidirectional_message_exchange() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob key package");
 
     alice_group.add_member(&bob_kp).await.expect("add bob");
@@ -910,14 +914,15 @@ async fn test_crdt_bidirectional_message_exchange() {
 #[tokio::test]
 async fn test_crdt_late_joiner_snapshot_and_messages() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _acceptor_dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _acceptor_dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -941,7 +946,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Add Bob — Bob starts with empty CRDT and catches up via backfill
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -984,7 +989,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Carol — she also catches up via backfill
-    let mut carol = test_yrs_weaver_client("carol", test_endpoint().await);
+    let mut carol = test_yrs_weaver_client("carol", test_endpoint(&discovery).await);
     let carol_kp = carol.generate_key_package().expect("carol kp");
     alice_group.add_member(&carol_kp).await.expect("add carol");
 
@@ -1177,13 +1182,14 @@ async fn drive_compaction(
 #[tokio::test]
 async fn test_welcome_force_compaction_verified() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1198,7 +1204,7 @@ async fn test_welcome_force_compaction_verified() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Bob joins
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1251,13 +1257,14 @@ async fn test_welcome_force_compaction_verified() {
 #[tokio::test]
 async fn test_welcome_after_threshold_compaction() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1296,7 +1303,7 @@ async fn test_welcome_after_threshold_compaction() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Now Bob joins — old L0s should be deleted, compacted snapshot remains
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1334,13 +1341,14 @@ async fn test_welcome_after_threshold_compaction() {
 #[tokio::test]
 async fn test_welcome_reencryption_sequential_joiners() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1353,7 +1361,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Bob joins — triggers force_compaction (L(max))
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1382,7 +1390,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Carol joins — another force_compaction re-encrypts at Carol's epoch
-    let mut carol = test_yrs_weaver_client("carol", test_endpoint().await);
+    let mut carol = test_yrs_weaver_client("carol", test_endpoint(&discovery).await);
     let carol_kp = carol.generate_key_package().expect("carol kp");
     alice_group.add_member(&carol_kp).await.expect("add carol");
 
@@ -1421,13 +1429,14 @@ async fn test_welcome_reencryption_sequential_joiners() {
 #[tokio::test]
 async fn test_post_compaction_bidirectional() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1440,7 +1449,7 @@ async fn test_post_compaction_bidirectional() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Bob joins — triggers compaction, clears update_buffer
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1500,13 +1509,14 @@ async fn test_post_compaction_bidirectional() {
 #[tokio::test]
 async fn test_welcome_force_compaction_empty() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1515,7 +1525,7 @@ async fn test_welcome_force_compaction_empty() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Bob immediately — no writes, no snapshot
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1569,13 +1579,14 @@ async fn test_welcome_force_compaction_empty() {
 #[tokio::test]
 async fn test_compaction_threshold_boundary() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1644,13 +1655,14 @@ async fn test_compaction_threshold_boundary() {
 #[tokio::test]
 async fn test_multiple_compaction_rounds() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1707,7 +1719,7 @@ async fn test_multiple_compaction_rounds() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // New joiner should get the fully merged state
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1745,13 +1757,14 @@ async fn test_multiple_compaction_rounds() {
 #[tokio::test]
 async fn test_compaction_deletion_late_joiner() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1786,7 +1799,7 @@ async fn test_compaction_deletion_late_joiner() {
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Late joiner should get the complete state
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1823,13 +1836,14 @@ async fn test_compaction_deletion_late_joiner() {
 #[tokio::test]
 async fn test_concurrent_writers_compaction() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1838,7 +1852,7 @@ async fn test_concurrent_writers_compaction() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Bob
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -1922,7 +1936,7 @@ async fn test_concurrent_writers_compaction() {
     );
 
     // Carol joins — should get complete state from both writers
-    let mut carol = test_yrs_weaver_client("carol", test_endpoint().await);
+    let mut carol = test_yrs_weaver_client("carol", test_endpoint(&discovery).await);
     let carol_kp = carol.generate_key_package().expect("carol kp");
     alice_group.add_member(&carol_kp).await.expect("add carol");
 
@@ -1959,13 +1973,14 @@ async fn test_concurrent_writers_compaction() {
 #[tokio::test]
 async fn test_key_update_then_compaction() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2007,7 +2022,7 @@ async fn test_key_update_then_compaction() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Bob joins — should get all text across the key rotation
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -2047,8 +2062,9 @@ async fn test_key_update_then_compaction() {
 #[tokio::test]
 async fn test_compaction_no_acceptors() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice.create(&[], "yrs").await.expect("create group");
     let mut alice_crdt = YrsCrdt::new();
 
@@ -2092,13 +2108,14 @@ async fn test_compaction_no_acceptors() {
 #[tokio::test]
 async fn test_compaction_after_member_removal() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2107,7 +2124,7 @@ async fn test_compaction_after_member_removal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Add Bob
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -2165,7 +2182,7 @@ async fn test_compaction_after_member_removal() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Carol joins — should get all text
-    let mut carol = test_yrs_weaver_client("carol", test_endpoint().await);
+    let mut carol = test_yrs_weaver_client("carol", test_endpoint(&discovery).await);
     let carol_kp = carol.generate_key_package().expect("carol kp");
     alice_group.add_member(&carol_kp).await.expect("add carol");
 
@@ -2203,20 +2220,21 @@ async fn test_compaction_after_member_removal() {
 #[tokio::test]
 async fn test_protocol_name_survives_join() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Bob joins
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -2239,14 +2257,15 @@ async fn test_protocol_name_survives_join() {
 #[tokio::test]
 async fn test_acceptor_list_in_group_info() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor1_task, acceptor1_addr, _dir1) = spawn_acceptor().await;
-    let (acceptor2_task, acceptor2_addr, _dir2) = spawn_acceptor().await;
+    let (acceptor1_task, acceptor1_id, _dir1) = spawn_acceptor(&discovery).await;
+    let (acceptor2_task, acceptor2_id, _dir2) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(&[acceptor1_addr.clone(), acceptor2_addr.clone()], "yrs")
+        .create(&[acceptor1_id, acceptor2_id], "yrs")
         .await
         .expect("create group");
 
@@ -2256,7 +2275,7 @@ async fn test_acceptor_list_in_group_info() {
     assert_eq!(alice_ctx.spools.len(), 2, "alice should see 2 acceptors");
 
     // Bob joins — should receive both acceptors from the welcome GroupInfoExt
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -2280,14 +2299,15 @@ async fn test_acceptor_list_in_group_info() {
 #[tokio::test]
 async fn test_multi_acceptor_message_delivery() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor1_task, acceptor1_addr, _dir1) = spawn_acceptor().await;
-    let (acceptor2_task, acceptor2_addr, _dir2) = spawn_acceptor().await;
+    let (acceptor1_task, acceptor1_id, _dir1) = spawn_acceptor(&discovery).await;
+    let (acceptor2_task, acceptor2_id, _dir2) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(&[acceptor1_addr.clone(), acceptor2_addr.clone()], "yrs")
+        .create(&[acceptor1_id, acceptor2_id], "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2301,7 +2321,7 @@ async fn test_multi_acceptor_message_delivery() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Bob joins and should sync the data via backfill from acceptors
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 
@@ -2337,13 +2357,14 @@ async fn test_multi_acceptor_message_delivery() {
 #[tokio::test]
 async fn test_empty_snapshot_join() {
     init_tracing();
+    let discovery = TestAddressLookup::new();
 
-    let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice = test_yrs_weaver_client("alice", test_endpoint().await);
+    let alice = test_yrs_weaver_client("alice", test_endpoint(&discovery).await);
     let mut alice_group = alice
-        .create(std::slice::from_ref(&acceptor_addr), "yrs")
+        .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2357,7 +2378,7 @@ async fn test_empty_snapshot_join() {
 
     // Bob joins — welcome has empty snapshot (vec![]), join should succeed
     // and start with an empty CRDT, then catch up via backfill
-    let mut bob = test_yrs_weaver_client("bob", test_endpoint().await);
+    let mut bob = test_yrs_weaver_client("bob", test_endpoint(&discovery).await);
     let bob_kp = bob.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
 

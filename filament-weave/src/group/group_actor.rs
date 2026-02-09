@@ -8,7 +8,7 @@ use filament_core::{
 };
 use filament_warp::proposer::{ProposeResult, Proposer, QuorumTracker};
 use filament_warp::{AcceptorMessage, Learner, Proposal};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, PublicKey};
 use mls_rs::client_builder::MlsConfig;
 use mls_rs::group::proposal::{MlsCustomProposal, Proposal as MlsProposal};
 use mls_rs::group::{CommitEffect, ReceivedMessage};
@@ -73,14 +73,14 @@ struct ActiveProposal {
 enum ProposalReplyKind {
     Simple(oneshot::Sender<Result<(), Report<WeaverError>>>),
     WithWelcome {
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         welcome: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     },
 }
 
 struct WelcomeToSend {
-    member_addr: EndpointAddr,
+    member_endpoint_id: [u8; 32],
     welcome: Vec<u8>,
     reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
 }
@@ -331,38 +331,23 @@ where
 
     async fn spawn_acceptor_actors(&mut self) {
         let acceptors: Vec<_> = self.learner.acceptors().clone().into_iter().collect();
-        for (acceptor_id, addr) in acceptors {
-            self.spawn_acceptor_actor(acceptor_id, addr).await;
+        for acceptor_id in acceptors {
+            self.spawn_acceptor_actor(acceptor_id).await;
         }
     }
 
-    async fn spawn_acceptor_actor(&mut self, acceptor_id: AcceptorId, addr: EndpointAddr) {
-        self.spawn_acceptor_actor_inner(acceptor_id, addr, false)
-            .await;
+    async fn spawn_acceptor_actor(&mut self, acceptor_id: AcceptorId) {
+        self.spawn_acceptor_actor_inner(acceptor_id, false).await;
     }
 
-    async fn spawn_acceptor_actor_with_registration(
-        &mut self,
-        acceptor_id: AcceptorId,
-        addr: EndpointAddr,
-    ) {
-        self.spawn_acceptor_actor_inner(acceptor_id, addr, true)
-            .await;
+    async fn spawn_acceptor_actor_with_registration(&mut self, acceptor_id: AcceptorId) {
+        self.spawn_acceptor_actor_inner(acceptor_id, true).await;
     }
 
     #[allow(clippy::collapsible_if)]
-    async fn spawn_acceptor_actor_inner(
-        &mut self,
-        acceptor_id: AcceptorId,
-        addr: EndpointAddr,
-        register: bool,
-    ) {
-        self.connection_manager
-            .add_address_hint(acceptor_id, addr.clone())
-            .await;
-
+    async fn spawn_acceptor_actor_inner(&mut self, acceptor_id: AcceptorId, register: bool) {
         if register {
-            if let Err(e) = self.register_group_with_acceptor(&addr).await {
+            if let Err(e) = self.register_group_with_acceptor(&acceptor_id).await {
                 tracing::warn!(
                     ?acceptor_id,
                     ?e,
@@ -395,16 +380,16 @@ where
 
     async fn register_group_with_acceptor(
         &self,
-        addr: &EndpointAddr,
+        acceptor_id: &AcceptorId,
     ) -> Result<(), Report<WeaverError>> {
-        use crate::connector::register_group_with_addr;
+        use crate::connector::register_group;
 
-        let acceptors = self.learner.acceptors().values().cloned();
+        let acceptors = self.learner.acceptors().iter().copied();
         let group_info_bytes = blocking(|| group_info_with_ext(self.learner.group(), acceptors))?;
 
-        register_group_with_addr(
+        register_group(
             self.connection_manager.endpoint(),
-            addr.clone(),
+            acceptor_id,
             &group_info_bytes,
         )
         .await
@@ -422,10 +407,10 @@ where
             }
             GroupRequest::AddMember {
                 key_package,
-                member_addr,
+                member_endpoint_id,
                 reply,
             } => {
-                self.handle_add_member(*key_package, member_addr, reply)
+                self.handle_add_member(*key_package, member_endpoint_id, reply)
                     .await;
             }
             GroupRequest::RemoveMember {
@@ -440,8 +425,8 @@ where
             GroupRequest::SendMessage { data, reply } => {
                 self.handle_send_message(&data, reply);
             }
-            GroupRequest::AddAcceptor { addr, reply } => {
-                self.handle_add_acceptor(addr, reply).await;
+            GroupRequest::AddAcceptor { id, reply } => {
+                self.handle_add_acceptor(id, reply).await;
             }
             GroupRequest::RemoveAcceptor { acceptor_id, reply } => {
                 self.handle_remove_acceptor(acceptor_id, reply).await;
@@ -496,7 +481,7 @@ where
     async fn handle_add_member(
         &mut self,
         key_package: MlsMessage,
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let acceptor_count = self.learner.acceptor_ids().len();
@@ -526,7 +511,7 @@ where
         }
 
         let result = blocking(|| {
-            let group_info_ext = group_info_ext_list(self.learner.acceptors().values().cloned());
+            let group_info_ext = group_info_ext_list(self.learner.acceptors().iter().copied());
 
             let commit_output = self
                 .learner
@@ -551,7 +536,7 @@ where
         match result {
             Ok((commit_output, welcome_bytes)) => {
                 let message = GroupMessage::new(commit_output.commit_message);
-                self.start_proposal_with_welcome(message, member_addr, welcome_bytes, reply)
+                self.start_proposal_with_welcome(message, member_endpoint_id, welcome_bytes, reply)
                     .await;
             }
             Err(e) => {
@@ -694,11 +679,11 @@ where
 
     async fn handle_add_acceptor(
         &mut self,
-        addr: EndpointAddr,
+        id: AcceptorId,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
         let result = blocking(|| {
-            let proposal = SyncProposal::acceptor_add(addr.clone());
+            let proposal = SyncProposal::acceptor_add(id);
             let custom = proposal.to_custom_proposal().change_context(WeaverError)?;
 
             self.learner
@@ -788,7 +773,7 @@ where
     async fn start_proposal_with_welcome(
         &mut self,
         message: GroupMessage,
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         welcome: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
@@ -799,7 +784,7 @@ where
         match result {
             ProposeResult::Learned { proposal, message } => {
                 self.apply_proposal(&proposal, message).await;
-                self.send_welcome_to_member(member_addr, welcome, reply)
+                self.send_welcome_to_member(member_endpoint_id, welcome, reply)
                     .await;
             }
             ProposeResult::Continue(messages) => {
@@ -808,7 +793,7 @@ where
                     proposal: proposal.clone(),
                     message,
                     reply_kind: ProposalReplyKind::WithWelcome {
-                        member_addr,
+                        member_endpoint_id,
                         welcome,
                         reply,
                     },
@@ -825,7 +810,7 @@ where
                 self.learner.clear_pending_commit();
                 tracing::debug!(?self.attempt, "proposal rejected, retrying");
                 let () = self
-                    .retry_proposal_with_welcome(message, member_addr, welcome, reply, 0)
+                    .retry_proposal_with_welcome(message, member_endpoint_id, welcome, reply, 0)
                     .await;
             }
         }
@@ -879,7 +864,7 @@ where
     async fn retry_proposal_with_welcome(
         &mut self,
         message: GroupMessage,
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         welcome: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
         retries: u32,
@@ -898,7 +883,7 @@ where
         match result {
             ProposeResult::Learned { proposal, message } => {
                 self.apply_proposal(&proposal, message).await;
-                self.send_welcome_to_member(member_addr, welcome, reply)
+                self.send_welcome_to_member(member_endpoint_id, welcome, reply)
                     .await;
             }
             ProposeResult::Continue(messages) => {
@@ -907,7 +892,7 @@ where
                     proposal: proposal.clone(),
                     message,
                     reply_kind: ProposalReplyKind::WithWelcome {
-                        member_addr,
+                        member_endpoint_id,
                         welcome,
                         reply,
                     },
@@ -925,7 +910,7 @@ where
                 tokio::time::sleep(exponential_backoff_duration(retries)).await;
                 Box::pin(self.retry_proposal_with_welcome(
                     message,
-                    member_addr,
+                    member_endpoint_id,
                     welcome,
                     reply,
                     retries + 1,
@@ -942,11 +927,11 @@ where
                 None
             }
             ProposalReplyKind::WithWelcome {
-                member_addr,
+                member_endpoint_id,
                 welcome,
                 reply,
             } => Some(WelcomeToSend {
-                member_addr,
+                member_endpoint_id,
                 welcome,
                 reply,
             }),
@@ -965,7 +950,7 @@ where
     async fn complete_proposal_success(&mut self, active: ActiveProposal) {
         if let Some(welcome_to_send) = Self::complete_proposal_success_sync(active) {
             self.send_welcome_to_member(
-                welcome_to_send.member_addr,
+                welcome_to_send.member_endpoint_id,
                 welcome_to_send.welcome,
                 welcome_to_send.reply,
             )
@@ -975,27 +960,30 @@ where
 
     async fn send_welcome_to_member(
         &self,
-        member_addr: EndpointAddr,
+        member_endpoint_id: [u8; 32],
         welcome: Vec<u8>,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
     ) {
-        let result = self.send_welcome_inner(&member_addr, &welcome).await;
+        let result = self.send_welcome_inner(&member_endpoint_id, &welcome).await;
         let _ = reply.send(result);
     }
 
     async fn send_welcome_inner(
         &self,
-        member_addr: &EndpointAddr,
+        member_endpoint_id: &[u8; 32],
         welcome: &[u8],
     ) -> Result<(), Report<WeaverError>> {
         use futures::SinkExt;
         use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
 
-        tracing::debug!(?member_addr, "sending welcome to new member");
+        let public_key = PublicKey::from_bytes(member_endpoint_id)
+            .map_err(|_| Report::new(WeaverError).attach("invalid member endpoint id"))?;
+
+        tracing::debug!(%public_key, "sending welcome to new member");
 
         let conn = self
             .endpoint
-            .connect(member_addr.clone(), PAXOS_ALPN)
+            .connect(public_key, PAXOS_ALPN)
             .await
             .change_context(WeaverError)?;
 
@@ -1251,8 +1239,8 @@ where
             });
             self.last_epoch_advance = std::time::Instant::now();
 
-            for (acceptor_id, addr) in new_acceptors {
-                self.spawn_acceptor_actor_with_registration(acceptor_id, addr)
+            for acceptor_id in new_acceptors {
+                self.spawn_acceptor_actor_with_registration(acceptor_id)
                     .await;
             }
 
@@ -1268,7 +1256,7 @@ where
         &mut self,
         effect: &CommitEffect,
         committer_index: Option<u32>,
-    ) -> (Vec<WeaverEvent>, Vec<(AcceptorId, EndpointAddr)>) {
+    ) -> (Vec<WeaverEvent>, Vec<AcceptorId>) {
         let applied_proposals = match effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
                 &new_epoch.applied_proposals
@@ -1323,21 +1311,20 @@ where
         &mut self,
         custom: &mls_rs::group::proposal::CustomProposal,
         committer_fingerprint: Option<MemberFingerprint>,
-        new_acceptors: &mut Vec<(AcceptorId, EndpointAddr)>,
+        new_acceptors: &mut Vec<AcceptorId>,
     ) -> WeaverEvent {
         let Ok(proposal) = SyncProposal::from_custom_proposal(custom) else {
             return WeaverEvent::Unknown;
         };
 
         match proposal {
-            SyncProposal::AcceptorAdd(addr) => {
-                let id = AcceptorId::from_bytes(*addr.id.as_bytes());
-                self.learner.add_acceptor_addr(addr.clone());
-                new_acceptors.push((id, addr));
+            SyncProposal::AcceptorAdd(id) => {
+                self.learner.add_acceptor(id);
+                new_acceptors.push(id);
                 WeaverEvent::SpoolAdded { id }
             }
             SyncProposal::AcceptorRemove(id) => {
-                self.learner.remove_acceptor_id(&id);
+                self.learner.remove_acceptor(&id);
                 if let Some(handle) = self.acceptor_handles.remove(&id) {
                     handle.abort();
                 }

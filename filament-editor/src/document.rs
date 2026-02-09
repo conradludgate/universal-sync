@@ -281,10 +281,12 @@ impl<E: EventEmitter> DocumentActor<E> {
         let bytes = bs58::decode(addr_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
-        let addr: iroh::EndpointAddr =
-            postcard::from_bytes(&bytes).map_err(|e| format!("invalid address: {e}"))?;
+        let key_bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| "spool address must be a 32-byte public key".to_string())?;
+        let id = filament_core::AcceptorId::from_bytes(key_bytes);
         self.group
-            .add_spool(addr)
+            .add_spool(id)
             .await
             .map_err(|e| format!("failed to add spool: {e:?}"))
     }
@@ -333,17 +335,17 @@ impl<E: EventEmitter> DocumentActor<E> {
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
 
+        if bytes.len() == 32 {
+            return self.add_spool(input_b58).await;
+        }
+
         if let Ok(msg) = mls_rs::MlsMessage::from_bytes(&bytes)
             && msg.as_key_package().is_some()
         {
             return self.add_member(input_b58).await;
         }
 
-        if postcard::from_bytes::<iroh::EndpointAddr>(&bytes).is_ok() {
-            return self.add_spool(input_b58).await;
-        }
-
-        Err("input is neither a valid KeyPackage nor an EndpointAddr".to_string())
+        Err("input is neither a 32-byte spool public key nor a valid KeyPackage".to_string())
     }
 
     async fn remove_member(&mut self, member_index: u32) -> Result<(), String> {

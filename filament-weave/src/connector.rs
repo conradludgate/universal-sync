@@ -4,20 +4,22 @@ use error_stack::{Report, ResultExt};
 pub use filament_core::ConnectorError;
 use filament_core::codec::PostcardCodec;
 use filament_core::{
-    GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, PAXOS_ALPN,
+    AcceptorId, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, PAXOS_ALPN,
 };
 use futures::{SinkExt, StreamExt};
-use iroh::Endpoint;
+use iroh::{Endpoint, PublicKey};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
-/// Register a new group with an acceptor. Returns the [`GroupId`] on success.
-pub(crate) async fn register_group_with_addr(
+/// Register a new group with an acceptor via discovery.
+pub(crate) async fn register_group(
     endpoint: &Endpoint,
-    addr: impl Into<iroh::EndpointAddr>,
+    acceptor_id: &AcceptorId,
     group_info: &[u8],
 ) -> Result<GroupId, Report<ConnectorError>> {
+    let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
+        .expect("AcceptorId should be a valid public key");
     let conn = endpoint
-        .connect(addr, PAXOS_ALPN)
+        .connect(public_key, PAXOS_ALPN)
         .await
         .change_context(ConnectorError)?;
 

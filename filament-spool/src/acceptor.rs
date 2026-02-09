@@ -8,7 +8,7 @@ use filament_core::{
     AcceptorId, Attempt, Epoch, GroupContextExt, GroupId, GroupMessage, GroupProposal, LeafNodeExt,
     MemberFingerprint, MemberId, SyncProposal, UnsignedProposal,
 };
-use iroh::{EndpointAddr, PublicKey, SecretKey, Signature};
+use iroh::{PublicKey, SecretKey, Signature};
 use mls_rs::CipherSuiteProvider;
 use mls_rs::crypto::SignaturePublicKey;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
@@ -45,7 +45,7 @@ where
     external_group: ExternalGroup<C>,
     cipher_suite: CS,
     secret_key: SecretKey,
-    acceptors: std::collections::BTreeMap<AcceptorId, EndpointAddr>,
+    acceptors: std::collections::BTreeSet<AcceptorId>,
     /// Enables epoch roster lookups for validating proposals from past epochs.
     state_store: Option<crate::state_store::GroupStateStore>,
 }
@@ -59,19 +59,13 @@ where
         external_group: ExternalGroup<C>,
         cipher_suite: CS,
         secret_key: SecretKey,
-        acceptors: impl IntoIterator<Item = EndpointAddr>,
+        acceptors: impl IntoIterator<Item = AcceptorId>,
     ) -> Self {
         Self {
             external_group,
             cipher_suite,
             secret_key,
-            acceptors: acceptors
-                .into_iter()
-                .map(|addr| {
-                    let id = AcceptorId::from_bytes(*addr.id.as_bytes());
-                    (id, addr)
-                })
-                .collect(),
+            acceptors: acceptors.into_iter().collect(),
             state_store: None,
         }
     }
@@ -85,8 +79,8 @@ where
         self
     }
 
-    pub(crate) fn acceptor_addrs(&self) -> impl Iterator<Item = (&AcceptorId, &EndpointAddr)> {
-        self.acceptors.iter()
+    pub(crate) fn acceptor_ids(&self) -> &std::collections::BTreeSet<AcceptorId> {
+        &self.acceptors
     }
 
     /// Read the protocol version from the group's `GroupContextExt`.
@@ -133,7 +127,7 @@ where
     }
 
     fn is_known_acceptor(&self, id: &AcceptorId) -> bool {
-        self.acceptors.contains_key(id)
+        self.acceptors.contains(id)
     }
 
     pub(crate) fn is_fingerprint_in_roster(
@@ -177,7 +171,7 @@ where
     }
 
     fn acceptors(&self) -> impl IntoIterator<Item = AcceptorId, IntoIter: ExactSizeIterator> {
-        self.acceptors.keys().copied().collect::<Vec<_>>()
+        self.acceptors.iter().copied().collect::<Vec<_>>()
     }
 
     fn propose(&self, attempt: Attempt) -> GroupProposal {
@@ -348,9 +342,8 @@ where
                 && let Ok(proposal) = SyncProposal::from_custom_proposal(custom)
             {
                 match proposal {
-                    SyncProposal::AcceptorAdd(addr) => {
-                        let id = AcceptorId::from_bytes(*addr.id.as_bytes());
-                        self.acceptors.insert(id, addr);
+                    SyncProposal::AcceptorAdd(id) => {
+                        self.acceptors.insert(id);
                         changes.push(AcceptorChangeEvent::Added { id });
                     }
                     SyncProposal::AcceptorRemove(id) => {
@@ -489,10 +482,10 @@ mod tests {
             .unwrap();
 
         let acceptor_sk = SecretKey::generate(&mut rand::rng());
-        let acceptor_addr = EndpointAddr::new(acceptor_sk.public());
+        let acceptor_id = AcceptorId::from_bytes(*acceptor_sk.public().as_bytes());
 
         let acceptor =
-            GroupAcceptor::new(external_group, cs, acceptor_sk.clone(), vec![acceptor_addr]);
+            GroupAcceptor::new(external_group, cs, acceptor_sk.clone(), vec![acceptor_id]);
 
         (acceptor, sk)
     }
@@ -558,13 +551,12 @@ mod tests {
         let (acceptor, _) = make_acceptor();
 
         let acceptor_id = acceptor.acceptors().into_iter().next().unwrap();
-        let addr = acceptor.acceptors.get(&acceptor_id).unwrap();
 
         let unsigned = UnsignedProposal::new(
             MemberId(u32::MAX),
             Epoch(0),
             Attempt(0),
-            *addr.id.as_bytes(),
+            *acceptor_id.as_bytes(),
         );
         let proposal = unsigned.with_signature(vec![1, 2, 3]);
 
