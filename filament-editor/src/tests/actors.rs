@@ -93,7 +93,8 @@ async fn spawn_doc_actor() -> (
     let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_weaver_client("doc-actor-test", test_endpoint(&discovery).await);
+    let endpoint = test_endpoint(&discovery).await;
+    let client = test_yrs_weaver_client("doc-actor-test", endpoint.clone());
     let group = client
         .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
@@ -104,7 +105,7 @@ async fn spawn_doc_actor() -> (
     let (doc_tx, doc_rx) = mpsc::channel(64);
     let (emitter, event_rx) = mock_emitter();
 
-    let actor = DocumentActor::new(group, crdt, group_id, doc_rx, emitter);
+    let actor = DocumentActor::new(group, crdt, group_id, endpoint, doc_rx, emitter);
     tokio::spawn(async move {
         actor.run().await;
         acceptor_task.abort();
@@ -231,7 +232,8 @@ async fn doc_actor_remote_update_triggers_event() {
     let (_acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_weaver_client("alice-doc-event", test_endpoint(&discovery).await);
+    let alice_endpoint = test_endpoint(&discovery).await;
+    let alice_client = test_yrs_weaver_client("alice-doc-event", alice_endpoint.clone());
     let mut alice_group = alice_client
         .create(std::slice::from_ref(&acceptor_id), "yrs")
         .await
@@ -240,7 +242,8 @@ async fn doc_actor_remote_update_triggers_event() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut bob_client = test_yrs_weaver_client("bob-doc-event", test_endpoint(&discovery).await);
+    let bob_endpoint = test_endpoint(&discovery).await;
+    let mut bob_client = test_yrs_weaver_client("bob-doc-event", bob_endpoint.clone());
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     alice_group.add_member(&bob_kp).await.expect("add bob");
     let welcome = bob_client.recv_welcome().await.expect("bob welcome");
@@ -256,7 +259,14 @@ async fn doc_actor_remote_update_triggers_event() {
         };
         let (tx, rx) = mpsc::channel(64);
         let (emitter, event_rx) = mock_emitter();
-        let actor = DocumentActor::new(join_info.group, bob_crdt, group_id, rx, emitter);
+        let actor = DocumentActor::new(
+            join_info.group,
+            bob_crdt,
+            group_id,
+            bob_endpoint,
+            rx,
+            emitter,
+        );
         tokio::spawn(actor.run());
         (tx, event_rx)
     };
@@ -265,7 +275,14 @@ async fn doc_actor_remote_update_triggers_event() {
         let alice_crdt = YrsCrdt::new();
         let (tx, rx) = mpsc::channel(64);
         let (emitter, _event_rx) = mock_emitter();
-        let actor = DocumentActor::new(alice_group, alice_crdt, group_id, rx, emitter);
+        let actor = DocumentActor::new(
+            alice_group,
+            alice_crdt,
+            group_id,
+            alice_endpoint,
+            rx,
+            emitter,
+        );
         tokio::spawn(actor.run());
         (tx, _event_rx)
     };
@@ -309,6 +326,7 @@ async fn doc_actor_remote_update_triggers_event() {
 /// Returns the request sender and the event receiver.
 fn spawn_coordinator(
     client: filament_weave::WeaverClient,
+    endpoint: iroh::Endpoint,
 ) -> (
     mpsc::Sender<CoordinatorRequest>,
     mpsc::Receiver<DocumentUpdatedPayload>,
@@ -316,7 +334,7 @@ fn spawn_coordinator(
     let (coord_tx, coord_rx) = mpsc::channel(64);
     let (emitter, event_rx) = mock_emitter();
 
-    let actor = CoordinatorActor::new(client, coord_rx, emitter);
+    let actor = CoordinatorActor::new(client, endpoint, coord_rx, emitter);
     tokio::spawn(actor.run());
 
     (coord_tx, event_rx)
@@ -329,8 +347,9 @@ async fn coordinator_create_document() {
     let (_acceptor_task, _acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_weaver_client("coord-create", test_endpoint(&discovery).await);
-    let (tx, _event_rx) = spawn_coordinator(client);
+    let endpoint = test_endpoint(&discovery).await;
+    let client = test_yrs_weaver_client("coord-create", endpoint.clone());
+    let (tx, _event_rx) = spawn_coordinator(client, endpoint);
 
     let info: DocumentInfo = send_coord(&tx, |reply| CoordinatorRequest::CreateDocument { reply })
         .await
@@ -356,8 +375,9 @@ async fn coordinator_create_multiple_documents() {
     let (_acceptor_task, _addr, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let client = test_yrs_weaver_client("coord-multi", test_endpoint(&discovery).await);
-    let (tx, _event_rx) = spawn_coordinator(client);
+    let endpoint = test_endpoint(&discovery).await;
+    let client = test_yrs_weaver_client("coord-multi", endpoint.clone());
+    let (tx, _event_rx) = spawn_coordinator(client, endpoint);
 
     let info_a = send_coord(&tx, |reply| CoordinatorRequest::CreateDocument { reply })
         .await
@@ -399,8 +419,9 @@ async fn coordinator_create_multiple_documents() {
 async fn coordinator_route_to_unknown_group_id() {
     init_tracing();
     let discovery = TestAddressLookup::new();
-    let client = test_yrs_weaver_client("coord-unknown", test_endpoint(&discovery).await);
-    let (tx, _event_rx) = spawn_coordinator(client);
+    let endpoint = test_endpoint(&discovery).await;
+    let client = test_yrs_weaver_client("coord-unknown", endpoint.clone());
+    let (tx, _event_rx) = spawn_coordinator(client, endpoint);
 
     let fake_id = GroupId::new([42u8; 32]);
 
@@ -429,8 +450,9 @@ async fn coordinator_join_via_welcome() {
     let (_acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_weaver_client("alice-coord", test_endpoint(&discovery).await);
-    let (alice_tx, _alice_events) = spawn_coordinator(alice_client);
+    let alice_endpoint = test_endpoint(&discovery).await;
+    let alice_client = test_yrs_weaver_client("alice-coord", alice_endpoint.clone());
+    let (alice_tx, _alice_events) = spawn_coordinator(alice_client, alice_endpoint);
 
     let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
         reply,
@@ -460,10 +482,11 @@ async fn coordinator_join_via_welcome() {
     .await
     .expect("alice write");
 
-    let bob_client = test_yrs_weaver_client("bob-coord", test_endpoint(&discovery).await);
+    let bob_endpoint = test_endpoint(&discovery).await;
+    let bob_client = test_yrs_weaver_client("bob-coord", bob_endpoint.clone());
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp).into_string();
-    let (bob_tx, _bob_events) = spawn_coordinator(bob_client);
+    let (bob_tx, _bob_events) = spawn_coordinator(bob_client, bob_endpoint);
 
     let bob_tx2 = bob_tx.clone();
     let bob_welcome_handle = tokio::spawn(async move {
@@ -512,8 +535,9 @@ async fn full_two_peer_sync() {
     let (_acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let alice_client = test_yrs_weaver_client("alice-sync", test_endpoint(&discovery).await);
-    let (alice_tx, mut alice_events) = spawn_coordinator(alice_client);
+    let alice_endpoint = test_endpoint(&discovery).await;
+    let alice_client = test_yrs_weaver_client("alice-sync", alice_endpoint.clone());
+    let (alice_tx, mut alice_events) = spawn_coordinator(alice_client, alice_endpoint);
 
     let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
         reply,
@@ -531,10 +555,11 @@ async fn full_two_peer_sync() {
     .expect("add acceptor");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let bob_client = test_yrs_weaver_client("bob-sync", test_endpoint(&discovery).await);
+    let bob_endpoint = test_endpoint(&discovery).await;
+    let bob_client = test_yrs_weaver_client("bob-sync", bob_endpoint.clone());
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp).into_string();
-    let (bob_tx, mut bob_events) = spawn_coordinator(bob_client);
+    let (bob_tx, mut bob_events) = spawn_coordinator(bob_client, bob_endpoint);
 
     let bob_tx2 = bob_tx.clone();
     let bob_welcome_handle = tokio::spawn(async move {
@@ -632,8 +657,9 @@ async fn two_member_unidirectional_sync() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Spawn Alice's coordinator
-    let alice_client = test_yrs_weaver_client("alice-uni", test_endpoint(&discovery).await);
-    let (alice_tx, _alice_events) = spawn_coordinator(alice_client);
+    let alice_endpoint = test_endpoint(&discovery).await;
+    let alice_client = test_yrs_weaver_client("alice-uni", alice_endpoint.clone());
+    let (alice_tx, _alice_events) = spawn_coordinator(alice_client, alice_endpoint);
 
     // Alice creates a document
     let doc_info = send_coord(&alice_tx, |reply| CoordinatorRequest::CreateDocument {
@@ -654,10 +680,11 @@ async fn two_member_unidirectional_sync() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Spawn Bob's coordinator
-    let bob_client = test_yrs_weaver_client("bob-uni", test_endpoint(&discovery).await);
+    let bob_endpoint = test_endpoint(&discovery).await;
+    let bob_client = test_yrs_weaver_client("bob-uni", bob_endpoint.clone());
     let bob_kp = bob_client.generate_key_package().expect("bob kp");
     let bob_kp_b58 = bs58::encode(bob_kp).into_string();
-    let (bob_tx, mut bob_events) = spawn_coordinator(bob_client);
+    let (bob_tx, mut bob_events) = spawn_coordinator(bob_client, bob_endpoint);
 
     // Bob starts waiting for a welcome
     let bob_tx2 = bob_tx.clone();

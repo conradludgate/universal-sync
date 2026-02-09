@@ -40,6 +40,8 @@ fn main() {
             commands::get_key_package,
             commands::recv_welcome,
             commands::join_document_bytes,
+            commands::join_external,
+            commands::generate_external_invite,
             commands::apply_delta,
             commands::get_document_text,
             commands::add_member,
@@ -82,9 +84,9 @@ async fn setup_coordinator(
     info!(addr = ?endpoint.addr(), "iroh endpoint ready");
 
     let identity = iroh_key.public().as_bytes().to_vec();
-    let group_client = WeaverClient::new(identity, endpoint);
+    let group_client = WeaverClient::new(identity, endpoint.clone());
 
-    let coordinator = CoordinatorActor::new(group_client, coordinator_rx, app_handle);
+    let coordinator = CoordinatorActor::new(group_client, endpoint, coordinator_rx, app_handle);
     coordinator.run().await;
 
     Ok(())

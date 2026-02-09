@@ -20,6 +20,8 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
   const [peers, setPeers] = useState<PeerEntry[]>([]);
   const [peerInput, setPeerInput] = useState("");
   const [updatingKeys, setUpdatingKeys] = useState(false);
+  const [externalInvite, setExternalInvite] = useState("");
+  const [generatingInvite, setGeneratingInvite] = useState(false);
 
   const fetchPeers = useCallback(async () => {
     try {
@@ -92,6 +94,30 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
     }
   }, [groupId, showToast]);
 
+  const handleGenerateExternalInvite = useCallback(async () => {
+    setGeneratingInvite(true);
+    setExternalInvite("");
+    try {
+      const code = await tauri.generateExternalInvite(groupId);
+      setExternalInvite(code);
+    } catch (error) {
+      console.error("Failed to generate external invite:", error);
+      showToast(`Failed to generate invite: ${error}`, "error");
+    } finally {
+      setGeneratingInvite(false);
+    }
+  }, [groupId, showToast]);
+
+  const copyExternalInvite = useCallback(async () => {
+    if (!externalInvite) return;
+    try {
+      await navigator.clipboard.writeText(externalInvite);
+      showToast("External invite copied!", "success");
+    } catch {
+      showToast("Failed to copy", "error");
+    }
+  }, [externalInvite, showToast]);
+
   const copyTranscriptHash = useCallback(async () => {
     if (!groupState) return;
     try {
@@ -160,6 +186,33 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
             >
               {updatingKeys ? "⏳ Updating…" : "🔑 Update Keys"}
             </button>
+          </div>
+
+          <div className="group-info-card">
+            <button
+              className="btn btn-secondary btn-sm btn-block"
+              onClick={handleGenerateExternalInvite}
+              disabled={generatingInvite}
+            >
+              {generatingInvite ? "Generating…" : "Generate External Invite"}
+            </button>
+            {externalInvite && (
+              <div className="invite-code-box" style={{ marginTop: "0.5rem" }}>
+                <textarea
+                  className="input-textarea invite-code"
+                  readOnly
+                  rows={3}
+                  value={externalInvite}
+                />
+                <button
+                  className="btn-icon-only"
+                  title="Copy external invite"
+                  onClick={copyExternalInvite}
+                >
+                  📋
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="peer-list">

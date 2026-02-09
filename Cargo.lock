@@ -1771,11 +1771,13 @@ dependencies = [
 name = "filament-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "bs58",
  "bytes",
  "error-stack",
  "filament-warp",
  "futures",
+ "iroh",
  "mls-rs",
  "mls-rs-core",
  "pin-project-lite",

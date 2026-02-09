@@ -22,6 +22,8 @@ tokio-util.workspace = true
 tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true
+iroh.workspace = true
+aes-gcm = "0.10.3"
 
 # Optional CRDT implementations
 yrs = { version = "0.25", optional = true }

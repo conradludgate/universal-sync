@@ -409,6 +409,10 @@ where
         let epoch = Epoch(self.external_group.group_context().epoch);
         self.store_snapshot(epoch);
     }
+
+    pub(crate) fn snapshot_bytes(&self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        self.external_group.snapshot().to_bytes()
+    }
 }
 
 #[cfg(test)]

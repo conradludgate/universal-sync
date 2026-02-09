@@ -2352,6 +2352,84 @@ async fn test_multi_acceptor_message_delivery() {
     acceptor2_task.abort();
 }
 
+// =============================================================================
+// External Commit Tests
+// =============================================================================
+
+/// Test 1: Happy path external commit join.
+///
+/// Alice creates a group with an acceptor, generates a QR payload
+/// (encrypted GroupInfo stored on spool), Bob uses the payload to
+/// join via external commit.
+#[tokio::test]
+async fn test_external_commit_join() {
+    init_tracing();
+    let discovery = TestAddressLookup::new();
+
+    let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Alice creates group with acceptor
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
+    let alice_endpoint = test_endpoint(&discovery).await;
+
+    let mut alice_group = alice
+        .create(std::slice::from_ref(&acceptor_id), "none")
+        .await
+        .expect("create group");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Alice generates QR payload (encrypts GroupInfo, stores on spool)
+    let qr_payload = alice_group
+        .generate_qr_payload(acceptor_id, &alice_endpoint)
+        .await
+        .expect("generate QR payload");
+
+    tracing::info!(?qr_payload.group_id, "Alice generated QR payload");
+
+    // Bob scans QR code and joins via external commit
+    let bob = test_weaver_client("bob", test_endpoint(&discovery).await);
+
+    let join_info = bob
+        .join_external(&qr_payload)
+        .await
+        .expect("bob external commit join");
+    let mut bob_group = join_info.group;
+
+    // Wait for Alice to learn the external commit from the spool.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let alice_ctx = alice_group.context().await.expect("alice context");
+    let bob_ctx = bob_group.context().await.expect("bob context");
+
+    tracing::info!(
+        alice_epoch = ?alice_ctx.epoch,
+        bob_epoch = ?bob_ctx.epoch,
+        alice_members = alice_ctx.member_count,
+        bob_members = bob_ctx.member_count,
+        "External commit join complete"
+    );
+
+    assert_eq!(bob_ctx.spools.len(), 1, "Bob should have 1 acceptor");
+    assert_eq!(
+        alice_ctx.epoch, bob_ctx.epoch,
+        "Alice and Bob must agree on the epoch"
+    );
+    assert_eq!(
+        alice_ctx.member_count, bob_ctx.member_count,
+        "Alice and Bob must agree on the member count"
+    );
+    assert!(
+        alice_ctx.member_count >= 2,
+        "Group must have at least 2 members after external join"
+    );
+
+    alice_group.shutdown().await;
+    bob_group.shutdown().await;
+    acceptor_task.abort();
+}
+
 /// Test: `YrsCrdt::from_snapshot` with empty bytes behaves like a fresh CRDT
 /// (the join path treats an empty snapshot as "no snapshot").
 #[tokio::test]

@@ -74,6 +74,29 @@ pub async fn join_document_bytes(
 }
 
 #[tauri::command]
+pub async fn join_external(
+    state: tauri::State<'_, AppState>,
+    invite_b58: String,
+) -> Result<DocumentInfo, String> {
+    coord_request(&state, |reply| CoordinatorRequest::JoinExternal {
+        invite_b58,
+        reply,
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn generate_external_invite(
+    state: tauri::State<'_, AppState>,
+    group_id: String,
+) -> Result<String, String> {
+    doc_request(&state, &group_id, |reply| {
+        DocRequest::GenerateExternalInvite { reply }
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn apply_delta(
     state: tauri::State<'_, AppState>,
     group_id: String,

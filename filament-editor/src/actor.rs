@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use filament_core::GroupId;
 use filament_weave::{Weaver, WeaverClient};
+use iroh::Endpoint;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use yrs::Transact;
@@ -18,6 +19,7 @@ use crate::yrs_crdt::YrsCrdt;
 
 pub struct CoordinatorActor<E: EventEmitter> {
     group_client: WeaverClient,
+    endpoint: Endpoint,
     welcome_rx: mpsc::Receiver<bytes::Bytes>,
     doc_actors: HashMap<GroupId, mpsc::Sender<DocRequest>>,
     request_rx: mpsc::Receiver<CoordinatorRequest>,
@@ -28,12 +30,14 @@ pub struct CoordinatorActor<E: EventEmitter> {
 impl<E: EventEmitter> CoordinatorActor<E> {
     pub fn new(
         mut group_client: WeaverClient,
+        endpoint: Endpoint,
         request_rx: mpsc::Receiver<CoordinatorRequest>,
         emitter: E,
     ) -> Self {
         let welcome_rx = group_client.take_welcome_rx();
         Self {
             group_client,
+            endpoint,
             welcome_rx,
             doc_actors: HashMap::new(),
             request_rx,
@@ -76,6 +80,10 @@ impl<E: EventEmitter> CoordinatorActor<E> {
                 let result = self.join_document_bytes(&welcome_b58).await;
                 let _ = reply.send(result);
             }
+            CoordinatorRequest::JoinExternal { invite_b58, reply } => {
+                let result = self.join_external(&invite_b58).await;
+                let _ = reply.send(result);
+            }
             CoordinatorRequest::ForDoc { group_id, request } => {
                 self.route_to_doc(group_id, request).await;
             }
@@ -106,6 +114,29 @@ impl<E: EventEmitter> CoordinatorActor<E> {
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
         self.join_with_welcome(&welcome_bytes).await
+    }
+
+    async fn join_external(&mut self, invite_b58: &str) -> Result<DocumentInfo, String> {
+        let bytes = bs58::decode(invite_b58)
+            .into_vec()
+            .map_err(|e| format!("invalid base58: {e}"))?;
+        let qr = filament_core::QrPayload::from_bytes(&bytes)
+            .map_err(|e| format!("invalid invite payload: {e}"))?;
+        let join_info = self
+            .group_client
+            .join_external(&qr)
+            .await
+            .map_err(|e| format!("external join failed: {e:?}"))?;
+
+        let client_id = join_info.group.client_id().0;
+        let crdt = if let Some(snapshot) = join_info.snapshot {
+            YrsCrdt::from_snapshot(&snapshot, client_id)
+                .map_err(|e| format!("failed to create CRDT from snapshot: {e:?}"))?
+        } else {
+            YrsCrdt::with_client_id(client_id)
+        };
+
+        self.register_document(join_info.group, crdt)
     }
 
     async fn handle_welcome_received(&mut self, welcome_bytes: bytes::Bytes) {
@@ -153,7 +184,14 @@ impl<E: EventEmitter> CoordinatorActor<E> {
         };
 
         let (doc_tx, doc_rx) = mpsc::channel(64);
-        let actor = DocumentActor::new(group, crdt, group_id, doc_rx, self.emitter.clone());
+        let actor = DocumentActor::new(
+            group,
+            crdt,
+            group_id,
+            self.endpoint.clone(),
+            doc_rx,
+            self.emitter.clone(),
+        );
         tokio::spawn(actor.run());
 
         self.doc_actors.insert(group_id, doc_tx);

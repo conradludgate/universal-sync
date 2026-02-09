@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, KeyPackageExt, LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
+    AcceptorId, KeyPackageExt, LeafNodeExt, QrPayload, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
 };
 use iroh::Endpoint;
 use mls_rs::client_builder::{BaseConfig, WithCryptoProvider, WithIdentityProvider};
@@ -172,6 +172,118 @@ impl WeaverClient {
     pub fn take_welcome_rx(&mut self) -> mpsc::Receiver<bytes::Bytes> {
         let (_, empty_rx) = mpsc::channel(1);
         std::mem::replace(&mut self.welcome_rx, empty_rx)
+    }
+
+    /// Join a group via an external commit using a [`QrPayload`].
+    ///
+    /// 1. Connects to the spool specified in the payload.
+    /// 2. Fetches the encrypted `GroupInfo`.
+    /// 3. Decrypts it using the key/nonce from the payload.
+    /// 4. Creates an external commit.
+    /// 5. Submits the commit back to the spool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if any step fails.
+    pub async fn join_external(&self, qr: &QrPayload) -> Result<JoinInfo, Report<WeaverError>> {
+        use filament_core::{Handshake, HandshakeResponse, PAXOS_ALPN, decrypt_group_info};
+        use futures::{SinkExt, StreamExt};
+        use iroh::PublicKey;
+
+        let endpoint = self.connection_manager.endpoint();
+        let spool_public_key = PublicKey::from_bytes(qr.spool_id.as_bytes())
+            .map_err(|_| Report::new(WeaverError).attach("invalid spool public key"))?;
+
+        let send_handshake = |handshake: Handshake| {
+            let endpoint = endpoint.clone();
+            async move {
+                let conn = endpoint
+                    .connect(spool_public_key, PAXOS_ALPN)
+                    .await
+                    .change_context(WeaverError)
+                    .attach("failed to connect to spool")?;
+
+                let (send, recv) = conn.open_bi().await.change_context(WeaverError)?;
+                let codec = tokio_util::codec::LengthDelimitedCodec::builder()
+                    .max_frame_length(16 * 1024 * 1024)
+                    .new_codec();
+                let mut writer = tokio_util::codec::FramedWrite::new(send, codec.clone());
+                let mut reader = tokio_util::codec::FramedRead::new(recv, codec);
+
+                let hs_bytes = postcard::to_allocvec(&handshake).change_context(WeaverError)?;
+
+                writer
+                    .send(hs_bytes.into())
+                    .await
+                    .change_context(WeaverError)?;
+
+                let resp_bytes = reader
+                    .next()
+                    .await
+                    .ok_or_else(|| Report::new(WeaverError).attach("spool closed before response"))?
+                    .change_context(WeaverError)?;
+
+                let resp: HandshakeResponse =
+                    postcard::from_bytes(&resp_bytes).change_context(WeaverError)?;
+
+                Ok::<_, Report<WeaverError>>(resp)
+            }
+        };
+
+        // Fetch encrypted `GroupInfo` from spool.
+        let resp = send_handshake(Handshake::FetchGroupInfo {
+            group_id: qr.group_id,
+        })
+        .await?;
+
+        let ciphertext = match resp {
+            HandshakeResponse::Data(data) => data,
+            HandshakeResponse::GroupNotFound => {
+                return Err(
+                    Report::new(WeaverError).attach("encrypted GroupInfo not found on spool")
+                );
+            }
+            other => {
+                return Err(Report::new(WeaverError)
+                    .attach(format!("unexpected spool response: {other:?}")));
+            }
+        };
+
+        // Decrypt GroupInfo.
+        let group_info_bytes = decrypt_group_info(&qr.key, &qr.nonce, &ciphertext)
+            .map_err(|_| Report::new(WeaverError).attach("GroupInfo decryption failed"))?;
+
+        // Create external commit.
+        let (join_info, commit_bytes) = Weaver::join_external(
+            &self.client,
+            self.signer.clone(),
+            self.cipher_suite.clone(),
+            &self.connection_manager,
+            &group_info_bytes,
+        )
+        .await?;
+
+        // Submit external commit to spool.
+        let resp = send_handshake(Handshake::ExternalCommit {
+            group_id: qr.group_id,
+            commit: commit_bytes.into(),
+        })
+        .await?;
+
+        match resp {
+            HandshakeResponse::Ok => {}
+            HandshakeResponse::Error(e) => {
+                return Err(
+                    Report::new(WeaverError).attach(format!("external commit rejected: {e}"))
+                );
+            }
+            other => {
+                return Err(Report::new(WeaverError)
+                    .attach(format!("unexpected commit response: {other:?}")));
+            }
+        }
+
+        Ok(join_info)
     }
 }
 

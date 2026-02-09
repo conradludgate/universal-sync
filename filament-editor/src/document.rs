@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use filament_core::GroupId;
 use filament_weave::{Weaver, WeaverEvent};
+use iroh::Endpoint;
 use tokio::sync::{broadcast, mpsc};
 use yrs::{Any, GetString, Observable, Out, Text, Transact};
 
@@ -21,6 +22,7 @@ pub struct DocumentActor<E: EventEmitter> {
     group: Weaver,
     crdt: YrsCrdt,
     group_id_b58: String,
+    endpoint: Endpoint,
     request_rx: mpsc::Receiver<DocRequest>,
     event_rx: broadcast::Receiver<WeaverEvent>,
     emitter: E,
@@ -34,6 +36,7 @@ impl<E: EventEmitter> DocumentActor<E> {
         group: Weaver,
         crdt: YrsCrdt,
         group_id: GroupId,
+        endpoint: Endpoint,
         request_rx: mpsc::Receiver<DocRequest>,
         emitter: E,
     ) -> Self {
@@ -43,6 +46,7 @@ impl<E: EventEmitter> DocumentActor<E> {
             group,
             crdt,
             group_id_b58,
+            endpoint,
             request_rx,
             event_rx,
             emitter,
@@ -209,6 +213,10 @@ impl<E: EventEmitter> DocumentActor<E> {
             }
             DocRequest::UpdateKeys { reply } => {
                 let result = self.update_keys().await;
+                let _ = reply.send(result);
+            }
+            DocRequest::GenerateExternalInvite { reply } => {
+                let result = self.generate_external_invite().await;
                 let _ = reply.send(result);
             }
             DocRequest::UpdateCursor { anchor, head } => {
@@ -391,6 +399,27 @@ impl<E: EventEmitter> DocumentActor<E> {
             .update_keys()
             .await
             .map_err(|e| format!("failed to update keys: {e:?}"))
+    }
+
+    async fn generate_external_invite(&mut self) -> Result<String, String> {
+        let ctx = self
+            .group
+            .context()
+            .await
+            .map_err(|e| format!("failed to get context: {e:?}"))?;
+
+        let spool_id = ctx
+            .spools
+            .first()
+            .ok_or_else(|| "group has no spools — add one first".to_string())?;
+
+        let qr = self
+            .group
+            .generate_qr_payload(*spool_id, &self.endpoint)
+            .await
+            .map_err(|e| format!("failed to generate invite: {e:?}"))?;
+
+        Ok(bs58::encode(qr.to_bytes()).into_string())
     }
 
     fn emit_text_update(&self, delta_buf: &Arc<Mutex<Vec<Delta>>>) {

@@ -438,6 +438,19 @@ where
             } => {
                 self.handle_compact_snapshot(snapshot, level, reply).await;
             }
+            GroupRequest::GenerateExternalGroupInfo { reply } => {
+                let result = blocking(|| {
+                    let extensions = group_info_ext_list(self.learner.acceptors().iter().copied());
+                    self.learner
+                        .group()
+                        .group_info_message_allowing_ext_commit_with_extensions(true, extensions)
+                        .change_context(WeaverError)
+                        .attach("failed to generate external commit GroupInfo")?
+                        .to_bytes()
+                        .change_context(WeaverError)
+                });
+                let _ = reply.send(result);
+            }
             GroupRequest::Shutdown => {
                 return true;
             }
@@ -1293,7 +1306,13 @@ where
                     index: remove_proposal.to_remove(),
                 },
                 MlsProposal::ReInit(_) => WeaverEvent::ReInitiated,
-                MlsProposal::ExternalInit(_) => WeaverEvent::ExternalInit,
+                MlsProposal::ExternalInit(_) => {
+                    let level = self.compaction_state.max_compacted_level.max(1);
+                    let _ = self
+                        .event_tx
+                        .send(WeaverEvent::CompactionNeeded { level, force: true });
+                    WeaverEvent::ExternalInit
+                }
                 MlsProposal::GroupContextExtensions(_) => WeaverEvent::ExtensionsUpdated,
                 MlsProposal::Custom(custom) => {
                     self.process_custom_proposal(custom, committer_fingerprint, &mut new_acceptors)

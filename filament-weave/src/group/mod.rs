@@ -18,7 +18,7 @@ use std::fmt;
 use error_stack::{Report, ResultExt};
 use filament_core::{
     AcceptorId, ClientId, Crdt, EncryptedAppMessage, Epoch, GroupContextExt, GroupId, GroupInfoExt,
-    Handshake, KeyPackageExt, LeafNodeExt, MessageId,
+    Handshake, KeyPackageExt, LeafNodeExt, MessageId, QrPayload,
 };
 use iroh::Endpoint;
 use mls_rs::client_builder::MlsConfig;
@@ -101,6 +101,9 @@ enum GroupRequest {
         snapshot: bytes::Bytes,
         level: u8,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
+    },
+    GenerateExternalGroupInfo {
+        reply: oneshot::Sender<Result<Vec<u8>, Report<WeaverError>>>,
     },
     Shutdown,
 }
@@ -418,6 +421,93 @@ impl Weaver {
         })
     }
 
+    /// Join a group via external commit. Returns the group handle, the
+    /// external commit bytes (to be submitted to a spool), and join metadata.
+    #[allow(clippy::unused_async)]
+    pub(crate) async fn join_external<C, CS>(
+        client: &Client<C>,
+        signer: SignatureSecretKey,
+        cipher_suite: CS,
+        connection_manager: &ConnectionManager,
+        group_info_bytes: &[u8],
+    ) -> Result<(JoinInfo, Vec<u8>), Report<WeaverError>>
+    where
+        C: MlsConfig + Clone + Send + Sync + 'static,
+        CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
+    {
+        let (learner, group_id, protocol_name, commit_bytes, key_rotation_interval_secs) =
+            blocking(|| {
+                let group_info_msg = MlsMessage::from_bytes(group_info_bytes)
+                    .change_context(WeaverError)
+                    .attach("failed to parse GroupInfo for external commit")?;
+
+                // Extract acceptors from GroupInfo extensions before consuming it.
+                let acceptor_ids: Vec<AcceptorId> = group_info_msg
+                    .as_group_info()
+                    .and_then(|gi| {
+                        gi.extensions()
+                            .get_as::<GroupInfoExt>()
+                            .ok()
+                            .flatten()
+                            .map(|e| e.acceptors)
+                    })
+                    .unwrap_or_default();
+
+                let (group, commit_msg) = client
+                    .commit_external(group_info_msg)
+                    .change_context(WeaverError)
+                    .attach("external commit failed")?;
+
+                let commit_bytes = commit_msg
+                    .to_bytes()
+                    .change_context(WeaverError)
+                    .attach("failed to serialize external commit")?;
+
+                let mls_group_id = group.context().group_id.clone();
+                let group_id = GroupId::from_slice(&mls_group_id);
+
+                let group_ctx = group
+                    .context()
+                    .extensions
+                    .get_as::<GroupContextExt>()
+                    .change_context(WeaverError)?;
+
+                let protocol_name = group_ctx
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |e| e.protocol_name.clone());
+
+                let key_rotation_interval_secs = group_ctx
+                    .as_ref()
+                    .and_then(|e| e.key_rotation_interval_secs);
+
+                let learner = WeaverLearner::new(group, signer, cipher_suite, acceptor_ids);
+
+                Ok::<_, Report<WeaverError>>((
+                    learner,
+                    group_id,
+                    protocol_name,
+                    commit_bytes,
+                    key_rotation_interval_secs,
+                ))
+            })?;
+
+        let group = Self::spawn_actors(
+            learner,
+            group_id,
+            connection_manager.endpoint().clone(),
+            connection_manager.clone(),
+            key_rotation_interval_secs,
+        );
+
+        let join_info = JoinInfo {
+            group,
+            protocol_name,
+            snapshot: None,
+        };
+
+        Ok((join_info, commit_bytes))
+    }
+
     fn spawn_actors<C, CS>(
         learner: WeaverLearner<C, CS>,
         group_id: GroupId,
@@ -548,6 +638,107 @@ impl Weaver {
         reply_rx
             .await
             .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
+    }
+
+    /// Generate a serialized `GroupInfo` suitable for external commit joins.
+    ///
+    /// The returned bytes include the `ExternalPubExt` and ratchet tree so
+    /// a joiner can call `Client::commit_external` without further data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if the group actor is closed or generation fails.
+    pub async fn generate_external_group_info(&self) -> Result<Vec<u8>, Report<WeaverError>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::GenerateExternalGroupInfo { reply: reply_tx })
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
+    }
+
+    /// Generate a [`QrPayload`] for external commit joining.
+    ///
+    /// Generates a `GroupInfo`, encrypts it with a random AES-256-GCM key,
+    /// stores the ciphertext on the given spool, and returns the payload
+    /// (containing decryption material) to encode in a QR code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if `GroupInfo` generation, encryption, or
+    /// spool communication fails.
+    pub async fn generate_qr_payload(
+        &self,
+        spool_id: AcceptorId,
+        endpoint: &Endpoint,
+    ) -> Result<QrPayload, Report<WeaverError>> {
+        use filament_core::{Handshake, HandshakeResponse, PAXOS_ALPN, encrypt_group_info};
+        use futures::{SinkExt, StreamExt};
+        use iroh::PublicKey;
+
+        let group_info_bytes = self.generate_external_group_info().await?;
+
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::Fill::fill(&mut key, &mut rand::rng());
+        rand::Fill::fill(&mut nonce, &mut rand::rng());
+
+        let ciphertext = encrypt_group_info(&key, &nonce, &group_info_bytes)
+            .map_err(|_| Report::new(WeaverError).attach("GroupInfo encryption failed"))?;
+
+        // Store on spool.
+        let spool_public_key = PublicKey::from_bytes(spool_id.as_bytes())
+            .map_err(|_| Report::new(WeaverError).attach("invalid spool public key"))?;
+        let conn = endpoint
+            .connect(spool_public_key, PAXOS_ALPN)
+            .await
+            .change_context(WeaverError)
+            .attach("failed to connect to spool")?;
+
+        let (send, recv) = conn.open_bi().await.change_context(WeaverError)?;
+        let codec = tokio_util::codec::LengthDelimitedCodec::builder()
+            .max_frame_length(16 * 1024 * 1024)
+            .new_codec();
+        let mut writer = tokio_util::codec::FramedWrite::new(send, codec.clone());
+        let mut reader = tokio_util::codec::FramedRead::new(recv, codec);
+
+        let handshake = Handshake::StoreGroupInfo {
+            group_id: self.group_id,
+            ciphertext: ciphertext.into(),
+        };
+        let hs_bytes = postcard::to_allocvec(&handshake).change_context(WeaverError)?;
+
+        writer
+            .send(hs_bytes.into())
+            .await
+            .change_context(WeaverError)?;
+
+        let resp_bytes = reader
+            .next()
+            .await
+            .ok_or_else(|| Report::new(WeaverError).attach("spool closed before response"))?
+            .change_context(WeaverError)?;
+
+        let resp: HandshakeResponse =
+            postcard::from_bytes(&resp_bytes).change_context(WeaverError)?;
+
+        match resp {
+            HandshakeResponse::Ok => {}
+            other => {
+                return Err(Report::new(WeaverError)
+                    .attach(format!("spool rejected group info: {other:?}")));
+            }
+        }
+
+        Ok(QrPayload {
+            spool_id,
+            group_id: self.group_id,
+            key,
+            nonce,
+        })
     }
 
     /// Flush local CRDT changes and broadcast. No-op if no pending changes.

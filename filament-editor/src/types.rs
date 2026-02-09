@@ -115,6 +115,10 @@ pub enum CoordinatorRequest {
         welcome_b58: String,
         reply: oneshot::Sender<Result<DocumentInfo, String>>,
     },
+    JoinExternal {
+        invite_b58: String,
+        reply: oneshot::Sender<Result<DocumentInfo, String>>,
+    },
     ForDoc {
         group_id: GroupId,
         request: DocRequest,
@@ -163,6 +167,9 @@ pub enum DocRequest {
     },
     UpdateKeys {
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    GenerateExternalInvite {
+        reply: oneshot::Sender<Result<String, String>>,
     },
     UpdateCursor {
         anchor: u32,

@@ -65,8 +65,8 @@ struct GroupKeyspaces {
     snapshots: Keyspace,
 }
 
-/// Returns disk_space + active memtable size for a keyspace.
-/// `Keyspace::disk_space()` only counts flushed SSTable segments; unflushed
+/// Returns `disk_space` + active memtable size for a keyspace.
+/// `Keyspace::disk_space()` only counts flushed `SSTable` segments; unflushed
 /// memtable data (which can be the majority for small/new keyspaces) is excluded.
 fn keyspace_data_size(ks: &Keyspace) -> u64 {
     ks.disk_space() + ks.tree.active_memtable().size()
@@ -117,6 +117,7 @@ pub(crate) struct FjallStateStore {
     latest_epoch: RwLock<HashMap<GroupId, Epoch>>,
     accepted_cache: quick_cache::sync::Cache<(GroupId, Epoch), Arc<(GroupProposal, GroupMessage)>>,
     message_cache: quick_cache::sync::Cache<MessageId, Arc<EncryptedAppMessage>>,
+    encrypted_group_info: RwLock<HashMap<GroupId, bytes::Bytes>>,
 }
 
 impl FjallStateStore {
@@ -139,6 +140,7 @@ impl FjallStateStore {
             latest_epoch: RwLock::new(HashMap::new()),
             accepted_cache: quick_cache::sync::Cache::new(ACCEPTED_CACHE_CAPACITY),
             message_cache: quick_cache::sync::Cache::new(MESSAGE_CACHE_CAPACITY),
+            encrypted_group_info: RwLock::new(HashMap::new()),
         })
     }
 
@@ -680,6 +682,30 @@ impl SharedFjallStateStore {
     pub fn database(&self) -> &Database {
         self.inner.database()
     }
+
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn store_encrypted_group_info(&self, group_id: &GroupId, ciphertext: bytes::Bytes) {
+        self.inner
+            .encrypted_group_info
+            .write()
+            .expect("lock poisoned")
+            .insert(*group_id, ciphertext);
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    #[must_use]
+    pub fn get_encrypted_group_info(&self, group_id: &GroupId) -> Option<bytes::Bytes> {
+        self.inner
+            .encrypted_group_info
+            .read()
+            .expect("lock poisoned")
+            .get(group_id)
+            .cloned()
+    }
 }
 
 #[derive(Clone)]
@@ -731,6 +757,28 @@ impl GroupStateStore {
     ) -> Result<usize, fjall::Error> {
         self.inner
             .delete_before_watermark(&self.group_id, watermark)
+    }
+
+    /// Store an accepted proposal and broadcast it to subscribers.
+    ///
+    /// Unlike `AcceptorStateStore::accept`, this bypasses the Paxos promise
+    /// check. Used for external commits where the spool validates the MLS
+    /// message directly and needs to distribute the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`fjall::Error`] if the storage write fails.
+    pub(crate) fn store_and_broadcast(
+        &self,
+        proposal: &GroupProposal,
+        message: &GroupMessage,
+    ) -> Result<(), fjall::Error> {
+        self.inner
+            .set_accepted_sync(&self.group_id, proposal, message)?;
+        self.inner
+            .get_broadcast(&self.group_id)
+            .send_replace(Some(proposal.clone()));
+        Ok(())
     }
 }
 

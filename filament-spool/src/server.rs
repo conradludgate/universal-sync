@@ -176,6 +176,16 @@ where
         Handshake::SendWelcome(_) => {
             Err(Report::new(ConnectorError).attach("acceptors do not handle welcome messages"))
         }
+        Handshake::StoreGroupInfo {
+            group_id,
+            ciphertext,
+        } => handle_store_group_info(group_id, ciphertext, writer, registry).await,
+        Handshake::FetchGroupInfo { group_id } => {
+            handle_fetch_group_info(group_id, writer, registry).await
+        }
+        Handshake::ExternalCommit { group_id, commit } => {
+            handle_external_commit(group_id, commit, writer, registry).await
+        }
     }
 }
 
@@ -406,5 +416,76 @@ where
         }
     }
 
+    Ok(())
+}
+
+async fn handle_store_group_info<C, CS>(
+    group_id: GroupId,
+    ciphertext: bytes::Bytes,
+    mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
+    registry: AcceptorRegistry<C, CS>,
+) -> Result<(), Report<ConnectorError>>
+where
+    C: ExternalMlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
+{
+    registry.store_encrypted_group_info(&group_id, ciphertext);
+    let response = HandshakeResponse::Ok;
+    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
+    writer
+        .send(response_bytes.into())
+        .await
+        .change_context(ConnectorError)?;
+    debug!(?group_id, "stored encrypted group info");
+    Ok(())
+}
+
+async fn handle_fetch_group_info<C, CS>(
+    group_id: GroupId,
+    mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
+    registry: AcceptorRegistry<C, CS>,
+) -> Result<(), Report<ConnectorError>>
+where
+    C: ExternalMlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
+{
+    let response = match registry.get_encrypted_group_info(&group_id) {
+        Some(ciphertext) => HandshakeResponse::Data(ciphertext),
+        None => HandshakeResponse::GroupNotFound,
+    };
+    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
+    writer
+        .send(response_bytes.into())
+        .await
+        .change_context(ConnectorError)?;
+    debug!(?group_id, "fetched encrypted group info");
+    Ok(())
+}
+
+async fn handle_external_commit<C, CS>(
+    group_id: GroupId,
+    commit_bytes: bytes::Bytes,
+    mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
+    registry: AcceptorRegistry<C, CS>,
+) -> Result<(), Report<ConnectorError>>
+where
+    C: ExternalMlsConfig + Clone + Send + Sync + 'static,
+    CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
+{
+    let result = registry
+        .apply_external_commit(&group_id, &commit_bytes)
+        .await;
+    let response = match result {
+        Ok(()) => HandshakeResponse::Ok,
+        Err(e) => {
+            warn!(?group_id, ?e, "external commit rejected");
+            HandshakeResponse::Error(format!("{e:?}"))
+        }
+    };
+    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
+    writer
+        .send(response_bytes.into())
+        .await
+        .change_context(ConnectorError)?;
     Ok(())
 }

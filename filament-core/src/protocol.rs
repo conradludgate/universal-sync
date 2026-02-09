@@ -72,6 +72,15 @@ pub enum Handshake {
     JoinMessages(GroupId, MemberFingerprint),
     /// Deliver a serialized MLS `Welcome` message.
     SendWelcome(Bytes),
+    /// Store encrypted `GroupInfo` for external commit joins.
+    StoreGroupInfo {
+        group_id: GroupId,
+        ciphertext: Bytes,
+    },
+    /// Fetch previously stored encrypted `GroupInfo`.
+    FetchGroupInfo { group_id: GroupId },
+    /// Submit an external commit to join a group.
+    ExternalCommit { group_id: GroupId, commit: Bytes },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +89,8 @@ pub enum HandshakeResponse {
     GroupNotFound,
     InvalidGroupInfo(String),
     Error(String),
+    /// Response carrying opaque bytes (used for `FetchGroupInfo`).
+    Data(Bytes),
 }
 
 /// Paxos payload wrapping an MLS message (commit or proposal).
@@ -588,6 +599,7 @@ mod tests {
             HandshakeResponse::GroupNotFound,
             HandshakeResponse::InvalidGroupInfo("bad".into()),
             HandshakeResponse::Error("err".into()),
+            HandshakeResponse::Data(Bytes::from_static(&[1, 2, 3])),
         ] {
             let bytes = postcard::to_allocvec(&variant).unwrap();
             let _decoded: HandshakeResponse = postcard::from_bytes(&bytes).unwrap();
@@ -600,6 +612,17 @@ mod tests {
             Handshake::CreateGroup(Bytes::from_static(&[1, 2, 3])),
             Handshake::JoinMessages(GroupId::new([0; 32]), MemberFingerprint([1; 8])),
             Handshake::SendWelcome(Bytes::from_static(&[4, 5, 6])),
+            Handshake::StoreGroupInfo {
+                group_id: GroupId::new([7; 32]),
+                ciphertext: Bytes::from_static(&[8, 9]),
+            },
+            Handshake::FetchGroupInfo {
+                group_id: GroupId::new([10; 32]),
+            },
+            Handshake::ExternalCommit {
+                group_id: GroupId::new([11; 32]),
+                commit: Bytes::from_static(&[12, 13]),
+            },
         ];
         for h in variants {
             let bytes = postcard::to_allocvec(&h).unwrap();

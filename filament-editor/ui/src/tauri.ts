@@ -13,6 +13,12 @@ export const recvWelcome = () =>
 export const joinDocumentBytes = (welcomeB58: string) =>
   invoke<DocumentInfo>("join_document_bytes", { welcomeB58 });
 
+export const joinExternal = (inviteB58: string) =>
+  invoke<DocumentInfo>("join_external", { inviteB58 });
+
+export const generateExternalInvite = (groupId: string) =>
+  invoke<string>("generate_external_invite", { groupId });
+
 export const applyDelta = (groupId: string, delta: Delta, anchor: number, head: number) =>
   invoke<void>("apply_delta", { groupId, delta, anchor, head });
 

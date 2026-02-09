@@ -81,12 +81,11 @@ where
 {
     fn collect_group_into(&self, enc: &mut Enc) -> Result<(), Enc::Err> {
         const NAME: &MetricName = MetricName::from_str("disk_bytes");
+        const TOTAL_NAME: &MetricName = MetricName::from_str("total_disk_bytes");
 
         enc.write_help(NAME, "data stored in storage keyspaces")?;
 
         let db = self.state_store.database();
-
-        const TOTAL_NAME: &MetricName = MetricName::from_str("total_disk_bytes");
         enc.write_help(TOTAL_NAME, "total disk space used by the database")?;
         #[allow(clippy::cast_possible_wrap)]
         measured::metric::gauge::write_gauge(

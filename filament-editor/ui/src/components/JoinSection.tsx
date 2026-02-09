@@ -16,6 +16,9 @@ export function JoinSection({ onDocumentJoined }: JoinSectionProps) {
   );
   const welcomeActiveRef = useRef(false);
 
+  const [externalInvite, setExternalInvite] = useState("");
+  const [externalJoining, setExternalJoining] = useState(false);
+
   const startJoinFlow = useCallback(async () => {
     setActive(true);
     setInviteCode("Generating…");
@@ -66,6 +69,26 @@ export function JoinSection({ onDocumentJoined }: JoinSectionProps) {
       showToast("Failed to copy", "error");
     }
   }, [inviteCode, showToast]);
+
+  const handleJoinExternal = useCallback(async () => {
+    const code = externalInvite.trim();
+    if (!code) {
+      showToast("Paste an external invite code", "error");
+      return;
+    }
+    setExternalJoining(true);
+    try {
+      const doc = await tauri.joinExternal(code);
+      onDocumentJoined(doc);
+      showToast("Joined document!", "success");
+      setExternalInvite("");
+    } catch (error) {
+      console.error("External join error:", error);
+      showToast(`Failed to join: ${error}`, "error");
+    } finally {
+      setExternalJoining(false);
+    }
+  }, [externalInvite, onDocumentJoined, showToast]);
 
   return (
     <div className="sidebar-section">
@@ -118,6 +141,28 @@ export function JoinSection({ onDocumentJoined }: JoinSectionProps) {
             </button>
           </div>
         )}
+      </div>
+
+      <div className="sidebar-section-header" style={{ marginTop: "0.75rem" }}>
+        <span className="sidebar-section-title">Join with Invite</span>
+      </div>
+      <div className="join-inline">
+        <div className="peer-input-row">
+          <textarea
+            className="input-textarea"
+            placeholder="Paste external invite code..."
+            rows={3}
+            value={externalInvite}
+            onChange={(e) => setExternalInvite(e.target.value)}
+          />
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={handleJoinExternal}
+            disabled={externalJoining}
+          >
+            {externalJoining ? "Joining…" : "Join"}
+          </button>
+        </div>
       </div>
     </div>
   );
