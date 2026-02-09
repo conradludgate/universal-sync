@@ -440,7 +440,10 @@ where
             }
             GroupRequest::GenerateExternalGroupInfo { reply } => {
                 let result = blocking(|| {
-                    let extensions = group_info_ext_list(self.learner.acceptors().iter().copied());
+                    let extensions = group_info_ext_list(
+                        self.learner.acceptors().iter().copied(),
+                        Some(self.own_fingerprint),
+                    );
                     self.learner
                         .group()
                         .group_info_message_allowing_ext_commit_with_extensions(true, extensions)
@@ -539,7 +542,8 @@ where
         }
 
         let result = blocking(|| {
-            let group_info_ext = group_info_ext_list(self.learner.acceptors().iter().copied());
+            let group_info_ext =
+                group_info_ext_list(self.learner.acceptors().iter().copied(), None);
 
             let commit_output = self
                 .learner
@@ -1232,11 +1236,11 @@ where
         let my_id = self.learner.node_id();
         let my_proposal = proposal.member_id == my_id;
 
-        let effect = blocking(|| {
+        let commit_result = blocking(|| {
             if my_proposal && self.learner.has_pending_commit() {
                 tracing::debug!("applying our own pending commit");
-                let effect = self.learner.group_mut().apply_pending_commit().ok()?;
-                Some(effect.effect)
+                let desc = self.learner.group_mut().apply_pending_commit().ok()?;
+                Some((desc.effect, desc.authenticated_data))
             } else {
                 if self.learner.has_pending_commit() {
                     tracing::debug!("clearing pending commit - another proposal won");
@@ -1250,16 +1254,17 @@ where
                     .ok()?;
 
                 match result {
-                    ReceivedMessage::Commit(commit_desc) => Some(commit_desc.effect),
+                    ReceivedMessage::Commit(desc) => Some((desc.effect, desc.authenticated_data)),
                     _ => None,
                 }
             }
         });
 
-        if let Some(effect) = effect {
+        if let Some((effect, authenticated_data)) = commit_result {
             let committer_index =
                 (proposal.member_id.0 != u32::MAX).then_some(proposal.member_id.0);
-            let (events, new_acceptors) = self.process_commit_effect(&effect, committer_index);
+            let (events, new_acceptors) =
+                self.process_commit_effect(&effect, committer_index, &authenticated_data);
             for event in events {
                 let _ = self.event_tx.send(event);
             }
@@ -1285,6 +1290,7 @@ where
         &mut self,
         effect: &CommitEffect,
         committer_index: Option<u32>,
+        authenticated_data: &[u8],
     ) -> (Vec<WeaverEvent>, Vec<AcceptorId>) {
         let applied_proposals = match effect {
             CommitEffect::NewEpoch(new_epoch) | CommitEffect::Removed { new_epoch, .. } => {
@@ -1323,10 +1329,14 @@ where
                 },
                 MlsProposal::ReInit(_) => WeaverEvent::ReInitiated,
                 MlsProposal::ExternalInit(_) => {
-                    let level = self.compaction_state.max_compacted_level.max(1);
-                    let _ = self
-                        .event_tx
-                        .send(WeaverEvent::CompactionNeeded { level, force: true });
+                    let invited_by: Option<MemberFingerprint> =
+                        postcard::from_bytes(authenticated_data).ok();
+                    if invited_by == Some(self.own_fingerprint) {
+                        let level = self.compaction_state.max_compacted_level.max(1);
+                        let _ = self
+                            .event_tx
+                            .send(WeaverEvent::CompactionNeeded { level, force: true });
+                    }
                     WeaverEvent::ExternalInit
                 }
                 MlsProposal::GroupContextExtensions(_) => WeaverEvent::ExtensionsUpdated,

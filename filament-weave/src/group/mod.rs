@@ -45,14 +45,19 @@ impl fmt::Display for WeaverError {
 
 impl std::error::Error for WeaverError {}
 
-/// Build `GroupInfo` extensions containing the acceptor list.
+/// Build `GroupInfo` extensions containing the acceptor list and optional inviter.
 #[must_use]
 pub(crate) fn group_info_ext_list(
     acceptors: impl IntoIterator<Item = AcceptorId>,
+    invited_by: Option<filament_core::MemberFingerprint>,
 ) -> mls_rs::ExtensionList {
+    let mut ext = GroupInfoExt::new(acceptors, vec![]);
+    if let Some(fp) = invited_by {
+        ext = ext.with_invited_by(fp);
+    }
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
-        .set_from(GroupInfoExt::new(acceptors, vec![]))
+        .set_from(ext)
         .expect("GroupInfoExt encoding should not fail");
     extensions
 }
@@ -62,7 +67,7 @@ pub(crate) fn group_info_with_ext<C: mls_rs::client_builder::MlsConfig>(
     group: &mls_rs::Group<C>,
     acceptors: impl IntoIterator<Item = AcceptorId>,
 ) -> Result<Vec<u8>, Report<WeaverError>> {
-    let extensions = group_info_ext_list(acceptors);
+    let extensions = group_info_ext_list(acceptors, None);
     let msg = group
         .group_info_message_internal(extensions, true)
         .change_context(WeaverError)?;
@@ -441,20 +446,26 @@ impl Weaver {
                     .change_context(WeaverError)
                     .attach("failed to parse GroupInfo for external commit")?;
 
-                // Extract acceptors from GroupInfo extensions before consuming it.
-                let acceptor_ids: Vec<AcceptorId> = group_info_msg
+                // Extract acceptors and inviter from GroupInfo extensions before consuming it.
+                let gi_ext: Option<GroupInfoExt> = group_info_msg
                     .as_group_info()
-                    .and_then(|gi| {
-                        gi.extensions()
-                            .get_as::<GroupInfoExt>()
-                            .ok()
-                            .flatten()
-                            .map(|e| e.acceptors)
-                    })
+                    .and_then(|gi| gi.extensions().get_as::<GroupInfoExt>().ok().flatten());
+
+                let acceptor_ids: Vec<AcceptorId> = gi_ext
+                    .as_ref()
+                    .map_or_else(Vec::new, |e| e.acceptors.clone());
+
+                let invited_by_aad = gi_ext
+                    .as_ref()
+                    .and_then(|e| e.invited_by)
+                    .and_then(|fp| postcard::to_allocvec(&fp).ok())
                     .unwrap_or_default();
 
                 let (group, commit_msg) = client
-                    .commit_external(group_info_msg)
+                    .external_commit_builder()
+                    .change_context(WeaverError)?
+                    .with_authenticated_data(invited_by_aad)
+                    .build(group_info_msg)
                     .change_context(WeaverError)
                     .attach("external commit failed")?;
 
