@@ -57,7 +57,7 @@ Called on each timer tick. Mirrors the `maybe_trigger_compaction()` pattern:
 
 1. Return early if rotation is disabled (`key_rotation_interval` is `None`)
 2. Return early if an active proposal is in flight
-3. Return early if no acceptors are connected
+3. Return early if no acceptors are assigned
 4. Return early if `last_epoch_advance.elapsed() < interval`
 5. Call `handle_update_keys()` via a fire-and-forget oneshot channel
 

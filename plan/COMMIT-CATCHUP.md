@@ -56,9 +56,6 @@ This is a breaking protocol change (no backward compatibility shim).
 `ConnectionManager::open_proposal_stream()` accepts `since_epoch: Epoch`
 and constructs the struct-variant handshake.
 
-`IrohConnector` stores `since_epoch: Arc<AtomicU64>` and reads it in
-`connect()`. The value can be updated via `set_since_epoch()`.
-
 #### Acceptor Side
 
 `handle_proposal_stream()` accepts `since_epoch: Epoch` and passes it to
@@ -115,7 +112,7 @@ pre-migration state). This prevents sequence number reuse after crashes.
 |------|--------|
 | `filament-core/src/protocol.rs` | `JoinProposals` changed from tuple to struct variant with `since_epoch` |
 | `filament-weave/src/connection.rs` | `open_proposal_stream` accepts `since_epoch: Epoch` |
-| `filament-weave/src/connector.rs` | `IrohConnector` stores `since_epoch: Arc<AtomicU64>` |
+| `filament-weave/src/connector.rs` | `register_group`, `ProposalRequest/Response`, `make_proposal_streams` |
 | `filament-weave/src/group/acceptor_actor.rs` | `AcceptorActor` stores `current_epoch: Epoch` |
 | `filament-weave/src/group/group_actor.rs` | Passes `learner.mls_epoch()` when spawning `AcceptorActor` |
 | `filament-spool/src/server.rs` | Extracts `since_epoch`, passes to runner |

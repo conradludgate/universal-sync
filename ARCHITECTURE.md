@@ -132,10 +132,20 @@ used for backfill requests.
 ## Message Routing
 
 Not every application message needs to reach every acceptor. Messages are
-routed to `ceil(sqrt(n))` acceptors selected by rendezvous hashing
-(Highest Random Weight). This distributes storage load while maintaining
-deterministic routing — any device can compute which acceptors hold a given
-message.
+routed to a subset of acceptors selected by rendezvous hashing (Highest
+Random Weight, using xxh3). The number of target acceptors is determined
+by an exponential delivery function:
+
+```
+delivery_count(level, counts_len, n) = ceil(e^(level - counts_len) * n)
+```
+
+For regular application messages (`level=0`, default `counts_len=2`),
+this gives `ceil(e^-2 * n)` ≈ 13.5% of acceptors (minimum 1). Higher
+compaction levels replicate to progressively more acceptors, approaching
+all acceptors at the highest level. This distributes storage load while
+maintaining deterministic routing — any device can compute which
+acceptors hold a given message.
 
 Devices connect to all acceptors and subscribe to live broadcasts plus
 backfill, so they receive the full message set across all acceptors.
@@ -172,15 +182,17 @@ sequenceDiagram
 ## Acceptor Storage
 
 Acceptors use [fjall](https://github.com/fjall-rs/fjall) (an LSM-tree
-storage engine) with the following keyspaces:
+storage engine) with three keyspaces:
 
 | Keyspace | Key | Value |
 |----------|-----|-------|
-| `promised` | `(group_id, epoch)` | Promised proposal |
-| `accepted` | `(group_id, epoch)` | Accepted (proposal, message) |
-| `groups` | `group_id` | GroupInfo bytes |
+| `accepted` | `(group_id, epoch)` | `SlimAccepted` (proposal + message); sentinel at `epoch=u64::MAX` stores the last promised proposal |
+| `snapshots` | `(group_id, epoch)` | `ExternalSnapshot` bytes (full group state for crash recovery) |
 | `messages` | `(group_id, sender_fingerprint, seq)` | Encrypted application message |
-| `epoch_rosters` | `(group_id, epoch)` | Historical roster snapshot |
 
-All writes are fsynced before acknowledging. Historical commits are replayed
-from epoch 0 on server restart.
+Accepted and promised writes are fsynced before acknowledging. Snapshot
+writes do not fsync (recoverable from accepted values). On server restart,
+the latest snapshot is loaded and only subsequent accepted commits are
+replayed — not from epoch 0. Snapshots are pruned logarithmically.
+
+See [plan/ACCEPTOR-STORAGE.md](plan/ACCEPTOR-STORAGE.md) for details.
