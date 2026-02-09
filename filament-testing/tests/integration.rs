@@ -5,9 +5,7 @@
 
 use std::time::Duration;
 
-use filament_core::{
-    AcceptorId, CompactionLevel, GroupId, NoCrdt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
-};
+use filament_core::{AcceptorId, GroupId, NoCrdt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
 };
@@ -953,12 +951,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -1001,12 +994,7 @@ async fn test_crdt_late_joiner_snapshot_and_messages() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = carol.recv_welcome().await.expect("carol welcome");
     let join_info = carol.join(&welcome).await.expect("carol join");
@@ -1151,19 +1139,22 @@ async fn wait_for_sync(
     });
 }
 
-/// Helper: low-threshold compaction config for fast tests.
-/// 2 levels (L0 + L(max)), threshold of `threshold` L0 messages.
-fn test_compaction_config(threshold: u32) -> Vec<CompactionLevel> {
-    vec![
-        CompactionLevel {
-            threshold: 0,
-            replication: 1,
-        }, // L0
-        CompactionLevel {
-            threshold,
-            replication: 0,
-        }, // L(max) → all
-    ]
+/// Helper: handle a single CompactionNeeded event, calling force_compact or compact.
+async fn handle_compaction_event(
+    group: &mut filament_weave::Weaver,
+    crdt: &mut impl filament_core::Crdt,
+    event: &WeaverEvent,
+) {
+    if let WeaverEvent::CompactionNeeded { level, force } = *event {
+        if force {
+            group
+                .force_compact(crdt, level)
+                .await
+                .expect("force_compact");
+        } else {
+            group.compact(crdt, level).await.expect("compact");
+        }
+    }
 }
 
 /// Helper: drive compaction by listening for CompactionNeeded events and calling compact.
@@ -1174,9 +1165,7 @@ async fn drive_compaction(
     events: &mut tokio::sync::broadcast::Receiver<WeaverEvent>,
 ) {
     while let Ok(event) = events.try_recv() {
-        if let WeaverEvent::CompactionNeeded { level } = event {
-            group.compact(crdt, level).await.expect("compact");
-        }
+        handle_compaction_event(group, crdt, &event).await;
     }
 }
 
@@ -1229,12 +1218,7 @@ async fn test_welcome_force_compaction_verified() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Verify CompactionCompleted event fires on Alice's side
     let event = wait_for_event(
@@ -1245,10 +1229,8 @@ async fn test_welcome_force_compaction_verified() {
     .await;
     match event {
         WeaverEvent::CompactionCompleted { level } => {
-            // force_compaction always uses L(max)
-            let config = filament_core::default_compaction_config();
-            let max_level = (config.len() - 1) as u8;
-            assert_eq!(level, max_level, "force_compaction should use L(max)");
+            // force_compaction uses max(max_compacted_level, 1)
+            assert!(level >= 1, "force_compaction should use at least L1");
         }
         _ => unreachable!(),
     }
@@ -1273,11 +1255,9 @@ async fn test_welcome_after_threshold_compaction() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Use low threshold (3 L0s → L(max))
-    let config = test_compaction_config(3);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config)
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1286,10 +1266,10 @@ async fn test_welcome_after_threshold_compaction() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Alice sends 3 updates (hits threshold)
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "aaa").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 3, "bbb").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 6, "ccc").await;
+    // Alice sends enough updates to trigger compaction (COMPACTION_BASE=20)
+    for i in 0..20 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 3, "abc").await;
+    }
 
     // Wait for threshold-triggered CompactionNeeded
     let compaction_event = wait_for_event(
@@ -1298,12 +1278,7 @@ async fn test_welcome_after_threshold_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Wait for threshold-triggered CompactionCompleted
     let event = wait_for_event(
@@ -1331,12 +1306,7 @@ async fn test_welcome_after_threshold_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -1348,7 +1318,8 @@ async fn test_welcome_after_threshold_compaction() {
     };
 
     // Bob catches up via backfill (force_compaction re-encrypts)
-    wait_for_sync(&mut bob_group, &mut bob_crdt, "aaabbbccc", 10).await;
+    let expected: String = "abc".repeat(20);
+    wait_for_sync(&mut bob_group, &mut bob_crdt, &expected, 10).await;
 
     alice_group.shutdown().await;
     bob_group.shutdown().await;
@@ -1367,10 +1338,9 @@ async fn test_welcome_reencryption_sequential_joiners() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(100); // High threshold — only force_compaction fires
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1403,12 +1373,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Bob catches up
     wait_for_sync(&mut bob_group, &mut bob_crdt, "Shared state", 10).await;
@@ -1437,12 +1402,7 @@ async fn test_welcome_reencryption_sequential_joiners() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Carol catches up via re-encrypted snapshot
     wait_for_sync(&mut carol_group, &mut carol_crdt, "Shared state", 10).await;
@@ -1465,10 +1425,9 @@ async fn test_post_compaction_bidirectional() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(100); // Only force_compaction
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1501,12 +1460,7 @@ async fn test_post_compaction_bidirectional() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Bob catches up with initial state via backfill
     wait_for_sync(&mut bob_group, &mut bob_crdt, "Hello", 10).await;
@@ -1581,12 +1535,7 @@ async fn test_welcome_force_compaction_empty() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1624,10 +1573,9 @@ async fn test_compaction_threshold_boundary() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(3);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config)
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1636,9 +1584,10 @@ async fn test_compaction_threshold_boundary() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Send 2 updates — below threshold
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "aa").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 2, "bb").await;
+    // Send 19 updates — below threshold (COMPACTION_BASE=20)
+    for i in 0..19 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 2, "ab").await;
+    }
 
     // Give compaction timer a chance to fire (it checks every 1s)
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1659,8 +1608,8 @@ async fn test_compaction_threshold_boundary() {
         "compaction should NOT fire below threshold"
     );
 
-    // Send the 3rd update — hits threshold
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 4, "cc").await;
+    // Send the 20th update — hits threshold
+    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 38, "cc").await;
 
     // Now CompactionNeeded should fire
     let compaction_event = wait_for_event(
@@ -1669,12 +1618,7 @@ async fn test_compaction_threshold_boundary() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Now CompactionCompleted should fire
     let event = wait_for_event(
@@ -1704,10 +1648,9 @@ async fn test_multiple_compaction_rounds() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(3);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1716,10 +1659,10 @@ async fn test_multiple_compaction_rounds() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Round 1: send 3 updates → triggers compaction
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "aaa").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 3, "bbb").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 6, "ccc").await;
+    // Round 1: send 20 updates → triggers compaction
+    for i in 0..20 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 3, "abc").await;
+    }
 
     let compaction_event = wait_for_event(
         &mut alice_events,
@@ -1727,12 +1670,7 @@ async fn test_multiple_compaction_rounds() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     wait_for_event(
         &mut alice_events,
@@ -1745,10 +1683,10 @@ async fn test_multiple_compaction_rounds() {
     // Wait for state to settle
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Round 2: send 3 more updates → triggers second compaction
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 9, "ddd").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 12, "eee").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 15, "fff").await;
+    // Round 2: send 20 more updates → triggers second compaction
+    for i in 0..20 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 60 + i * 3, "xyz").await;
+    }
 
     let compaction_event = wait_for_event(
         &mut alice_events,
@@ -1756,12 +1694,7 @@ async fn test_multiple_compaction_rounds() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     wait_for_event(
         &mut alice_events,
@@ -1784,12 +1717,7 @@ async fn test_multiple_compaction_rounds() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -1800,7 +1728,8 @@ async fn test_multiple_compaction_rounds() {
         YrsCrdt::new()
     };
 
-    wait_for_sync(&mut bob_group, &mut bob_crdt, "aaabbbcccdddeeefff", 10).await;
+    let expected: String = "abc".repeat(20) + &"xyz".repeat(20);
+    wait_for_sync(&mut bob_group, &mut bob_crdt, &expected, 10).await;
 
     alice_group.shutdown().await;
     bob_group.shutdown().await;
@@ -1820,10 +1749,9 @@ async fn test_compaction_deletion_late_joiner() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(3);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1832,24 +1760,19 @@ async fn test_compaction_deletion_late_joiner() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Send 6 updates (two rounds of compaction at threshold=3)
-    for i in 0u32..6 {
+    // Send 20 updates → triggers compaction at COMPACTION_BASE
+    for i in 0u32..20 {
         yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 2, &format!("{i}x")).await;
     }
 
-    // Handle CompactionNeeded after sends (threshold=3 fires after 3rd send)
+    // Handle CompactionNeeded after sends
     let event = wait_for_event(
         &mut alice_events,
         |e| matches!(e, WeaverEvent::CompactionNeeded { .. }),
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     // Wait for at least one CompactionCompleted
     wait_for_event(
@@ -1873,12 +1796,7 @@ async fn test_compaction_deletion_late_joiner() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -1909,10 +1827,9 @@ async fn test_concurrent_writers_compaction() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(3);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -1931,12 +1848,7 @@ async fn test_concurrent_writers_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -1950,10 +1862,10 @@ async fn test_concurrent_writers_compaction() {
     // Wait for Bob to stabilize
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Alice writes 3 messages
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "A1").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 2, "A2").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 4, "A3").await;
+    // Alice writes 20 messages → triggers compaction
+    for i in 0..20 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 2, "A+").await;
+    }
 
     // Wait for Alice's CompactionNeeded and handle it
     let compaction_event = wait_for_event(
@@ -1962,12 +1874,7 @@ async fn test_concurrent_writers_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Wait for Alice's compaction to fire
     wait_for_event(
@@ -1980,11 +1887,11 @@ async fn test_concurrent_writers_compaction() {
     // Wait for Bob to sync Alice's updates + compaction epoch advance
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
-    // Now Bob writes 3 messages (his own threshold)
+    // Now Bob writes 20 messages → triggers his own compaction
     let mut bob_events = bob_group.subscribe();
-    yrs_insert_and_send(&mut bob_group, &mut bob_crdt, 0, "B1").await;
-    yrs_insert_and_send(&mut bob_group, &mut bob_crdt, 2, "B2").await;
-    yrs_insert_and_send(&mut bob_group, &mut bob_crdt, 4, "B3").await;
+    for i in 0..20 {
+        yrs_insert_and_send(&mut bob_group, &mut bob_crdt, i * 2, "B+").await;
+    }
 
     // Wait for Bob's CompactionNeeded and handle it
     let compaction_event = wait_for_event(
@@ -1993,12 +1900,7 @@ async fn test_concurrent_writers_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        bob_group
-            .compact(&mut bob_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut bob_group, &mut bob_crdt, &compaction_event).await;
 
     // Wait for Bob's compaction
     wait_for_event(
@@ -2015,7 +1917,7 @@ async fn test_concurrent_writers_compaction() {
     // Alice should have both her own and Bob's text
     let alice_text = yrs_get_text(&alice_crdt);
     assert!(
-        alice_text.contains("A1") && alice_text.contains("B1"),
+        alice_text.contains("A+") && alice_text.contains("B+"),
         "Alice should have merged both writers' text, got: {alice_text}"
     );
 
@@ -2030,12 +1932,7 @@ async fn test_concurrent_writers_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = carol.recv_welcome().await.expect("carol welcome");
     let join_info = carol.join(&welcome).await.expect("carol join");
@@ -2066,10 +1963,9 @@ async fn test_key_update_then_compaction() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(4);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2077,17 +1973,19 @@ async fn test_key_update_then_compaction() {
     let mut alice_events = alice_group.subscribe();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Write 2 messages before key update
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "before1").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 7, "before2").await;
+    // Write 10 messages before key update
+    for i in 0..10 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 7, "before1").await;
+    }
 
     // Key update (advances epoch)
     alice_group.update_keys().await.expect("update keys");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Write 2 more messages (hits threshold=4)
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 14, "after1").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 20, "after2").await;
+    // Write 10 more messages (total 20 = COMPACTION_BASE)
+    for i in 0..10 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 70 + i * 7, "after2+").await;
+    }
 
     // Wait for CompactionNeeded and handle it
     let compaction_event = wait_for_event(
@@ -2096,12 +1994,7 @@ async fn test_key_update_then_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Wait for compaction
     wait_for_event(
@@ -2124,12 +2017,7 @@ async fn test_key_update_then_compaction() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -2160,12 +2048,8 @@ async fn test_key_update_then_compaction() {
 async fn test_compaction_no_acceptors() {
     init_tracing();
 
-    let config = test_compaction_config(2);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
-    let mut alice_group = alice
-        .create_with_config(&[], "yrs", config)
-        .await
-        .expect("create group");
+    let mut alice_group = alice.create(&[], "yrs").await.expect("create group");
     let mut alice_crdt = YrsCrdt::new();
 
     let mut alice_events = alice_group.subscribe();
@@ -2212,10 +2096,9 @@ async fn test_compaction_after_member_removal() {
     let (acceptor_task, acceptor_addr, _dir) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(4);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(std::slice::from_ref(&acceptor_addr), "yrs", config.clone())
+        .create(std::slice::from_ref(&acceptor_addr), "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2234,20 +2117,17 @@ async fn test_compaction_after_member_removal() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
     let bob_group = join_info.group;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Alice writes
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 0, "with_bob").await;
+    // Alice writes some messages with Bob present
+    for i in 0..5 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, i * 3, "wb+").await;
+    }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Remove Bob (member index 1)
@@ -2260,10 +2140,10 @@ async fn test_compaction_after_member_removal() {
     bob_group.shutdown().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Alice writes more (total 4 = threshold for compaction)
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 8, "_after1").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 15, "_after2").await;
-    yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 22, "_after3").await;
+    // Alice writes more (total 20 = COMPACTION_BASE)
+    for i in 0..15 {
+        yrs_insert_and_send(&mut alice_group, &mut alice_crdt, 15 + i * 3, "af+").await;
+    }
 
     // Wait for CompactionNeeded and handle it
     let compaction_event = wait_for_event(
@@ -2272,12 +2152,7 @@ async fn test_compaction_after_member_removal() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = compaction_event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
 
     // Wait for compaction
     wait_for_event(
@@ -2300,12 +2175,7 @@ async fn test_compaction_after_member_removal() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = carol.recv_welcome().await.expect("carol welcome");
     let join_info = carol.join(&welcome).await.expect("carol join");
@@ -2318,7 +2188,7 @@ async fn test_compaction_after_member_removal() {
 
     let expected = yrs_get_text(&alice_crdt);
     assert!(
-        expected.contains("with_bob") && expected.contains("_after3"),
+        expected.contains("wb+") && expected.contains("af+"),
         "expected full text, got: {expected}"
     );
     wait_for_sync(&mut carol_group, &mut carol_crdt, &expected, 10).await;
@@ -2415,14 +2285,9 @@ async fn test_multi_acceptor_message_delivery() {
     let (acceptor2_task, acceptor2_addr, _dir2) = spawn_acceptor().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let config = test_compaction_config(4);
     let alice = test_yrs_weaver_client("alice", test_endpoint().await);
     let mut alice_group = alice
-        .create_with_config(
-            &[acceptor1_addr.clone(), acceptor2_addr.clone()],
-            "yrs",
-            config.clone(),
-        )
+        .create(&[acceptor1_addr.clone(), acceptor2_addr.clone()], "yrs")
         .await
         .expect("create group");
     let mut alice_crdt = YrsCrdt::new();
@@ -2446,12 +2311,7 @@ async fn test_multi_acceptor_message_delivery() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");
@@ -2507,12 +2367,7 @@ async fn test_empty_snapshot_join() {
         10,
     )
     .await;
-    if let WeaverEvent::CompactionNeeded { level } = event {
-        alice_group
-            .compact(&mut alice_crdt, level)
-            .await
-            .expect("compact");
-    }
+    handle_compaction_event(&mut alice_group, &mut alice_crdt, &event).await;
 
     let welcome = bob.recv_welcome().await.expect("bob welcome");
     let join_info = bob.join(&welcome).await.expect("bob join");

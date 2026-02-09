@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, AuthData, CompactionConfig, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
+    AcceptorId, AuthData, COMPACTION_BASE, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
     GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN, StateVector,
     SyncProposal,
 };
@@ -57,7 +57,6 @@ where
     join_epoch: Epoch,
     active_proposal: Option<ActiveProposal>,
     compaction_state: CompactionState,
-    compaction_config: CompactionConfig,
     last_epoch_advance: std::time::Instant,
     key_rotation_interval: Option<std::time::Duration>,
 }
@@ -112,15 +111,17 @@ struct CompactionState {
     counts: Vec<u64>,
     /// The watermark that was last compacted (messages at or below this are compacted).
     last_compacted_watermark: StateVector,
+    /// The highest level that has been compacted into.
+    max_compacted_level: u8,
 }
 
 impl CompactionState {
-    /// Create a new `CompactionState` with per-level counters sized to `config`.
-    fn new(config: &CompactionConfig) -> Self {
+    fn new() -> Self {
         Self {
             active_claims: HashMap::new(),
-            counts: vec![0; config.len()],
+            counts: vec![0, 0],
             last_compacted_watermark: StateVector::new(),
+            max_compacted_level: 0,
         }
     }
 
@@ -150,8 +151,14 @@ impl CompactionState {
     /// compaction completed into level N). Increments `counts[level + 1]`.
     fn record_entry(&mut self, level: usize) {
         let next = level + 1;
-        if next < self.counts.len() {
-            self.counts[next] += 1;
+        while self.counts.len() <= next {
+            self.counts.push(0);
+        }
+        self.counts[next] += 1;
+        if level > 0 {
+            self.max_compacted_level = self
+                .max_compacted_level
+                .max(u8::try_from(level).unwrap_or(u8::MAX));
         }
     }
 
@@ -161,24 +168,20 @@ impl CompactionState {
     /// the threshold, we cascade further.
     ///
     /// Returns `None` if no level triggers.
-    fn cascade_target(&self, config: &CompactionConfig) -> Option<u8> {
+    fn cascade_target(&self) -> Option<u8> {
+        let threshold = u64::from(COMPACTION_BASE);
         let mut target: Option<usize> = None;
 
-        // Start at L1 and walk upward.
-        for (level, level_cfg) in config.iter().enumerate().skip(1) {
+        for level in 1..self.counts.len() {
             let count = if target.is_some() {
-                // A lower level already triggered — completing it would bump
-                // this level's counter by 1.
-                self.counts.get(level).copied().unwrap_or(0) + 1
+                self.counts[level] + 1
             } else {
-                self.counts.get(level).copied().unwrap_or(0)
+                self.counts[level]
             };
 
-            let threshold = u64::from(level_cfg.threshold);
-            if threshold > 0 && count >= threshold {
+            if count >= threshold {
                 target = Some(level);
             } else if target.is_some() {
-                // Cascade stops here — this level wouldn't trigger.
                 break;
             }
         }
@@ -227,7 +230,6 @@ where
         app_message_tx: mpsc::Sender<Vec<u8>>,
         event_tx: broadcast::Sender<WeaverEvent>,
         cancel_token: CancellationToken,
-        compaction_config: CompactionConfig,
         key_rotation_interval: Option<std::time::Duration>,
     ) -> Self {
         let num_acceptors = learner.acceptor_ids().count();
@@ -259,8 +261,7 @@ where
             pending_messages: Vec::new(),
             join_epoch,
             active_proposal: None,
-            compaction_state: CompactionState::new(&compaction_config),
-            compaction_config,
+            compaction_state: CompactionState::new(),
             last_epoch_advance: std::time::Instant::now(),
             key_rotation_interval,
         }
@@ -659,9 +660,13 @@ where
             seq,
         };
         let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
-        let delivery_count = crate::rendezvous::delivery_count(acceptor_ids.len());
+        let count = crate::rendezvous::delivery_count(
+            0,
+            self.compaction_state.counts.len(),
+            acceptor_ids.len(),
+        );
         let selected_acceptors =
-            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
+            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, count);
 
         for acceptor_id in selected_acceptors {
             if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
@@ -675,12 +680,13 @@ where
         self.compaction_state.record_entry(0);
 
         if !self.acceptor_txs.is_empty()
-            && let Some(level) = self
-                .compaction_state
-                .cascade_target(&self.compaction_config)
+            && let Some(level) = self.compaction_state.cascade_target()
             && !self.compaction_state.has_active_claim(level)
         {
-            let _ = self.event_tx.send(WeaverEvent::CompactionNeeded { level });
+            let _ = self.event_tx.send(WeaverEvent::CompactionNeeded {
+                level,
+                force: false,
+            });
         }
 
         let _ = reply.send(Ok(()));
@@ -1289,13 +1295,10 @@ where
             let event = match &proposal_info.proposal {
                 MlsProposal::Add(add_proposal) => {
                     let _ = add_proposal;
-                    let max_level =
-                        u8::try_from(self.compaction_config.len().saturating_sub(1)).unwrap_or(0);
-                    if max_level > 0 {
-                        let _ = self
-                            .event_tx
-                            .send(WeaverEvent::CompactionNeeded { level: max_level });
-                    }
+                    let level = self.compaction_state.max_compacted_level.max(1);
+                    let _ = self
+                        .event_tx
+                        .send(WeaverEvent::CompactionNeeded { level, force: true });
                     WeaverEvent::MemberAdded { index: 0 }
                 }
                 MlsProposal::Remove(remove_proposal) => WeaverEvent::MemberRemoved {
@@ -1602,22 +1605,17 @@ where
         };
 
         let acceptor_ids: Vec<_> = self.learner.acceptor_ids().collect();
-        let replication = self
-            .compaction_config
-            .get(usize::from(level))
-            .map_or(0, |cfg| cfg.replication);
-        let delivery_count = if replication == 0 {
-            acceptor_ids.len()
-        } else {
-            crate::rendezvous::delivery_count_for_level(acceptor_ids.len(), replication)
-        };
+        let count = crate::rendezvous::delivery_count(
+            usize::from(level),
+            self.compaction_state.counts.len(),
+            acceptor_ids.len(),
+        );
 
-        let selected =
-            crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, delivery_count);
+        let selected = crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, count);
 
         tracing::info!(
             level,
-            delivery_count,
+            count,
             total_acceptors = acceptor_ids.len(),
             "sending compacted message to acceptors"
         );
@@ -1750,36 +1748,16 @@ mod tests {
             .as_secs()
     }
 
-    use filament_core::CompactionLevel;
-
-    /// Helper: 3-level config for tests (L0, L1 at threshold 10, L2 at threshold 5).
-    fn test_config_3() -> CompactionConfig {
-        vec![
-            CompactionLevel {
-                threshold: 0,
-                replication: 1,
-            },
-            CompactionLevel {
-                threshold: 10,
-                replication: 2,
-            },
-            CompactionLevel {
-                threshold: 5,
-                replication: 0,
-            },
-        ]
-    }
-
     #[test]
     fn compaction_state_no_active_claims() {
-        let state = CompactionState::new(&test_config_3());
+        let state = CompactionState::new();
         assert!(!state.has_active_claim(1));
         assert!(!state.has_active_claim(2));
     }
 
     #[test]
     fn compaction_state_active_claim_not_expired() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state
             .active_claims
             .insert(1, make_claim(1, now_secs() + 60));
@@ -1789,14 +1767,14 @@ mod tests {
 
     #[test]
     fn compaction_state_expired_claim() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state.active_claims.insert(1, make_claim(1, now_secs() - 1));
         assert!(!state.has_active_claim(1));
     }
 
     #[test]
     fn compaction_state_prune_expired() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state.active_claims.insert(1, make_claim(1, now_secs() - 1));
         state
             .active_claims
@@ -1810,7 +1788,7 @@ mod tests {
 
     #[test]
     fn compaction_state_multiple_levels() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state
             .active_claims
             .insert(1, make_claim(1, now_secs() + 60));
@@ -1824,101 +1802,79 @@ mod tests {
 
     #[test]
     fn compaction_state_initial_values() {
-        let config = test_config_3();
-        let state = CompactionState::new(&config);
-        assert_eq!(state.counts, vec![0, 0, 0]);
+        let state = CompactionState::new();
+        assert_eq!(state.counts, vec![0, 0]);
         assert!(state.last_compacted_watermark.is_empty());
         assert!(state.active_claims.is_empty());
+        assert_eq!(state.max_compacted_level, 0);
     }
 
     #[test]
-    fn compaction_state_record_entry_increments_next_level() {
-        let mut state = CompactionState::new(&test_config_3());
-        // Sending an L0 message should bump counts[1].
+    fn compaction_state_dynamic_record_entry() {
+        let mut state = CompactionState::new();
         state.record_entry(0);
-        assert_eq!(state.counts, vec![0, 1, 0]);
+        assert_eq!(state.counts, vec![0, 1]);
 
-        // Completing an L1 compaction should bump counts[2].
         state.record_entry(1);
         assert_eq!(state.counts, vec![0, 1, 1]);
 
-        // Recording at L(max) should be a no-op (no level above).
-        state.record_entry(2);
-        assert_eq!(state.counts, vec![0, 1, 1]);
+        state.record_entry(5);
+        assert_eq!(state.counts, vec![0, 1, 1, 0, 0, 0, 1]);
     }
 
     #[test]
-    fn compaction_state_cascade_no_trigger() {
-        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
-        let mut state = CompactionState::new(&config);
-        // 9 L0 messages → not enough for L1 (threshold 10)
-        for _ in 0..9 {
+    fn compaction_state_cascade_with_base() {
+        let mut state = CompactionState::new();
+        // 19 L0 messages → not enough for L1 (COMPACTION_BASE=20)
+        for _ in 0..19 {
             state.record_entry(0);
         }
-        assert_eq!(state.cascade_target(&config), None);
+        assert_eq!(state.cascade_target(), None);
+
+        // 20th L0 message → triggers L1
+        state.record_entry(0);
+        assert_eq!(state.cascade_target(), Some(1));
     }
 
     #[test]
-    fn compaction_state_cascade_l1_only() {
-        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
-        let mut state = CompactionState::new(&config);
-        // 10 L0 messages → triggers L1; L2 count is 0 so no cascade
-        for _ in 0..10 {
-            state.record_entry(0);
-        }
-        assert_eq!(state.cascade_target(&config), Some(1));
+    fn compaction_state_cascade_multi_level() {
+        let mut state = CompactionState::new();
+        // Simulate 19 previous L1 compactions
+        state.counts = vec![0, 20, 19];
+        // L1 triggers (20 >= 20), completing it bumps L2 to 20 → cascade to L2
+        assert_eq!(state.cascade_target(), Some(2));
     }
 
     #[test]
-    fn compaction_state_cascade_skips_to_l2() {
-        let config = test_config_3(); // L1 threshold=10, L2 threshold=5
-        let mut state = CompactionState::new(&config);
-        // Simulate: 4 previous L1 compactions already done
-        state.counts[2] = 4;
-        // 10 L0 messages → L1 would trigger → completing it bumps L2 to 5
-        // → L2 also triggers → cascade to L2
-        for _ in 0..10 {
-            state.record_entry(0);
-        }
-        assert_eq!(state.cascade_target(&config), Some(2));
+    fn compaction_state_max_compacted_level_tracking() {
+        let mut state = CompactionState::new();
+        assert_eq!(state.max_compacted_level, 0);
+
+        state.record_entry(1);
+        assert_eq!(state.max_compacted_level, 1);
+
+        state.record_entry(3);
+        assert_eq!(state.max_compacted_level, 3);
+
+        // L0 entries don't affect max_compacted_level
+        state.record_entry(0);
+        assert_eq!(state.max_compacted_level, 3);
     }
 
     #[test]
     fn compaction_state_reset_counts_up_to() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state.counts = vec![0, 10, 4];
-        // Compacting at L2 should reset counts[1] and counts[2]
         state.reset_counts_up_to(2);
         assert_eq!(state.counts, vec![0, 0, 0]);
     }
 
     #[test]
     fn compaction_state_reset_counts_l1_only() {
-        let mut state = CompactionState::new(&test_config_3());
+        let mut state = CompactionState::new();
         state.counts = vec![0, 10, 4];
-        // Compacting at L1 should only reset counts[1], leave counts[2]
         state.reset_counts_up_to(1);
         assert_eq!(state.counts, vec![0, 0, 4]);
-    }
-
-    #[test]
-    fn compaction_state_cascade_two_level_config() {
-        // Simple 2-level config: L0 + L1 (threshold 3)
-        let config = vec![
-            CompactionLevel {
-                threshold: 0,
-                replication: 1,
-            },
-            CompactionLevel {
-                threshold: 3,
-                replication: 0,
-            },
-        ];
-        let mut state = CompactionState::new(&config);
-        for _ in 0..3 {
-            state.record_entry(0);
-        }
-        assert_eq!(state.cascade_target(&config), Some(1));
     }
 
     #[test]

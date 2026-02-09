@@ -113,9 +113,14 @@ impl<E: EventEmitter> DocumentActor<E> {
                 }
                 event = self.event_rx.recv() => {
                     match event {
-                        Ok(WeaverEvent::CompactionNeeded { level }) => {
-                            if let Err(e) = self.group.compact(&mut self.crdt, level).await {
-                                tracing::warn!(?e, level, "compaction failed");
+                        Ok(WeaverEvent::CompactionNeeded { level, force }) => {
+                            let result = if force {
+                                self.group.force_compact(&mut self.crdt, level).await
+                            } else {
+                                self.group.compact(&mut self.crdt, level).await
+                            };
+                            if let Err(e) = result {
+                                tracing::warn!(?e, level, force, "compaction failed");
                             }
                         }
                         Ok(_group_event) => {

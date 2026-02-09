@@ -17,9 +17,8 @@ use std::fmt;
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, ClientId, CompactionConfig, Crdt, EncryptedAppMessage, Epoch, GroupContextExt,
-    GroupId, GroupInfoExt, Handshake, KeyPackageExt, LeafNodeExt, MessageId,
-    default_compaction_config,
+    AcceptorId, ClientId, Crdt, EncryptedAppMessage, Epoch, GroupContextExt, GroupId, GroupInfoExt,
+    Handshake, KeyPackageExt, LeafNodeExt, MessageId,
 };
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::MlsConfig;
@@ -143,7 +142,7 @@ enum AcceptorOutbound {
 }
 
 /// Events emitted by a [`Weaver`]. `CompactionNeeded` should be handled by the
-/// application by calling [`Weaver::compact`].
+/// application by calling [`Weaver::compact`] (or [`Weaver::force_compact`] if `force` is set).
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum WeaverEvent {
@@ -174,9 +173,10 @@ pub enum WeaverEvent {
     /// garbage-collected by acceptors.
     CompactionCompleted { level: u8 },
     /// The message count at this level exceeded the compaction threshold.
-    /// The application should call [`Weaver::compact`] to merge older
+    /// The application should call [`Weaver::compact`] (or
+    /// [`Weaver::force_compact`] when `force` is true) to merge older
     /// updates into a snapshot.
-    CompactionNeeded { level: u8 },
+    CompactionNeeded { level: u8, force: bool },
     /// An unrecognised commit effect. Future-proofing for new proposal types.
     Unknown,
 }
@@ -267,7 +267,6 @@ impl Weaver {
         connection_manager: &ConnectionManager,
         acceptors: &[EndpointAddr],
         protocol_name: &str,
-        compaction_config: CompactionConfig,
     ) -> Result<Self, Report<WeaverError>>
     where
         C: MlsConfig + Clone + Send + Sync + 'static,
@@ -280,11 +279,7 @@ impl Weaver {
         let (learner, group_id, group_info_bytes) = blocking(|| {
             let mut group_context_extensions = mls_rs::ExtensionList::default();
             group_context_extensions
-                .set_from(GroupContextExt::new(
-                    &protocol_name,
-                    compaction_config.clone(),
-                    Some(86400),
-                ))
+                .set_from(GroupContextExt::new(&protocol_name, Some(86400)))
                 .change_context(WeaverError)
                 .attach(OperationContext::CREATING_GROUP)?;
 
@@ -335,7 +330,6 @@ impl Weaver {
             group_id,
             endpoint.clone(),
             connection_manager.clone(),
-            compaction_config,
             Some(86400),
         ))
     }
@@ -352,68 +346,58 @@ impl Weaver {
         C: MlsConfig + Clone + Send + Sync + 'static,
         CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
     {
-        let (
-            learner,
-            group_id,
-            protocol_name,
-            compaction_config,
-            crdt_snapshot_opt,
-            key_rotation_interval_secs,
-        ) = blocking(|| {
-            let welcome = MlsMessage::from_bytes(welcome_bytes)
-                .change_context(WeaverError)
-                .attach(OperationContext::JOINING_GROUP)?;
+        let (learner, group_id, protocol_name, crdt_snapshot_opt, key_rotation_interval_secs) =
+            blocking(|| {
+                let welcome = MlsMessage::from_bytes(welcome_bytes)
+                    .change_context(WeaverError)
+                    .attach(OperationContext::JOINING_GROUP)?;
 
-            let (group, info) = client
-                .join_group(None, &welcome, None)
-                .change_context(WeaverError)
-                .attach(OperationContext::JOINING_GROUP)?;
+                let (group, info) = client
+                    .join_group(None, &welcome, None)
+                    .change_context(WeaverError)
+                    .attach(OperationContext::JOINING_GROUP)?;
 
-            let mls_group_id = group.context().group_id.clone();
-            let group_id = GroupId::from_slice(&mls_group_id);
+                let mls_group_id = group.context().group_id.clone();
+                let group_id = GroupId::from_slice(&mls_group_id);
 
-            let group_info_ext = info
-                .group_info_extensions
-                .get_as::<GroupInfoExt>()
-                .change_context(WeaverError)
-                .attach(OperationContext::JOINING_GROUP)?;
+                let group_info_ext = info
+                    .group_info_extensions
+                    .get_as::<GroupInfoExt>()
+                    .change_context(WeaverError)
+                    .attach(OperationContext::JOINING_GROUP)?;
 
-            let acceptors = group_info_ext
-                .as_ref()
-                .map(|e| e.acceptors.clone())
-                .unwrap_or_default();
+                let acceptors = group_info_ext
+                    .as_ref()
+                    .map(|e| e.acceptors.clone())
+                    .unwrap_or_default();
 
-            let crdt_snapshot_opt = group_info_ext.map(|e| e.snapshot);
+                let crdt_snapshot_opt = group_info_ext.map(|e| e.snapshot);
 
-            let group_ctx = group
-                .context()
-                .extensions
-                .get_as::<GroupContextExt>()
-                .change_context(WeaverError)
-                .attach(OperationContext::JOINING_GROUP)?;
+                let group_ctx = group
+                    .context()
+                    .extensions
+                    .get_as::<GroupContextExt>()
+                    .change_context(WeaverError)
+                    .attach(OperationContext::JOINING_GROUP)?;
 
-            let protocol_name = group_ctx
-                .as_ref()
-                .map_or_else(|| "none".to_owned(), |e| e.protocol_name.clone());
+                let protocol_name = group_ctx
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), |e| e.protocol_name.clone());
 
-            let key_rotation_interval_secs = group_ctx
-                .as_ref()
-                .and_then(|e| e.key_rotation_interval_secs);
+                let key_rotation_interval_secs = group_ctx
+                    .as_ref()
+                    .and_then(|e| e.key_rotation_interval_secs);
 
-            let compaction_config =
-                group_ctx.map_or_else(default_compaction_config, |e| e.compaction_config);
+                let learner = WeaverLearner::new(group, signer, cipher_suite, acceptors);
 
-            let learner = WeaverLearner::new(group, signer, cipher_suite, acceptors);
-
-            Ok::<_, Report<WeaverError>>((
-                learner,
-                group_id,
-                protocol_name,
-                compaction_config,
-                crdt_snapshot_opt,
-                key_rotation_interval_secs,
-            ))
-        })?;
+                Ok::<_, Report<WeaverError>>((
+                    learner,
+                    group_id,
+                    protocol_name,
+                    crdt_snapshot_opt,
+                    key_rotation_interval_secs,
+                ))
+            })?;
 
         for (id, addr) in learner.acceptors() {
             connection_manager.add_address_hint(*id, addr.clone()).await;
@@ -432,7 +416,6 @@ impl Weaver {
             group_id,
             connection_manager.endpoint().clone(),
             connection_manager.clone(),
-            compaction_config,
             key_rotation_interval_secs,
         );
 
@@ -448,7 +431,6 @@ impl Weaver {
         group_id: GroupId,
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
-        compaction_config: CompactionConfig,
         key_rotation_interval_secs: Option<u64>,
     ) -> Self
     where
@@ -481,7 +463,6 @@ impl Weaver {
             app_message_tx,
             event_tx.clone(),
             cancel_token.clone(),
-            compaction_config,
             key_rotation_interval,
         );
 
@@ -651,6 +632,32 @@ impl Weaver {
         crdt: &mut impl Crdt,
         level: u8,
     ) -> Result<(), Report<WeaverError>> {
+        self.compact_inner(crdt, level, false).await
+    }
+
+    /// Force-compact at the given level, producing a full snapshot by
+    /// resetting flush state first. Used on member join.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if flushing, encryption, or consensus fails.
+    pub async fn force_compact(
+        &mut self,
+        crdt: &mut impl Crdt,
+        level: u8,
+    ) -> Result<(), Report<WeaverError>> {
+        self.compact_inner(crdt, level, true).await
+    }
+
+    async fn compact_inner(
+        &mut self,
+        crdt: &mut impl Crdt,
+        level: u8,
+        force: bool,
+    ) -> Result<(), Report<WeaverError>> {
+        if force {
+            crdt.reset_flush(usize::from(level));
+        }
         let data = crdt.flush(usize::from(level)).change_context(WeaverError)?;
         let Some(data) = data else {
             return Ok(());
@@ -669,6 +676,10 @@ impl Weaver {
         reply_rx
             .await
             .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+
+        for i in 0..=usize::from(level) {
+            crdt.confirm_flush(i);
+        }
 
         Ok(())
     }

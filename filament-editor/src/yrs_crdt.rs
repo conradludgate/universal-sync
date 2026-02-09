@@ -263,6 +263,13 @@ impl Crdt for YrsCrdt {
             self.flushed[level] = self.inflight[level].clone();
         }
     }
+
+    fn reset_flush(&mut self, level: usize) {
+        if level < self.flushed.len() {
+            self.flushed[level] = Snapshot::default();
+            self.inflight[level] = Snapshot::default();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -674,6 +681,55 @@ mod tests {
         let mut bob = YrsCrdt::with_client_id(2);
         bob.apply(&update).unwrap();
         assert_eq!(get_text(&bob), "Hello");
+    }
+
+    #[test]
+    fn test_reset_flush_produces_full_snapshot() {
+        let mut alice = YrsCrdt::with_client_id(1);
+
+        insert_text(&alice, 0, "hello");
+        let _l1 = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        insert_text(&alice, 5, " world");
+        let _l1_incr = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        insert_text(&alice, 11, "!");
+        alice.reset_flush(1);
+        let full = alice.flush(1).unwrap().unwrap();
+
+        let mut bob = YrsCrdt::with_client_id(2);
+        bob.apply(&full).unwrap();
+        assert_eq!(get_text(&bob), "hello world!");
+    }
+
+    #[test]
+    fn test_reset_flush_does_not_affect_other_levels() {
+        let mut alice = YrsCrdt::with_client_id(1);
+
+        insert_text(&alice, 0, "hello");
+        let l0_initial = alice.flush(0).unwrap().unwrap();
+        alice.confirm_flush(0);
+        let _l1 = alice.flush(1).unwrap().unwrap();
+        alice.confirm_flush(1);
+
+        insert_text(&alice, 5, " world");
+        alice.reset_flush(1);
+
+        // L1 was reset, so its flush should be a full snapshot
+        let l1 = alice.flush(1).unwrap().unwrap();
+        let mut bob_full = YrsCrdt::with_client_id(2);
+        bob_full.apply(&l1).unwrap();
+        assert_eq!(get_text(&bob_full), "hello world");
+
+        // L0 was NOT reset, so its flush is incremental from "hello"
+        let l0_inc = alice.flush(0).unwrap().unwrap();
+        let mut bob_inc = YrsCrdt::with_client_id(3);
+        bob_inc.apply(&l0_initial).unwrap();
+        assert_eq!(get_text(&bob_inc), "hello");
+        bob_inc.apply(&l0_inc).unwrap();
+        assert_eq!(get_text(&bob_inc), "hello world");
     }
 
     /// yrs 0.25: V2 delete markers silently truncate the *referenced item's*

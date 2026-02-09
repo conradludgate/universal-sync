@@ -48,33 +48,24 @@ pub(crate) fn select_acceptors<'a>(
     result.into_iter().map(|(_, id)| id).collect()
 }
 
-/// `ceil(sqrt(n))`, minimum 1.
+/// Exponential delivery count: `ceil(e^(level - counts_len) * num_acceptors)`.
+///
+/// Lower levels replicate to fewer acceptors; the highest tracked level
+/// approaches all acceptors. A new level beyond `counts_len` gets all.
 #[must_use]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-pub(crate) fn delivery_count(num_acceptors: usize) -> usize {
+pub(crate) fn delivery_count(level: usize, counts_len: usize, num_acceptors: usize) -> usize {
     if num_acceptors == 0 {
         return 0;
     }
-    let sqrt = (num_acceptors as f64).sqrt().ceil() as usize;
-    sqrt.max(1)
-}
-
-/// Delivery count for a specific compaction level.
-/// `replication_factor` of 0 means all acceptors.
-#[must_use]
-pub(crate) fn delivery_count_for_level(num_acceptors: usize, replication_factor: u8) -> usize {
-    if num_acceptors == 0 {
-        return 0;
-    }
-    if replication_factor == 0 {
-        num_acceptors
-    } else {
-        (replication_factor as usize).min(num_acceptors)
-    }
+    let fraction = ((level as f64) - (counts_len as f64)).exp();
+    (fraction * num_acceptors as f64)
+        .ceil()
+        .min(num_acceptors as f64) as usize
 }
 
 #[cfg(test)]
@@ -98,13 +89,26 @@ mod tests {
     }
 
     #[test]
-    fn test_delivery_count() {
-        assert_eq!(delivery_count(0), 0);
-        assert_eq!(delivery_count(1), 1);
-        assert_eq!(delivery_count(4), 2);
-        assert_eq!(delivery_count(9), 3);
-        assert_eq!(delivery_count(10), 4); // ceil(sqrt(10)) = 4
-        assert_eq!(delivery_count(100), 10);
+    fn test_delivery_count_exponential() {
+        // counts_len=4, 10 acceptors
+        assert_eq!(delivery_count(0, 4, 10), 1); // e^-4 * 10 = 0.18 -> 1
+        assert_eq!(delivery_count(1, 4, 10), 1); // e^-3 * 10 = 0.50 -> 1
+        assert_eq!(delivery_count(2, 4, 10), 2); // e^-2 * 10 = 1.35 -> 2
+        assert_eq!(delivery_count(3, 4, 10), 4); // e^-1 * 10 = 3.68 -> 4
+        assert_eq!(delivery_count(4, 4, 10), 10); // e^0 * 10 = 10 -> 10
+    }
+
+    #[test]
+    fn test_delivery_count_zero_acceptors() {
+        assert_eq!(delivery_count(0, 2, 0), 0);
+        assert_eq!(delivery_count(5, 3, 0), 0);
+    }
+
+    #[test]
+    fn test_delivery_count_single_acceptor() {
+        assert_eq!(delivery_count(0, 4, 1), 1);
+        assert_eq!(delivery_count(3, 4, 1), 1);
+        assert_eq!(delivery_count(4, 4, 1), 1);
     }
 
     #[test]
@@ -145,28 +149,5 @@ mod tests {
 
         let selected = select_acceptors(&acceptors, &msg_id, 0);
         assert!(selected.is_empty());
-    }
-
-    #[test]
-    fn test_delivery_count_for_level_all() {
-        // replication_factor == 0 means all acceptors
-        assert_eq!(delivery_count_for_level(5, 0), 5);
-        assert_eq!(delivery_count_for_level(10, 0), 10);
-        assert_eq!(delivery_count_for_level(1, 0), 1);
-    }
-
-    #[test]
-    fn test_delivery_count_for_level_specific() {
-        // replication_factor capped at num_acceptors
-        assert_eq!(delivery_count_for_level(5, 2), 2);
-        assert_eq!(delivery_count_for_level(5, 5), 5);
-        assert_eq!(delivery_count_for_level(5, 10), 5); // capped at 5
-        assert_eq!(delivery_count_for_level(3, 1), 1);
-    }
-
-    #[test]
-    fn test_delivery_count_for_level_zero_acceptors() {
-        assert_eq!(delivery_count_for_level(0, 0), 0);
-        assert_eq!(delivery_count_for_level(0, 3), 0);
     }
 }

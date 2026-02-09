@@ -14,9 +14,7 @@ pub mod proposal;
 pub mod protocol;
 pub mod sink_stream;
 pub use codec::{Versioned, VersionedCodec};
-pub use crdt::{
-    default_compaction_config, CompactionConfig, CompactionLevel, Crdt, CrdtError, NoCrdt,
-};
+pub use crdt::{Crdt, CrdtError, NoCrdt, COMPACTION_BASE};
 pub use error::{
     AcceptorContext, ConnectorError, EpochContext, GroupContext, MemberContext, OperationContext,
 };

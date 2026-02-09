@@ -3,10 +3,7 @@
 use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
-use filament_core::{
-    CompactionConfig, KeyPackageExt, LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
-    default_compaction_config,
-};
+use filament_core::{KeyPackageExt, LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 use iroh::{Endpoint, EndpointAddr};
 use mls_rs::client_builder::{BaseConfig, WithCryptoProvider, WithIdentityProvider};
 use mls_rs::crypto::SignatureSecretKey;
@@ -121,7 +118,7 @@ impl WeaverClient {
             .change_context(WeaverError)
     }
 
-    /// Create a new weaver with the default compaction config.
+    /// Create a new weaver.
     ///
     /// # Errors
     /// Returns an error if creation fails.
@@ -130,20 +127,6 @@ impl WeaverClient {
         acceptors: &[EndpointAddr],
         protocol_name: &str,
     ) -> Result<Weaver, Report<WeaverError>> {
-        self.create_with_config(acceptors, protocol_name, default_compaction_config())
-            .await
-    }
-
-    /// Create a weaver with a custom compaction config.
-    ///
-    /// # Errors
-    /// Returns an error if creation fails.
-    pub async fn create_with_config(
-        &self,
-        acceptors: &[EndpointAddr],
-        protocol_name: &str,
-        compaction_config: CompactionConfig,
-    ) -> Result<Weaver, Report<WeaverError>> {
         Weaver::create(
             &self.client,
             self.signer.clone(),
@@ -151,7 +134,6 @@ impl WeaverClient {
             &self.connection_manager,
             acceptors,
             protocol_name,
-            compaction_config,
         )
         .await
     }

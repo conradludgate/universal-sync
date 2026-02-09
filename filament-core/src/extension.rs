@@ -19,7 +19,6 @@ use mls_rs::mls_rs_codec::{self as mls_rs_codec, MlsDecode, MlsEncode, MlsSize};
 use mls_rs_core::group::ProposalType;
 use serde::{Deserialize, Serialize};
 
-use crate::crdt::CompactionConfig;
 use crate::proposal::AcceptorId;
 use crate::protocol::MemberFingerprint;
 
@@ -40,14 +39,13 @@ pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupContextExtV1 {
     pub protocol_name: String,
-    pub compaction_config: CompactionConfig,
     pub key_rotation_interval_secs: Option<u64>,
 }
 
-/// CRDT type, compaction config, and protocol version (group context extension).
+/// CRDT type and protocol version (group context extension).
 ///
 /// Set at group creation. Joiners use `protocol_name` to select the right CRDT
-/// implementation and `compaction_config` to drive hierarchical compaction.
+/// implementation. Compaction uses a hardcoded base threshold.
 ///
 /// The binary encoding uses a fixed 4-byte `u32` version prefix followed by
 /// a version-specific postcard payload. The version number doubles as the
@@ -56,21 +54,15 @@ pub struct GroupContextExtV1 {
 pub struct GroupContextExt {
     pub protocol_version: u32,
     pub protocol_name: String,
-    pub compaction_config: CompactionConfig,
     pub key_rotation_interval_secs: Option<u64>,
 }
 
 impl GroupContextExt {
     #[must_use]
-    pub fn new(
-        protocol_name: impl Into<String>,
-        compaction_config: CompactionConfig,
-        key_rotation_interval_secs: Option<u64>,
-    ) -> Self {
+    pub fn new(protocol_name: impl Into<String>, key_rotation_interval_secs: Option<u64>) -> Self {
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             protocol_name: protocol_name.into(),
-            compaction_config,
             key_rotation_interval_secs,
         }
     }
@@ -81,7 +73,6 @@ impl From<GroupContextExtV1> for GroupContextExt {
         Self {
             protocol_version: 1,
             protocol_name: v1.protocol_name,
-            compaction_config: v1.compaction_config,
             key_rotation_interval_secs: v1.key_rotation_interval_secs,
         }
     }
@@ -91,7 +82,6 @@ impl From<&GroupContextExt> for GroupContextExtV1 {
     fn from(ext: &GroupContextExt) -> Self {
         Self {
             protocol_name: ext.protocol_name.clone(),
-            compaction_config: ext.compaction_config.clone(),
             key_rotation_interval_secs: ext.key_rotation_interval_secs,
         }
     }
@@ -459,7 +449,6 @@ mod tests {
     use iroh::SecretKey;
 
     use super::*;
-    use crate::CompactionLevel;
 
     fn test_addr(seed: u8) -> EndpointAddr {
         let secret = SecretKey::from_bytes(&[seed; 32]);
@@ -468,23 +457,12 @@ mod tests {
 
     #[test]
     fn group_context_ext_roundtrip() {
-        let config = vec![
-            CompactionLevel {
-                threshold: 0,
-                replication: 1,
-            },
-            CompactionLevel {
-                threshold: 5,
-                replication: 0,
-            },
-        ];
-        let ext = GroupContextExt::new("yjs", config.clone(), None);
+        let ext = GroupContextExt::new("yjs", None);
 
         let encoded = ext.mls_encode_to_vec().unwrap();
         let decoded = GroupContextExt::mls_decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(ext, decoded);
         assert_eq!(decoded.protocol_name, "yjs");
-        assert_eq!(decoded.compaction_config, config);
     }
 
     #[test]
@@ -592,8 +570,7 @@ mod tests {
 
     #[test]
     fn group_context_ext_with_key_rotation_roundtrip() {
-        let ext =
-            GroupContextExt::new("test-crdt", crate::default_compaction_config(), Some(86400));
+        let ext = GroupContextExt::new("test-crdt", Some(86400));
         assert_eq!(ext.key_rotation_interval_secs, Some(86400));
 
         let encoded = ext.mls_encode_to_vec().unwrap();
@@ -604,16 +581,15 @@ mod tests {
 
     #[test]
     fn group_context_ext_key_rotation_disabled() {
-        let ext = GroupContextExt::new("test", crate::default_compaction_config(), None);
+        let ext = GroupContextExt::new("test", None);
         assert_eq!(ext.key_rotation_interval_secs, None);
     }
 
     #[test]
     fn group_context_ext_version_prefix() {
-        let ext = GroupContextExt::new("yjs", crate::default_compaction_config(), None);
+        let ext = GroupContextExt::new("yjs", None);
         let encoded = ext.mls_encode_to_vec().unwrap();
 
-        // First 4 bytes = version (no length prefix)
         assert!(encoded.len() >= 4);
         let version = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         assert_eq!(version, 1);
@@ -622,7 +598,7 @@ mod tests {
 
     #[test]
     fn group_context_ext_read_protocol_version() {
-        let ext = GroupContextExt::new("yjs", crate::default_compaction_config(), None);
+        let ext = GroupContextExt::new("yjs", None);
         let encoded = ext.mls_encode_to_vec().unwrap();
         let version = super::read_protocol_version(&encoded).unwrap();
         assert_eq!(version, 1);
@@ -630,10 +606,9 @@ mod tests {
 
     #[test]
     fn group_context_ext_unknown_version_rejected() {
-        let ext = GroupContextExt::new("yjs", crate::default_compaction_config(), None);
+        let ext = GroupContextExt::new("yjs", None);
         let mut encoded = ext.mls_encode_to_vec().unwrap();
 
-        // Corrupt the version to an unknown value (99)
         encoded[0] = 0;
         encoded[1] = 0;
         encoded[2] = 0;
