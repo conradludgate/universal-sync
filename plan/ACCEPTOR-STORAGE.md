@@ -149,12 +149,29 @@ the in-memory roster is current for proposal validation.
 - `epoch >= current_epoch`: uses the in-memory roster (membership changes
   only take effect after commit application, so the current roster is
   valid for upcoming rounds).
-- `epoch < current_epoch`: returns `None`. Historical reconstruction from
-  snapshots is not yet implemented.
+- `epoch < current_epoch`: reconstructs the roster from the nearest
+  snapshot via `get_member_public_key_for_past_epoch()`.
 
-**TODO**: For past-epoch validation, load the nearest `ExternalSnapshot`,
-replay accepted values to the target epoch, and extract the roster.
-Throttle/cache this to avoid expense under load.
+#### Historical roster reconstruction
+
+`GroupAcceptor` stores an `Arc<ExternalClient<C>>` (passed from the
+registry) and a `quick_cache::sync::Cache<(Epoch, MemberId), SignaturePublicKey>`
+roster cache.
+
+On cache miss, `get_member_public_key_for_past_epoch` loads the nearest
+`ExternalSnapshot` at or before the target epoch
+(`state_store.get_snapshot_at_or_before(epoch)`), creates a temporary
+`ExternalGroup` via `external_client.load_group(snapshot)`, replays
+accepted values from the snapshot epoch up to (not including) the target
+epoch, then caches the entire roster for that epoch. Subsequent lookups
+for the same epoch are served from cache.
+
+All operations are synchronous — `ExternalGroup::process_incoming_message`
+does not require async. The cache is bounded (256 entries) with automatic
+eviction via `quick_cache`.
+
+Returns `None` gracefully if `state_store` or `external_client` is not
+set, or if no snapshot exists for the target epoch.
 
 ### Sender roster check
 
@@ -169,18 +186,13 @@ The `ExternalClient` must register `SYNC_EXTENSION_TYPE` (and
 in the roster. Without registration, mls-rs strips unknown extensions,
 causing `LeafNodeExt.binding_id` to be missing and fingerprint mismatches.
 
-## Not Yet Implemented
-
-- **Historical roster reconstruction** for past-epoch proposal
-  validation. Currently returns `None` for `epoch < current_epoch`.
-
 ## File Changes
 
 | File | Change |
 |------|--------|
 | `filament-spool/src/state_store.rs` | Removed `promised`, `groups`, `epoch_rosters` keyspaces. Added `snapshots`. `SlimAccepted` struct. Sentinel promised. Logarithmic pruning. |
-| `filament-spool/src/acceptor.rs` | `store_snapshot` / `store_initial_snapshot` using `ExternalSnapshot`. Roster lookup `>=` for future epochs. `is_fingerprint_in_roster` for message sender validation. |
-| `filament-spool/src/registry.rs` | `create_acceptor_from_snapshot`. `get_group` loads from snapshot + replay (from `snapshot_epoch` inclusive). Removed `check_sender_in_roster` stub. |
+| `filament-spool/src/acceptor.rs` | `store_snapshot` / `store_initial_snapshot` using `ExternalSnapshot`. Roster lookup `>=` for future epochs. `is_fingerprint_in_roster` for message sender validation. Historical roster reconstruction via `get_member_public_key_for_past_epoch`. `external_client` and `roster_cache` fields. |
+| `filament-spool/src/registry.rs` | `create_acceptor_from_snapshot`. `get_group` loads from snapshot + replay (from `snapshot_epoch` inclusive). Removed `check_sender_in_roster` stub. Passes `external_client` to `GroupAcceptor` at all construction sites. |
 | `filament-spool/src/server.rs` | `handle_message_request` takes `GroupAcceptor` reference for roster check. |
 | `filament-spool/src/main.rs` | `ExternalClient` registers `SYNC_EXTENSION_TYPE` and `SYNC_PROPOSAL_TYPE`. |
 | `filament-spool/Cargo.toml` | Added `sha2` dependency. |

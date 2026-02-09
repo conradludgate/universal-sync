@@ -128,7 +128,7 @@ impl FjallStateStore {
             .expect("spawn_blocking panicked")
     }
 
-    fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
+    pub(crate) fn open_sync(path: &Path) -> Result<Self, fjall::Error> {
         let db = Database::builder(path).open()?;
 
         Ok(Self {
@@ -494,7 +494,6 @@ impl FjallStateStore {
         None
     }
 
-    #[allow(dead_code)]
     fn get_snapshot_at_or_before_sync(
         &self,
         group_id: &GroupId,
@@ -710,8 +709,8 @@ impl SharedFjallStateStore {
 
 #[derive(Clone)]
 pub struct GroupStateStore {
-    inner: Arc<FjallStateStore>,
-    group_id: GroupId,
+    pub(crate) inner: Arc<FjallStateStore>,
+    pub(crate) group_id: GroupId,
 }
 
 impl GroupStateStore {
@@ -745,7 +744,6 @@ impl GroupStateStore {
     }
 
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn get_snapshot_at_or_before(&self, epoch: Epoch) -> Option<(Epoch, bytes::Bytes)> {
         self.inner
             .get_snapshot_at_or_before_sync(&self.group_id, epoch)

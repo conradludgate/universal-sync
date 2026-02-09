@@ -123,7 +123,8 @@ where
             self.cipher_suite.clone(),
             self.endpoint.secret_key().clone(),
             acceptors,
-        ))
+        )
+        .with_external_client(Arc::clone(&self.external_client)))
     }
 }
 
@@ -192,7 +193,8 @@ where
             self.cipher_suite.clone(),
             self.endpoint.secret_key().clone(),
             acceptors,
-        );
+        )
+        .with_external_client(Arc::clone(&self.external_client));
 
         let state = self.state_store.for_group(group_id);
 

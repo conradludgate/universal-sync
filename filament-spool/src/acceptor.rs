@@ -12,7 +12,9 @@ use iroh::{PublicKey, SecretKey, Signature};
 use mls_rs::CipherSuiteProvider;
 use mls_rs::crypto::SignaturePublicKey;
 use mls_rs::external_client::builder::MlsConfig as ExternalMlsConfig;
-use mls_rs::external_client::{ExternalGroup, ExternalReceivedMessage};
+use mls_rs::external_client::{
+    ExternalClient, ExternalGroup, ExternalReceivedMessage, ExternalSnapshot,
+};
 
 /// Error marker for `GroupAcceptor` operations.
 #[derive(Debug, Default)]
@@ -37,6 +39,8 @@ pub(crate) enum AcceptorChangeEvent {
 ///
 /// Wraps an MLS `ExternalGroup` to verify signatures without decrypting messages.
 /// Tracks the acceptor set via `AcceptorAdd`/`AcceptorRemove` extensions in commits.
+const ROSTER_CACHE_CAPACITY: usize = 256;
+
 pub struct GroupAcceptor<C, CS>
 where
     C: ExternalMlsConfig + Clone,
@@ -46,8 +50,9 @@ where
     cipher_suite: CS,
     secret_key: SecretKey,
     acceptors: std::collections::BTreeSet<AcceptorId>,
-    /// Enables epoch roster lookups for validating proposals from past epochs.
     state_store: Option<crate::state_store::GroupStateStore>,
+    external_client: Option<std::sync::Arc<ExternalClient<C>>>,
+    roster_cache: quick_cache::sync::Cache<(Epoch, MemberId), SignaturePublicKey>,
 }
 
 impl<C, CS> GroupAcceptor<C, CS>
@@ -67,6 +72,8 @@ where
             secret_key,
             acceptors: acceptors.into_iter().collect(),
             state_store: None,
+            external_client: None,
+            roster_cache: quick_cache::sync::Cache::new(ROSTER_CACHE_CAPACITY),
         }
     }
 
@@ -76,6 +83,15 @@ where
         state_store: crate::state_store::GroupStateStore,
     ) -> Self {
         self.state_store = Some(state_store);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_external_client(
+        mut self,
+        external_client: std::sync::Arc<ExternalClient<C>>,
+    ) -> Self {
+        self.external_client = Some(external_client);
         self
     }
 
@@ -109,10 +125,8 @@ where
 
     /// Looks up the signing key for a member at a specific epoch.
     ///
-    /// For current or future epochs, uses the in-memory roster (membership changes only take
-    /// effect after the commit is applied, so the current roster is valid for upcoming rounds).
-    /// For past epochs: would reconstruct from the nearest snapshot + replaying accepted values.
-    // TODO: implement historical roster reconstruction from snapshots with throttling/caching
+    /// For current or future epochs, uses the in-memory roster.
+    /// For past epochs, reconstructs from the nearest snapshot + replaying accepted values.
     fn get_member_public_key_for_epoch(
         &self,
         member_id: MemberId,
@@ -123,7 +137,45 @@ where
             return self.get_member_public_key(member_id);
         }
 
-        None
+        self.get_member_public_key_for_past_epoch(member_id, epoch)
+    }
+
+    fn get_member_public_key_for_past_epoch(
+        &self,
+        member_id: MemberId,
+        epoch: Epoch,
+    ) -> Option<SignaturePublicKey> {
+        let state_store = self.state_store.as_ref()?;
+        let external_client = self.external_client.as_ref()?;
+
+        if let Some(key) = self.roster_cache.get(&(epoch, member_id)) {
+            return Some(key);
+        }
+
+        let (snapshot_epoch, snapshot_bytes) = state_store.get_snapshot_at_or_before(epoch)?;
+        let snapshot = ExternalSnapshot::from_bytes(&snapshot_bytes).ok()?;
+        let mut group = external_client.load_group(snapshot).ok()?;
+
+        let accepted = state_store.get_accepted_from(snapshot_epoch);
+        for (proposal, message) in accepted {
+            if proposal.epoch >= epoch {
+                break;
+            }
+            if group.process_incoming_message(message.mls_message).is_err() {
+                return None;
+            }
+        }
+
+        let mut result = None;
+        for m in group.roster().members_iter() {
+            let mid = MemberId(m.index);
+            let key = m.signing_identity.signature_key.clone();
+            if mid == member_id {
+                result = Some(key.clone());
+            }
+            self.roster_cache.insert((epoch, mid), key);
+        }
+        result
     }
 
     fn is_known_acceptor(&self, id: &AcceptorId) -> bool {
@@ -614,5 +666,138 @@ mod tests {
         let (acceptor, _) = make_acceptor();
         assert!(acceptor.state_store.is_none());
         acceptor.store_snapshot(Epoch(0));
+    }
+
+    fn make_acceptor_at_epoch_1() -> (
+        GroupAcceptor<impl ExternalMlsConfig, impl CipherSuiteProvider + Clone>,
+        SignaturePublicKey,
+        tempfile::TempDir,
+    ) {
+        let crypto = RustCryptoProvider::default();
+        let cs_provider = crypto
+            .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+            .unwrap();
+        let (secret_key, public_key) = cs_provider.signature_key_generate().unwrap();
+        let credential = BasicCredential::new(b"alice".to_vec());
+        let signing_identity = mls_rs::identity::SigningIdentity::new(
+            credential.into_credential(),
+            public_key.clone(),
+        );
+
+        let client = mls_rs::Client::builder()
+            .crypto_provider(crypto)
+            .identity_provider(BasicIdentityProvider::new())
+            .extension_type(filament_core::SYNC_EXTENSION_TYPE)
+            .custom_proposal_types(Some(filament_core::SYNC_PROPOSAL_TYPE))
+            .signing_identity(
+                signing_identity,
+                secret_key.clone(),
+                CipherSuite::CURVE25519_AES128,
+            )
+            .build();
+
+        let mut mls_group = client
+            .create_group(ExtensionList::default(), ExtensionList::default(), None)
+            .unwrap();
+
+        let external_client = make_external_client();
+        let group_info = mls_group
+            .group_info_message(true)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let mls_msg = mls_rs::MlsMessage::from_bytes(&group_info).unwrap();
+        let mut external_group = external_client.observe_group(mls_msg, None, None).unwrap();
+
+        let snapshot_bytes = external_group.snapshot().to_bytes().unwrap();
+
+        let commit_output = mls_group.commit_builder().build().unwrap();
+        let commit_message = GroupMessage::new(commit_output.commit_message);
+        let commit_proposal = GroupProposal {
+            member_id: MemberId(0),
+            epoch: Epoch(0),
+            attempt: Attempt(0),
+            message_hash: [0u8; 32],
+            signature: bytes::Bytes::from_static(&[0; 64]),
+        };
+
+        external_group
+            .process_incoming_message(commit_message.mls_message.clone())
+            .unwrap();
+        assert_eq!(external_group.group_context().epoch, 1);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::state_store::FjallStateStore::open_sync(temp_dir.path()).unwrap(),
+        );
+        let mls_group_id = external_group.group_context().group_id.clone();
+        let group_id = GroupId::from_slice(&mls_group_id);
+        let group_state = crate::state_store::GroupStateStore {
+            inner: store,
+            group_id,
+        };
+        group_state
+            .store_snapshot(Epoch(0), &snapshot_bytes)
+            .unwrap();
+        group_state
+            .store_and_broadcast(&commit_proposal, &commit_message)
+            .unwrap();
+
+        let acceptor_sk = SecretKey::generate(&mut rand::rng());
+        let acceptor_id = AcceptorId::from_bytes(*acceptor_sk.public().as_bytes());
+        let cs = make_cipher_suite();
+
+        let acceptor = GroupAcceptor::new(external_group, cs, acceptor_sk, vec![acceptor_id])
+            .with_state_store(group_state)
+            .with_external_client(std::sync::Arc::new(make_external_client()));
+
+        (acceptor, public_key, temp_dir)
+    }
+
+    #[test]
+    fn historical_lookup_returns_none_without_infrastructure() {
+        let (acceptor, _) = make_acceptor();
+        let result = acceptor.get_member_public_key_for_past_epoch(MemberId(0), Epoch(0));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn historical_lookup_reconstructs_from_snapshot() {
+        let (acceptor, alice_key, _dir) = make_acceptor_at_epoch_1();
+        assert_eq!(acceptor.current_round(), Epoch(1));
+
+        let past_key = acceptor.get_member_public_key_for_epoch(MemberId(0), Epoch(0));
+        assert_eq!(past_key, Some(alice_key.clone()));
+
+        let current_key = acceptor.get_member_public_key_for_epoch(MemberId(0), Epoch(1));
+        assert_eq!(current_key, Some(alice_key));
+    }
+
+    #[test]
+    fn historical_lookup_returns_none_for_nonexistent_member() {
+        let (acceptor, _, _dir) = make_acceptor_at_epoch_1();
+        let result = acceptor.get_member_public_key_for_epoch(MemberId(999), Epoch(0));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn historical_lookup_cache_populates() {
+        let (acceptor, _, _dir) = make_acceptor_at_epoch_1();
+        assert!(
+            acceptor
+                .roster_cache
+                .get(&(Epoch(0), MemberId(0)))
+                .is_none()
+        );
+
+        let key = acceptor.get_member_public_key_for_epoch(MemberId(0), Epoch(0));
+        assert!(key.is_some());
+
+        assert!(
+            acceptor
+                .roster_cache
+                .get(&(Epoch(0), MemberId(0)))
+                .is_some()
+        );
     }
 }
