@@ -119,10 +119,6 @@ pub enum CoordinatorRequest {
         invite_b58: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    GenerateExternalInvite {
-        group_id: GroupId,
-        reply: oneshot::Sender<Result<String, String>>,
-    },
     ForDoc {
         group_id: GroupId,
         request: DocRequest,
@@ -175,6 +171,9 @@ pub enum DocRequest {
     UpdateCursor {
         anchor: u32,
         head: u32,
+    },
+    GenerateExternalInvite {
+        reply: oneshot::Sender<Result<String, String>>,
     },
     #[allow(dead_code)]
     Shutdown,

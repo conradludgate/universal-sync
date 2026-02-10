@@ -2278,8 +2278,9 @@ async fn test_multi_acceptor_message_delivery() {
 // Key Package Send Tests
 // =============================================================================
 
-/// Bob sends his key package directly to Alice's endpoint. Alice receives
-/// it, calls add_member, and Bob joins via the resulting welcome.
+/// Bob sends his key package directly to Alice's endpoint. Alice's group
+/// actor automatically verifies the HMAC tag and calls add_member. Bob
+/// joins via the resulting welcome.
 #[tokio::test]
 async fn test_key_package_send_flow() {
     init_tracing();
@@ -2288,7 +2289,7 @@ async fn test_key_package_send_flow() {
     let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut alice = test_weaver_client("alice", test_endpoint(&discovery).await);
+    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
         .create(std::slice::from_ref(&acceptor_id), "none")
@@ -2301,26 +2302,19 @@ async fn test_key_package_send_flow() {
 
     let mut bob = test_weaver_client("bob", test_endpoint(&discovery).await);
 
+    let invite_payload = alice_group
+        .generate_invite()
+        .await
+        .expect("alice generate invite");
+    let hmac_tag: [u8; 32] = invite_payload[64..96].try_into().unwrap();
+
     let alice_endpoint_id = alice.endpoint_id();
 
-    bob.send_key_package(alice_endpoint_id, group_id)
+    bob.send_key_package(alice_endpoint_id, group_id, hmac_tag)
         .await
         .expect("bob send key package");
 
-    let (received_group_id, key_package_bytes) =
-        tokio::time::timeout(Duration::from_secs(5), alice.recv_key_package())
-            .await
-            .expect("timeout waiting for key package")
-            .expect("channel closed");
-
-    assert_eq!(received_group_id, group_id);
-
-    alice_group
-        .add_member(&key_package_bytes)
-        .await
-        .expect("alice add bob");
-
-    let welcome = tokio::time::timeout(Duration::from_secs(5), bob.recv_welcome())
+    let welcome = tokio::time::timeout(Duration::from_secs(10), bob.recv_welcome())
         .await
         .expect("timeout waiting for welcome")
         .expect("channel closed");

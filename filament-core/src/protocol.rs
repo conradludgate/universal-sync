@@ -66,7 +66,7 @@ pub enum Handshake {
     /// Register a new group with a `GroupInfo` MLS message.
     CreateGroup {
         #[serde(with = "mls_bytes")]
-        group_info: MlsMessage,
+        group_info: Box<MlsMessage>,
     },
     /// Join an existing group's message stream.
     ///
@@ -76,7 +76,7 @@ pub enum Handshake {
     /// Deliver an MLS `Welcome` message.
     SendWelcome {
         #[serde(with = "mls_bytes")]
-        welcome: MlsMessage,
+        welcome: Box<MlsMessage>,
     },
     /// Send a key package to request joining a group.
     ///
@@ -85,7 +85,8 @@ pub enum Handshake {
     SendKeyPackage {
         group_id: GroupId,
         #[serde(with = "mls_bytes")]
-        key_package: MlsMessage,
+        key_package: Box<MlsMessage>,
+        hmac_tag: [u8; 32],
     },
 }
 
@@ -638,7 +639,7 @@ mod tests {
 
     #[test]
     fn handshake_variants_roundtrip() {
-        let msg = test_mls_message();
+        let msg = Box::new(test_mls_message());
         let variants: Vec<Handshake> = vec![
             Handshake::JoinProposals {
                 group_id: GroupId::new([0; 32]),
@@ -654,6 +655,7 @@ mod tests {
             Handshake::SendKeyPackage {
                 group_id: GroupId::new([7; 32]),
                 key_package: msg,
+                hmac_tag: [0xAB; 32],
             },
         ];
         for h in variants {

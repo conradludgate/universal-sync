@@ -183,7 +183,7 @@ where
 #[instrument(skip_all, name = "proposal_stream", fields(?group_id))]
 async fn handle_proposal_stream<C, CS>(
     mut group_id: GroupId,
-    create_group_info: Option<MlsMessage>,
+    create_group_info: Option<Box<MlsMessage>>,
     since_epoch: Epoch,
     reader: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,

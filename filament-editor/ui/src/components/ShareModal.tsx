@@ -106,7 +106,7 @@ export function ShareModal({ groupId, groupState, awarenessPeers, syncStatus, on
     tauri.generateExternalInvite(groupId).then(setInvite).catch((error) => {
       console.error("Failed to generate invite:", error);
     });
-  }, [groupId]);
+  }, [groupId, groupState]);
 
   const copyInvite = useCallback(async () => {
     if (!invite) return;

@@ -211,6 +211,10 @@ impl<E: EventEmitter> DocumentActor<E> {
                 let result = self.update_keys().await;
                 let _ = reply.send(result);
             }
+            DocRequest::GenerateExternalInvite { reply } => {
+                let result = self.generate_external_invite().await;
+                let _ = reply.send(result);
+            }
             DocRequest::UpdateCursor { anchor, head } => {
                 self.crdt.set_cursor(anchor, head);
                 if let Err(e) = self.group.send_update(&mut self.crdt).await {
@@ -384,6 +388,15 @@ impl<E: EventEmitter> DocumentActor<E> {
             spool_count: ctx.spools.len(),
             connected_spool_count: ctx.connected_spools.len(),
         })
+    }
+
+    async fn generate_external_invite(&mut self) -> Result<String, String> {
+        let payload = self
+            .group
+            .generate_invite()
+            .await
+            .map_err(|e| format!("failed to generate invite: {e:?}"))?;
+        Ok(bs58::encode(payload).into_string())
     }
 
     async fn update_keys(&mut self) -> Result<(), String> {

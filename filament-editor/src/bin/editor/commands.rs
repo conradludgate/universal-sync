@@ -90,10 +90,8 @@ pub async fn generate_external_invite(
     state: tauri::State<'_, AppState>,
     group_id: String,
 ) -> Result<String, String> {
-    let gid = parse_group_id(&group_id)?;
-    coord_request(&state, |reply| CoordinatorRequest::GenerateExternalInvite {
-        group_id: gid,
-        reply,
+    doc_request(&state, &group_id, |reply| {
+        DocRequest::GenerateExternalInvite { reply }
     })
     .await
 }

@@ -168,7 +168,7 @@ where
     /// Returns [`RegistryError`] if parsing, observing, or persisting the group fails.
     pub fn create_group(
         &self,
-        mls_message: MlsMessage,
+        mls_message: Box<MlsMessage>,
     ) -> Result<(GroupId, GroupAcceptor<C, CS>, GroupStateStore), Report<RegistryError>> {
         let acceptors = mls_message
             .as_group_info()
@@ -177,7 +177,7 @@ where
 
         let external_group = self
             .external_client
-            .observe_group(mls_message, None, None)
+            .observe_group(*mls_message, None, None)
             .change_context(RegistryError)
             .attach("failed to observe group")?;
 

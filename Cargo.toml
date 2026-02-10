@@ -25,6 +25,7 @@ mls-rs = { version = "0.52", default-features = false, features = ["std", "custo
 yrs = { version = "0.25" }
 zeroize = "1.8"
 sha2 = "0.10"
+hmac = "0.12"
 
 error-stack = "0.6"
 bs58 = "0.5"

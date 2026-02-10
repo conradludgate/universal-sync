@@ -3,8 +3,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use error_stack::{Report, ResultExt};
 use filament_core::{
     AcceptorId, AuthData, COMPACTION_BASE, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
-    GroupProposal, Handshake, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN, StateVector,
-    SyncProposal,
+    GroupProposal, Handshake, KeyPackageExt, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN,
+    StateVector, SyncProposal,
 };
 use filament_warp::proposer::{ProposeResult, Proposer, QuorumTracker};
 use filament_warp::{AcceptorMessage, Learner, Proposal};
@@ -390,6 +390,19 @@ where
                 self.handle_compact_snapshot(snapshot, level, force, reply)
                     .await;
             }
+            GroupRequest::GenerateInvite { reply } => {
+                let _ = reply.send(self.handle_generate_invite());
+            }
+            GroupRequest::VerifyInviteTag { hmac_tag, reply } => {
+                let _ = reply.send(self.handle_verify_invite_tag(&hmac_tag));
+            }
+            GroupRequest::IncomingKeyPackage {
+                key_package,
+                hmac_tag,
+            } => {
+                self.handle_incoming_key_package(*key_package, hmac_tag)
+                    .await;
+            }
             GroupRequest::Shutdown => {
                 return true;
             }
@@ -461,6 +474,60 @@ where
             connected_spools: self.connected_acceptors.clone(),
             confirmed_transcript_hash: mls_context.confirmed_transcript_hash.to_vec(),
         }
+    }
+
+    fn invite_hmac_key(&self) -> Result<Vec<u8>, Report<WeaverError>> {
+        let secret = self
+            .learner
+            .group()
+            .export_secret(b"filament/invite", b"", 32)
+            .change_context(WeaverError)?;
+        Ok(secret.to_vec())
+    }
+
+    fn handle_generate_invite(&self) -> Result<Vec<u8>, Report<WeaverError>> {
+        let hmac_key = self.invite_hmac_key()?;
+        let endpoint_id = *self.endpoint.id().as_bytes();
+        let tag = super::compute_invite_hmac(&hmac_key, &endpoint_id, &self.group_id);
+        let mut payload = Vec::with_capacity(96);
+        payload.extend_from_slice(&endpoint_id);
+        payload.extend_from_slice(self.group_id.as_bytes());
+        payload.extend_from_slice(&tag);
+        Ok(payload)
+    }
+
+    fn handle_verify_invite_tag(&self, hmac_tag: &[u8; 32]) -> Result<bool, Report<WeaverError>> {
+        let hmac_key = self.invite_hmac_key()?;
+        let endpoint_id = *self.endpoint.id().as_bytes();
+        let expected = super::compute_invite_hmac(&hmac_key, &endpoint_id, &self.group_id);
+        Ok(*hmac_tag == expected)
+    }
+
+    async fn handle_incoming_key_package(&mut self, key_package: MlsMessage, hmac_tag: [u8; 32]) {
+        match self.handle_verify_invite_tag(&hmac_tag) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("rejecting incoming key package: invalid HMAC tag");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(?e, "failed to verify invite tag for incoming key package");
+                return;
+            }
+        }
+
+        let Some(ext) = key_package
+            .as_key_package()
+            .and_then(|kp| kp.extensions.get_as::<KeyPackageExt>().ok().flatten())
+        else {
+            tracing::warn!("key package missing KeyPackageExt");
+            return;
+        };
+        let member_endpoint_id = ext.endpoint_id;
+
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        self.handle_add_member(key_package, member_endpoint_id, reply_tx)
+            .await;
     }
 
     async fn handle_add_member(
@@ -977,7 +1044,9 @@ where
         let mut framed = FramedWrite::new(send, LengthDelimitedCodec::new());
 
         let welcome = MlsMessage::from_bytes(welcome).change_context(WeaverError)?;
-        let handshake = Handshake::SendWelcome { welcome };
+        let handshake = Handshake::SendWelcome {
+            welcome: Box::new(welcome),
+        };
         let handshake_bytes = postcard::to_stdvec(&handshake).change_context(WeaverError)?;
 
         framed

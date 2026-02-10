@@ -15,7 +15,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 pub(crate) async fn register_group(
     endpoint: &Endpoint,
     acceptor_id: &AcceptorId,
-    group_info: MlsMessage,
+    group_info: Box<MlsMessage>,
 ) -> Result<GroupId, Report<ConnectorError>> {
     let group_id = group_info
         .group_id()

@@ -28,6 +28,19 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+fn compute_invite_hmac(hmac_key: &[u8], endpoint_id: &[u8; 32], group_id: &GroupId) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(hmac_key).expect("valid key size");
+    mac.update(endpoint_id);
+    mac.update(group_id.as_bytes());
+    mac.finalize().into_bytes().into()
+}
+
+pub(crate) type GroupRegistry = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<GroupId, mpsc::Sender<GroupRequest>>>,
+>;
+
 use crate::connection::ConnectionManager;
 use crate::connector::ProposalRequest;
 use crate::learner::{WeaverLearner, fingerprint_of_member};
@@ -62,14 +75,15 @@ pub(crate) fn group_info_ext_list(
 pub(crate) fn group_info_with_ext<C: mls_rs::client_builder::MlsConfig>(
     group: &mls_rs::Group<C>,
     acceptors: impl IntoIterator<Item = AcceptorId>,
-) -> Result<MlsMessage, Report<WeaverError>> {
+) -> Result<Box<MlsMessage>, Report<WeaverError>> {
     let extensions = group_info_ext_list(acceptors);
     group
         .group_info_message_internal(extensions, true)
+        .map(Box::new)
         .change_context(WeaverError)
 }
 
-enum GroupRequest {
+pub(crate) enum GroupRequest {
     GetContext {
         reply: oneshot::Sender<WeaverContext>,
     },
@@ -102,6 +116,17 @@ enum GroupRequest {
         level: u8,
         force: bool,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
+    },
+    GenerateInvite {
+        reply: oneshot::Sender<Result<Vec<u8>, Report<WeaverError>>>,
+    },
+    VerifyInviteTag {
+        hmac_tag: [u8; 32],
+        reply: oneshot::Sender<Result<bool, Report<WeaverError>>>,
+    },
+    IncomingKeyPackage {
+        key_package: Box<MlsMessage>,
+        hmac_tag: [u8; 32],
     },
     Shutdown,
 }
@@ -262,6 +287,7 @@ impl Weaver {
         connection_manager: &ConnectionManager,
         acceptors: &[AcceptorId],
         protocol_name: &str,
+        group_registry: &GroupRegistry,
     ) -> Result<Self, Report<WeaverError>>
     where
         C: MlsConfig + Clone + Send + Sync + 'static,
@@ -322,6 +348,7 @@ impl Weaver {
             endpoint.clone(),
             connection_manager.clone(),
             Some(86400),
+            group_registry,
         ))
     }
 
@@ -331,19 +358,16 @@ impl Weaver {
         signer: SignatureSecretKey,
         cipher_suite: CS,
         connection_manager: &ConnectionManager,
-        welcome_bytes: &[u8],
+        welcome: &MlsMessage,
+        group_registry: &GroupRegistry,
     ) -> Result<JoinInfo, Report<WeaverError>>
     where
         C: MlsConfig + Clone + Send + Sync + 'static,
         CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
     {
         let (learner, group_id, protocol_name, key_rotation_interval_secs) = blocking(|| {
-            let welcome = MlsMessage::from_bytes(welcome_bytes)
-                .change_context(WeaverError)
-                .attach(OperationContext::JOINING_GROUP)?;
-
             let (group, info) = client
-                .join_group(None, &welcome, None)
+                .join_group(None, welcome, None)
                 .change_context(WeaverError)
                 .attach(OperationContext::JOINING_GROUP)?;
 
@@ -392,6 +416,7 @@ impl Weaver {
             connection_manager.endpoint().clone(),
             connection_manager.clone(),
             key_rotation_interval_secs,
+            group_registry,
         );
 
         Ok(JoinInfo {
@@ -406,6 +431,7 @@ impl Weaver {
         endpoint: Endpoint,
         connection_manager: ConnectionManager,
         key_rotation_interval_secs: Option<u64>,
+        group_registry: &GroupRegistry,
     ) -> Self
     where
         C: MlsConfig + Clone + Send + Sync + 'static,
@@ -425,6 +451,11 @@ impl Weaver {
         let (event_tx, _) = broadcast::channel(64);
         let (request_tx, request_rx) = mpsc::channel(64);
         let (app_message_tx, app_message_rx) = mpsc::channel(256);
+
+        group_registry
+            .lock()
+            .unwrap()
+            .insert(group_id, request_tx.clone());
 
         let key_rotation_interval = key_rotation_interval_secs.map(std::time::Duration::from_secs);
 
@@ -740,6 +771,39 @@ impl Weaver {
         self.client_id
     }
 
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if the group actor is closed or the export secret fails.
+    pub async fn generate_invite(&self) -> Result<Vec<u8>, Report<WeaverError>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::GenerateInvite { reply: reply_tx })
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if the group actor is closed or the export secret fails.
+    pub async fn verify_invite_tag(&self, hmac_tag: [u8; 32]) -> Result<bool, Report<WeaverError>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.request_tx
+            .send(GroupRequest::VerifyInviteTag {
+                hmac_tag,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
+    }
+
     /// Unlike `Drop`, this waits for actors to complete.
     pub async fn shutdown(mut self) {
         let _ = self.request_tx.send(GroupRequest::Shutdown).await;
@@ -751,8 +815,8 @@ impl Weaver {
 }
 
 pub(crate) enum IncomingHandshake {
-    Welcome(bytes::Bytes),
-    KeyPackage(GroupId, Vec<u8>),
+    Welcome(Box<MlsMessage>),
+    KeyPackage(GroupId, Box<MlsMessage>, [u8; 32]),
 }
 
 /// Waits for an incoming handshake (welcome or key package) on the endpoint.
@@ -786,17 +850,16 @@ pub(crate) async fn wait_for_incoming(
         postcard::from_bytes(&handshake_bytes).change_context(WeaverError)?;
 
     match handshake {
-        Handshake::SendWelcome { welcome } => {
-            let bytes = welcome.to_bytes().change_context(WeaverError)?;
-            Ok(IncomingHandshake::Welcome(bytes.into()))
-        }
+        Handshake::SendWelcome { welcome } => Ok(IncomingHandshake::Welcome(welcome)),
         Handshake::SendKeyPackage {
             group_id,
             key_package,
-        } => {
-            let bytes = key_package.to_bytes().change_context(WeaverError)?;
-            Ok(IncomingHandshake::KeyPackage(group_id, bytes))
-        }
+            hmac_tag,
+        } => Ok(IncomingHandshake::KeyPackage(
+            group_id,
+            key_package,
+            hmac_tag,
+        )),
         _ => Err(Report::new(WeaverError).attach("unexpected handshake type on client endpoint")),
     }
 }

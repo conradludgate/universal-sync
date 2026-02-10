@@ -16,7 +16,7 @@ use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use tokio::sync::mpsc;
 
 use crate::connection::ConnectionManager;
-use crate::group::{JoinInfo, Weaver, WeaverError};
+use crate::group::{GroupRegistry, JoinInfo, Weaver, WeaverError};
 
 type WeaverMlsConfig =
     WithIdentityProvider<BasicIdentityProvider, WithCryptoProvider<RustCryptoProvider, BaseConfig>>;
@@ -30,8 +30,8 @@ pub struct WeaverClient {
     signer: SignatureSecretKey,
     cipher_suite: WeaverCipherSuite,
     connection_manager: ConnectionManager,
-    welcome_rx: mpsc::Receiver<bytes::Bytes>,
-    key_package_rx: mpsc::Receiver<(filament_core::GroupId, Vec<u8>)>,
+    welcome_rx: mpsc::Receiver<Box<MlsMessage>>,
+    group_registry: GroupRegistry,
 }
 
 impl WeaverClient {
@@ -67,12 +67,14 @@ impl WeaverClient {
             .build();
 
         let (welcome_tx, welcome_rx) = mpsc::channel(16);
-        let (key_package_tx, key_package_rx) = mpsc::channel(16);
         let connection_manager = ConnectionManager::new(endpoint);
+        let group_registry: GroupRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let endpoint_clone = connection_manager.endpoint().clone();
+        let registry_clone = group_registry.clone();
         tokio::spawn(async move {
-            Self::incoming_loop(endpoint_clone, welcome_tx, key_package_tx).await;
+            Self::incoming_loop(endpoint_clone, welcome_tx, registry_clone).await;
         });
 
         Self {
@@ -81,26 +83,37 @@ impl WeaverClient {
             cipher_suite,
             connection_manager,
             welcome_rx,
-            key_package_rx,
+            group_registry,
         }
     }
 
     async fn incoming_loop(
         endpoint: Endpoint,
-        welcome_tx: mpsc::Sender<bytes::Bytes>,
-        key_package_tx: mpsc::Sender<(filament_core::GroupId, Vec<u8>)>,
+        welcome_tx: mpsc::Sender<Box<MlsMessage>>,
+        group_registry: GroupRegistry,
     ) {
-        use crate::group::IncomingHandshake;
+        use crate::group::{GroupRequest, IncomingHandshake};
         loop {
             match crate::group::wait_for_incoming(&endpoint).await {
-                Ok(IncomingHandshake::Welcome(bytes)) => {
-                    if welcome_tx.send(bytes).await.is_err() {
+                Ok(IncomingHandshake::Welcome(welcome)) => {
+                    if welcome_tx.send(welcome).await.is_err() {
                         break;
                     }
                 }
-                Ok(IncomingHandshake::KeyPackage(group_id, bytes)) => {
-                    if key_package_tx.send((group_id, bytes)).await.is_err() {
-                        break;
+                Ok(IncomingHandshake::KeyPackage(group_id, key_package, hmac_tag)) => {
+                    let sender = group_registry.lock().unwrap().get(&group_id).cloned();
+                    if let Some(tx) = sender {
+                        let _ = tx
+                            .send(GroupRequest::IncomingKeyPackage {
+                                key_package,
+                                hmac_tag,
+                            })
+                            .await;
+                    } else {
+                        tracing::warn!(
+                            ?group_id,
+                            "received key package for unknown group, dropping"
+                        );
                     }
                 }
                 Err(e) => {
@@ -155,6 +168,7 @@ impl WeaverClient {
             &self.connection_manager,
             acceptors,
             protocol_name,
+            &self.group_registry,
         )
         .await
     }
@@ -165,45 +179,33 @@ impl WeaverClient {
     ///
     /// # Errors
     /// Returns an error if joining fails.
-    pub async fn join(&self, welcome_bytes: &[u8]) -> Result<JoinInfo, Report<WeaverError>> {
+    pub async fn join(&self, welcome: &MlsMessage) -> Result<JoinInfo, Report<WeaverError>> {
         Weaver::join(
             &self.client,
             self.signer.clone(),
             self.cipher_suite.clone(),
             &self.connection_manager,
-            welcome_bytes,
+            welcome,
+            &self.group_registry,
         )
         .await
     }
 
     /// Receive the next welcome message, or wait for one. Returns `None` on shutdown.
-    pub async fn recv_welcome(&mut self) -> Option<bytes::Bytes> {
+    pub async fn recv_welcome(&mut self) -> Option<Box<MlsMessage>> {
         self.welcome_rx.recv().await
     }
 
     /// Non-blocking variant of [`recv_welcome`](Self::recv_welcome).
-    pub fn try_recv_welcome(&mut self) -> Option<bytes::Bytes> {
+    pub fn try_recv_welcome(&mut self) -> Option<Box<MlsMessage>> {
         self.welcome_rx.try_recv().ok()
     }
 
     /// Take the welcome receiver for use in a `select!` loop.
     /// After this, `recv_welcome`/`try_recv_welcome` will always return `None`.
-    pub fn take_welcome_rx(&mut self) -> mpsc::Receiver<bytes::Bytes> {
+    pub fn take_welcome_rx(&mut self) -> mpsc::Receiver<Box<MlsMessage>> {
         let (_, empty_rx) = mpsc::channel(1);
         std::mem::replace(&mut self.welcome_rx, empty_rx)
-    }
-
-    /// Receive the next key package sent by a remote peer, or wait for one.
-    /// Returns `None` on shutdown.
-    pub async fn recv_key_package(&mut self) -> Option<(filament_core::GroupId, Vec<u8>)> {
-        self.key_package_rx.recv().await
-    }
-
-    /// Take the key-package receiver for use in a `select!` loop.
-    /// After this, `recv_key_package` will always return `None`.
-    pub fn take_key_package_rx(&mut self) -> mpsc::Receiver<(filament_core::GroupId, Vec<u8>)> {
-        let (_, empty_rx) = mpsc::channel(1);
-        std::mem::replace(&mut self.key_package_rx, empty_rx)
     }
 
     /// Send this client's key package to a remote peer, requesting to join
@@ -218,6 +220,7 @@ impl WeaverClient {
         &self,
         target: [u8; 32],
         group_id: filament_core::GroupId,
+        hmac_tag: [u8; 32],
     ) -> Result<(), Report<WeaverError>> {
         use filament_core::{Handshake, PAXOS_ALPN};
         use futures::SinkExt;
@@ -244,7 +247,8 @@ impl WeaverClient {
 
         let handshake = Handshake::SendKeyPackage {
             group_id,
-            key_package,
+            key_package: Box::new(key_package),
+            hmac_tag,
         };
         let hs_bytes = postcard::to_allocvec(&handshake).change_context(WeaverError)?;
         framed
