@@ -145,9 +145,9 @@ impl AcceptorActor {
                                 break ConnectionResult::Disconnected { was_connected: true };
                             }
                         }
-                        AcceptorOutbound::AppMessage { id, msg } => {
+                        AcceptorOutbound::AppMessage { id, level, msg } => {
                             if let Some(ref mut writer) = message_writer_opt {
-                                let request = MessageRequest::Send { id, message: msg };
+                                let request = MessageRequest::Send { id, level, message: msg };
                                 let _ = writer.send(request).await;
                             }
                         }

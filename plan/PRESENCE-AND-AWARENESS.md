@@ -1,6 +1,6 @@
 # Presence Detection and Cursor Awareness
 
-## Status: BUGGY — editors getting out of sync. Not yet reverted.
+## Status: Implemented
 
 The original plan called for a prefix-byte framing approach (`0x00` for
 doc, `0x01` for awareness) with `CrdtFactory::wrap_snapshot_for_wire()`
@@ -56,34 +56,8 @@ stability.
 
 ---
 
-## Known Bug: Editors getting out of sync
+## Previously Known Bug (Fixed)
 
-Symptom: Two editors in the same document drift apart — edits from one
-peer stop appearing in the other, or text diverges.
-
-### Suspected root causes to investigate
-
-1. **`ignoreNextChange` guard in Monaco integration**: `setEditorText()`
-   uses `pushEditOperations()` which fires `onDidChangeModelContent`. The
-   flag is set/cleared synchronously but the callback might fire
-   asynchronously, creating a feedback loop.
-
-2. **`flush_update()` state vector drift**: If `apply()` is called
-   between the state vector read and the update of `last_flushed_sv`, the
-   next diff could skip or duplicate operations.
-
-3. **Pre-existing race in delta application**: The frontend computes
-   deltas by diffing `lastSentText` against `getEditorText()`. A remote
-   update arriving between diff computation and `apply_delta` invoke
-   could apply the wrong edit.
-
-### Debugging approach
-
-1. Check if the bug reproduces WITHOUT awareness (strip awareness from
-   `CrdtMessage`, test sync). If sync works without awareness, narrow
-   down which change introduced the regression.
-2. Check if the bug reproduces without Monaco (use textarea). If sync
-   works with textarea, the `ignoreNextChange` guard or Monaco event
-   timing is the issue.
-3. Write a deterministic test: two peers, interleave doc edits with
-   awareness updates, verify text stays in sync after each round.
+Editors were getting out of sync due to race conditions in the Monaco
+integration and `flush_update()` state vector handling. This has been
+resolved.

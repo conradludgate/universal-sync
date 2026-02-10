@@ -352,7 +352,7 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
     match request {
-        MessageRequest::Send { id, message } => {
+        MessageRequest::Send { id, level, message } => {
             if !acceptor.is_fingerprint_in_roster(group_id, id.sender) {
                 debug!(sender = ?id.sender, "rejecting message from sender not in roster");
                 connection
@@ -362,7 +362,7 @@ where
                 return Ok(());
             }
 
-            match registry.store_message(group_id, &id, &message) {
+            match registry.store_message(group_id, &id, level, &message) {
                 Ok(()) => {
                     connection
                         .send(MessageResponse::Stored)

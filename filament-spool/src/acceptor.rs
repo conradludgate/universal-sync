@@ -410,7 +410,7 @@ where
                         );
 
                         if let Some(ref store) = self.state_store {
-                            match store.delete_before_watermark(&watermark) {
+                            match store.delete_before_watermark(&watermark, level) {
                                 Ok(deleted) => {
                                     tracing::info!(
                                         deleted,

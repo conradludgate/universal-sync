@@ -216,10 +216,11 @@ where
         &self,
         group_id: &GroupId,
         id: &filament_core::MessageId,
+        level: u8,
         msg: &filament_core::EncryptedAppMessage,
     ) -> Result<(), Report<RegistryError>> {
         self.state_store
-            .store_app_message(group_id, id, msg)
+            .store_app_message(group_id, id, level, msg)
             .change_context(RegistryError)
             .attach("failed to store message")
     }

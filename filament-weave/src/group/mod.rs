@@ -163,6 +163,7 @@ enum AcceptorOutbound {
     },
     AppMessage {
         id: MessageId,
+        level: u8,
         msg: EncryptedAppMessage,
     },
 }

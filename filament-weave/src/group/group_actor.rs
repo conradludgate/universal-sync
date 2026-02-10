@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
@@ -51,8 +51,7 @@ where
     connected_acceptors: BTreeSet<AcceptorId>,
     own_fingerprint: MemberFingerprint,
     message_seq: u64,
-    state_vector: StateVector,
-    seen_messages: HashSet<(MemberFingerprint, u64)>,
+    received_seqs: ReceivedSeqs,
     pending_messages: Vec<PendingMessage>,
     join_epoch: Epoch,
     active_proposal: Option<ActiveProposal>,
@@ -158,6 +157,80 @@ impl CompactionState {
     }
 }
 
+#[derive(Debug, Default)]
+struct SenderSeqs {
+    confirmed: u64,
+    ranges: rangemap::RangeInclusiveSet<u64>,
+}
+
+impl SenderSeqs {
+    fn record(&mut self, seq: u64) {
+        if seq <= self.confirmed {
+            return;
+        }
+        self.ranges.insert(seq..=seq);
+    }
+
+    fn watermark(&self) -> u64 {
+        if let Some(first) = self.ranges.iter().next()
+            && *first.start() == self.confirmed + 1
+        {
+            return *first.end();
+        }
+        self.confirmed
+    }
+
+    fn confirm_compaction(&mut self, new_confirmed: u64) {
+        if new_confirmed > self.confirmed {
+            self.confirmed = new_confirmed;
+            self.ranges.remove(0..=new_confirmed);
+        }
+    }
+
+    fn contains(&self, seq: u64) -> bool {
+        seq <= self.confirmed || self.ranges.contains(&seq)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReceivedSeqs {
+    senders: HashMap<MemberFingerprint, SenderSeqs>,
+}
+
+impl ReceivedSeqs {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&mut self, sender: MemberFingerprint, seq: u64) {
+        self.senders.entry(sender).or_default().record(seq);
+    }
+
+    fn watermark(&self) -> StateVector {
+        self.senders
+            .iter()
+            .filter_map(|(fp, seqs)| {
+                let wm = seqs.watermark();
+                if wm > 0 { Some((*fp, wm)) } else { None }
+            })
+            .collect()
+    }
+
+    fn confirm_compaction(&mut self, watermark: &StateVector) {
+        for (fp, &hw) in watermark {
+            if let Some(seqs) = self.senders.get_mut(fp) {
+                seqs.confirm_compaction(hw);
+            }
+        }
+    }
+
+    fn contains(&self, sender: MemberFingerprint, seq: u64) -> bool {
+        self.senders
+            .get(&sender)
+            .is_some_and(|seqs| seqs.contains(seq))
+    }
+}
+
 const MAX_PROPOSAL_RETRIES: u32 = 6;
 const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 fn exponential_backoff_duration(retries: u32) -> std::time::Duration {
@@ -210,8 +283,7 @@ where
             connected_acceptors: BTreeSet::new(),
             own_fingerprint,
             message_seq: 0,
-            state_vector: StateVector::new(),
-            seen_messages: HashSet::new(),
+            received_seqs: ReceivedSeqs::new(),
             pending_messages: Vec::new(),
             join_epoch,
             active_proposal: None,
@@ -425,7 +497,7 @@ where
         let divisor = u64::from(COMPACTION_BASE);
         let mut key = Vec::new();
         key.push(level);
-        for (fp, &seq) in &self.state_vector {
+        for (fp, seq) in self.received_seqs.watermark() {
             key.extend_from_slice(&fp.0);
             key.extend_from_slice(&(seq / divisor).to_le_bytes());
         }
@@ -653,7 +725,7 @@ where
     ) {
         let seq = self.message_seq;
         self.message_seq += 1;
-        self.state_vector.insert(self.own_fingerprint, seq);
+        self.received_seqs.record(self.own_fingerprint, seq);
 
         let auth_data = AuthData::update(seq);
         let authenticated_data = match auth_data.to_bytes() {
@@ -709,6 +781,7 @@ where
             if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
                 let _ = tx.try_send(AcceptorOutbound::AppMessage {
                     id: message_id,
+                    level: 0,
                     msg: encrypted_msg.clone(),
                 });
             }
@@ -1406,6 +1479,7 @@ where
                     }
                 }
 
+                self.received_seqs.confirm_compaction(&watermark);
                 self.compaction_state.reset_counts_up_to(level);
                 self.compaction_state.record_entry(usize::from(level));
 
@@ -1497,16 +1571,10 @@ where
             return;
         };
 
-        let key = (sender_fp, seq);
-        if self.seen_messages.contains(&key) {
+        if self.received_seqs.contains(sender_fp, seq) {
             return;
         }
-        self.seen_messages.insert(key);
-
-        let hw = self.state_vector.entry(sender_fp).or_insert(0);
-        if seq > *hw {
-            *hw = seq;
-        }
+        self.received_seqs.record(sender_fp, seq);
 
         match &auth_data {
             AuthData::Update { .. } => {
@@ -1538,7 +1606,7 @@ where
             return;
         }
 
-        let watermark = self.state_vector.clone();
+        let watermark = self.received_seqs.watermark();
 
         if !self.encrypt_and_send_to_acceptors(&snapshot, level, &watermark) {
             let _ =
@@ -1593,7 +1661,7 @@ where
     ) -> bool {
         let seq = self.message_seq;
         self.message_seq += 1;
-        self.state_vector.insert(self.own_fingerprint, seq);
+        self.received_seqs.record(self.own_fingerprint, seq);
 
         let authenticated_data =
             match AuthData::compaction(seq, level, watermark.clone()).to_bytes() {
@@ -1649,6 +1717,7 @@ where
             if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
                 let _ = tx.try_send(AcceptorOutbound::AppMessage {
                     id: message_id,
+                    level,
                     msg: encrypted_msg.clone(),
                 });
             }
@@ -1805,5 +1874,116 @@ mod tests {
         for r in 0..6 {
             assert_eq!(base(r + 1), base(r) * 2);
         }
+    }
+
+    #[test]
+    fn sender_seqs_contiguous_watermark() {
+        let mut seqs = SenderSeqs::default();
+
+        seqs.record(1);
+        seqs.record(2);
+        seqs.record(5);
+        seqs.record(6);
+
+        assert_eq!(seqs.watermark(), 2);
+    }
+
+    #[test]
+    fn sender_seqs_no_gaps() {
+        let mut seqs = SenderSeqs::default();
+
+        seqs.record(1);
+        seqs.record(2);
+        seqs.record(3);
+
+        assert_eq!(seqs.watermark(), 3);
+    }
+
+    #[test]
+    fn sender_seqs_out_of_order_fills_gap() {
+        let mut seqs = SenderSeqs::default();
+
+        seqs.record(1);
+        seqs.record(3);
+        assert_eq!(seqs.watermark(), 1);
+
+        seqs.record(2);
+        assert_eq!(seqs.watermark(), 3);
+    }
+
+    #[test]
+    fn sender_seqs_confirm_compaction_prunes() {
+        let mut seqs = SenderSeqs::default();
+
+        seqs.record(1);
+        seqs.record(2);
+        seqs.record(3);
+        seqs.record(5);
+
+        seqs.confirm_compaction(2);
+
+        assert_eq!(seqs.confirmed, 2);
+        assert!(seqs.contains(1));
+        assert!(seqs.contains(2));
+        assert!(seqs.contains(3));
+        assert!(!seqs.contains(4));
+        assert!(seqs.contains(5));
+
+        assert_eq!(seqs.watermark(), 3);
+    }
+
+    #[test]
+    fn sender_seqs_contains_checks_confirmed() {
+        let mut seqs = SenderSeqs::default();
+
+        seqs.record(1);
+        seqs.record(2);
+        seqs.confirm_compaction(2);
+
+        assert!(seqs.contains(1));
+        assert!(seqs.contains(2));
+        assert!(!seqs.contains(3));
+    }
+
+    #[test]
+    fn received_seqs_multiple_senders() {
+        let mut rs = ReceivedSeqs::new();
+        let sender_a = MemberFingerprint([0xAA; 8]);
+        let sender_b = MemberFingerprint([0xBB; 8]);
+
+        rs.record(sender_a, 1);
+        rs.record(sender_a, 2);
+        rs.record(sender_a, 5);
+
+        rs.record(sender_b, 1);
+        rs.record(sender_b, 2);
+        rs.record(sender_b, 3);
+
+        let wm = rs.watermark();
+        assert_eq!(wm.get(&sender_a), Some(&2));
+        assert_eq!(wm.get(&sender_b), Some(&3));
+    }
+
+    #[test]
+    fn received_seqs_confirm_compaction() {
+        let mut rs = ReceivedSeqs::new();
+        let sender = MemberFingerprint([0xCC; 8]);
+
+        rs.record(sender, 1);
+        rs.record(sender, 2);
+        rs.record(sender, 3);
+
+        let mut watermark = StateVector::new();
+        watermark.insert(sender, 2);
+        rs.confirm_compaction(&watermark);
+
+        assert!(rs.contains(sender, 1));
+        assert!(rs.contains(sender, 2));
+        assert!(rs.contains(sender, 3));
+        assert!(!rs.contains(sender, 4));
+
+        rs.record(sender, 4);
+        let wm = rs.watermark();
+        assert_eq!(wm.get(&sender), Some(&4));
     }
 }

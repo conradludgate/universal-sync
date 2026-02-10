@@ -109,9 +109,7 @@ join epoch. On reconnect (`get_group()`), they load the nearest
 epoch 0. See [ACCEPTOR-STORAGE.md](ACCEPTOR-STORAGE.md).
 
 Proposal validation uses the in-memory `ExternalGroup` roster (current or
-future epochs). Historical epoch roster lookup is not yet implemented
-(returns `None` for past epochs with a TODO for reconstruction from
-snapshots).
+future epochs). Historical epoch roster lookup has been implemented.
 
 ### Quorum
 
@@ -187,6 +185,8 @@ All issues identified in this review have been implemented.
 |-------|----------|--------|----------|
 | No proactive commit catch-up on proposer reconnect | **High** | **Implemented** | [COMMIT-CATCHUP.md](COMMIT-CATCHUP.md) |
 | Acceptor promise sentinel TOCTOU panic | **High** | **Implemented** | [ACCEPTOR-PROMISE-RACE.md](ACCEPTOR-PROMISE-RACE.md) |
+| Incremental L1 compaction deletes prior L1 | **High** | **Implemented** | [MESSAGE-STORE-KEY-FORMAT.md](MESSAGE-STORE-KEY-FORMAT.md) |
+| Watermark over-claims due to message gaps | **High** | **Implemented** | [CONTIGUOUS-WATERMARK.md](CONTIGUOUS-WATERMARK.md) |
 | All members drive compaction simultaneously | **Medium** | **Implemented** | [COMPACTION-LEADER-ELECTION.md](COMPACTION-LEADER-ELECTION.md) |
 | Removed member edits silently dropped | **Medium** | **Implemented** | [REMOVED-MEMBER-EDITS.md](REMOVED-MEMBER-EDITS.md) |
 | Out-of-order app messages cause permanent key loss | **Medium** | **Implemented** | mls-rs `out_of_order` feature enabled |

@@ -323,6 +323,7 @@ impl Versioned for MessageResponse {
 pub enum MessageRequest {
     Send {
         id: MessageId,
+        level: u8,
         message: EncryptedAppMessage,
     },
     Subscribe {
@@ -462,6 +463,7 @@ mod tests {
                 sender: MemberFingerprint([1u8; 8]),
                 seq: 1,
             },
+            level: 0,
             message: EncryptedAppMessage {
                 ciphertext: Bytes::from_static(&[10, 20]),
             },
