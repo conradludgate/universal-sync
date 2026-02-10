@@ -211,10 +211,6 @@ impl<E: EventEmitter> DocumentActor<E> {
                 let result = self.update_keys().await;
                 let _ = reply.send(result);
             }
-            DocRequest::GenerateExternalInvite { reply } => {
-                let result = self.generate_external_invite().await;
-                let _ = reply.send(result);
-            }
             DocRequest::UpdateCursor { anchor, head } => {
                 self.crdt.set_cursor(anchor, head);
                 if let Err(e) = self.group.send_update(&mut self.crdt).await {
@@ -395,16 +391,6 @@ impl<E: EventEmitter> DocumentActor<E> {
             .update_keys()
             .await
             .map_err(|e| format!("failed to update keys: {e:?}"))
-    }
-
-    async fn generate_external_invite(&mut self) -> Result<String, String> {
-        let group_info_bytes = self
-            .group
-            .generate_external_group_info()
-            .await
-            .map_err(|e| format!("failed to generate invite: {e:?}"))?;
-
-        Ok(bs58::encode(group_info_bytes).into_string())
     }
 
     fn emit_text_update(&self, delta_buf: &Arc<Mutex<Vec<Delta>>>) {

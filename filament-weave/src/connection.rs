@@ -168,9 +168,6 @@ impl ConnectionManager {
             HandshakeResponse::Error(e) => {
                 return Err(Report::new(ConnectorError).attach(e));
             }
-            HandshakeResponse::Data(_) => {
-                return Err(Report::new(ConnectorError).attach("unexpected Data response"));
-            }
         }
 
         Ok((writer, reader))

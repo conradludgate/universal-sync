@@ -16,7 +16,7 @@ and waste resources.
 but did not consider whether *this* member should be the one to drive
 compaction. Every member that saw the threshold would emit the event.
 
-Force-compaction paths (`Add`, `ExternalInit`) emitted `CompactionNeeded`
+Force-compaction paths (`Add`) emitted `CompactionNeeded`
 on **all** weavers unconditionally.
 
 An unused `CompactionClaim` scaffolding (`submit_compaction_claim`,
@@ -58,30 +58,13 @@ selection in `rendezvous.rs`.
 committer (the weaver that issued the Add commit), checked via
 `committer_fingerprint == Some(self.own_fingerprint)`.
 
-### ExternalInit compaction (invited_by)
-
-When a member joins via external commit, the inviter's fingerprint is
-embedded in the MLS commit's `authenticated_data` so only the inviter
-compacts:
-
-1. `GroupInfoExt` carries `invited_by: Option<MemberFingerprint>`, set
-   when generating GroupInfo for external commit
-2. The joiner extracts it and passes it via
-   `ExternalCommitBuilder::with_authenticated_data()`
-3. Existing weavers read `CommitMessageDescription::authenticated_data`
-   and decode the inviter fingerprint
-4. Only the inviter emits `CompactionNeeded { force: true }`
-
-If `authenticated_data` is empty or unparsable (old clients), no weaver
-compacts on that `ExternalInit` — the threshold path catches up eventually.
-
 ### Cascade guard in handle_compact_snapshot
 
 Before executing compaction, `handle_compact_snapshot` re-checks
 `cascade_target()`. If another weaver's `CompactionComplete` was processed
 since `CompactionNeeded` was emitted, the counts will have been reset and
 the compaction is skipped. This guard is bypassed for forced compactions
-(Add/ExternalInit).
+(Add).
 
 ### Dead code cleanup
 

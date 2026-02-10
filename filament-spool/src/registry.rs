@@ -254,64 +254,6 @@ where
         }
     }
 
-    pub fn export_tree(
-        &self,
-        group_id: &GroupId,
-        confirmed_transcript_hash: &[u8],
-    ) -> Option<Vec<u8>> {
-        let (acceptor, _state) = self.get_group(group_id)?;
-        if acceptor.confirmed_transcript_hash() != confirmed_transcript_hash {
-            return None;
-        }
-        acceptor.export_tree().ok()
-    }
-
-    /// Apply an external commit through the spool's Paxos identity.
-    ///
-    /// The MLS commit is validated by `ExternalGroup::process_incoming_message`
-    /// during `apply()`. If the commit is invalid the error propagates back.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistryError`] if the group is not found, the MLS message
-    /// is invalid, or applying the commit fails.
-    pub async fn apply_external_commit(
-        &self,
-        mls_message: MlsMessage,
-    ) -> Result<(), Report<RegistryError>> {
-        let group_id = mls_message
-            .group_id()
-            .map(GroupId::from_slice)
-            .ok_or_else(|| Report::new(RegistryError).attach("MLS message has no group_id"))?;
-
-        let (mut acceptor, state) = self
-            .get_group(&group_id)
-            .ok_or_else(|| Report::new(RegistryError).attach("group not found"))?;
-
-        let message = filament_core::GroupMessage::new(mls_message);
-        let proposal = acceptor.propose(filament_core::Attempt(0));
-
-        filament_warp::Learner::apply(&mut acceptor, proposal.clone(), message.clone())
-            .await
-            .change_context(RegistryError)
-            .attach("external commit apply failed")?;
-
-        // Persist and broadcast so connected members receive the commit.
-        state
-            .store_and_broadcast(&proposal, &message)
-            .change_context(RegistryError)
-            .attach("failed to store accepted commit")?;
-
-        let new_epoch = acceptor.current_round();
-        self.notify_epoch_learned(&group_id, new_epoch);
-
-        if let Ok(snapshot_bytes) = acceptor.snapshot_bytes() {
-            let _ = state.store_snapshot(new_epoch, &snapshot_bytes);
-        }
-
-        Ok(())
-    }
-
     fn ensure_epoch_watcher_and_learning(
         &self,
         group_id: GroupId,

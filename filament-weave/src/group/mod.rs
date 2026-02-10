@@ -45,16 +45,12 @@ impl fmt::Display for WeaverError {
 
 impl std::error::Error for WeaverError {}
 
-/// Build `GroupInfo` extensions containing the acceptor list and optional inviter.
+/// Build `GroupInfo` extensions containing the acceptor list.
 #[must_use]
 pub(crate) fn group_info_ext_list(
     acceptors: impl IntoIterator<Item = AcceptorId>,
-    invited_by: Option<filament_core::MemberFingerprint>,
 ) -> mls_rs::ExtensionList {
-    let mut ext = GroupInfoExt::new(acceptors);
-    if let Some(fp) = invited_by {
-        ext = ext.with_invited_by(fp);
-    }
+    let ext = GroupInfoExt::new(acceptors);
     let mut extensions = mls_rs::ExtensionList::default();
     extensions
         .set_from(ext)
@@ -67,52 +63,10 @@ pub(crate) fn group_info_with_ext<C: mls_rs::client_builder::MlsConfig>(
     group: &mls_rs::Group<C>,
     acceptors: impl IntoIterator<Item = AcceptorId>,
 ) -> Result<MlsMessage, Report<WeaverError>> {
-    let extensions = group_info_ext_list(acceptors, None);
+    let extensions = group_info_ext_list(acceptors);
     group
         .group_info_message_internal(extensions, true)
         .change_context(WeaverError)
-}
-
-/// Metadata extracted from a serialized `GroupInfo` for external commit joining.
-pub struct GroupInfoMetadata {
-    pub group_id: GroupId,
-    pub acceptor_ids: Vec<AcceptorId>,
-    pub confirmed_transcript_hash: Vec<u8>,
-}
-
-/// Parse a serialized `GroupInfo` and extract the metadata needed for external
-/// commit joining (group ID, acceptor list, confirmed transcript hash).
-///
-/// # Errors
-///
-/// Returns [`WeaverError`] if the bytes cannot be parsed as an MLS message
-/// or are not a valid `GroupInfo`.
-pub fn parse_group_info_metadata(
-    group_info_bytes: &[u8],
-) -> Result<GroupInfoMetadata, Report<WeaverError>> {
-    let msg = MlsMessage::from_bytes(group_info_bytes)
-        .change_context(WeaverError)
-        .attach("failed to parse GroupInfo")?;
-
-    let gi = msg
-        .as_group_info()
-        .ok_or_else(|| Report::new(WeaverError).attach("MLS message is not a GroupInfo"))?;
-
-    let group_id = GroupId::from_slice(&gi.group_context().group_id);
-    let confirmed_transcript_hash = gi.group_context().confirmed_transcript_hash.to_vec();
-
-    let acceptor_ids = gi
-        .extensions()
-        .get_as::<GroupInfoExt>()
-        .ok()
-        .flatten()
-        .map_or_else(Vec::new, |e| e.acceptors);
-
-    Ok(GroupInfoMetadata {
-        group_id,
-        acceptor_ids,
-        confirmed_transcript_hash,
-    })
 }
 
 enum GroupRequest {
@@ -148,9 +102,6 @@ enum GroupRequest {
         level: u8,
         force: bool,
         reply: oneshot::Sender<Result<(), Report<WeaverError>>>,
-    },
-    GenerateExternalGroupInfo {
-        reply: oneshot::Sender<Result<Vec<u8>, Report<WeaverError>>>,
     },
     Shutdown,
 }
@@ -449,100 +400,6 @@ impl Weaver {
         })
     }
 
-    /// Join a group via external commit. Returns the group handle, the
-    /// external commit bytes (to be submitted to a spool), and join metadata.
-    #[allow(clippy::unused_async)]
-    pub(crate) async fn join_external<C, CS>(
-        client: &Client<C>,
-        signer: SignatureSecretKey,
-        cipher_suite: CS,
-        connection_manager: &ConnectionManager,
-        group_info_bytes: &[u8],
-        tree_data: mls_rs::group::ExportedTree<'static>,
-    ) -> Result<(JoinInfo, Vec<u8>), Report<WeaverError>>
-    where
-        C: MlsConfig + Clone + Send + Sync + 'static,
-        CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
-    {
-        let (learner, group_id, protocol_name, commit_bytes, key_rotation_interval_secs) =
-            blocking(|| {
-                let group_info_msg = MlsMessage::from_bytes(group_info_bytes)
-                    .change_context(WeaverError)
-                    .attach("failed to parse GroupInfo for external commit")?;
-
-                // Extract acceptors and inviter from GroupInfo extensions before consuming it.
-                let gi_ext: Option<GroupInfoExt> = group_info_msg
-                    .as_group_info()
-                    .and_then(|gi| gi.extensions().get_as::<GroupInfoExt>().ok().flatten());
-
-                let acceptor_ids: Vec<AcceptorId> = gi_ext
-                    .as_ref()
-                    .map_or_else(Vec::new, |e| e.acceptors.clone());
-
-                let invited_by_aad = gi_ext
-                    .as_ref()
-                    .and_then(|e| e.invited_by)
-                    .and_then(|fp| postcard::to_allocvec(&fp).ok())
-                    .unwrap_or_default();
-
-                let (group, commit_msg) = client
-                    .external_commit_builder()
-                    .change_context(WeaverError)?
-                    .with_tree_data(tree_data)
-                    .with_authenticated_data(invited_by_aad)
-                    .build(group_info_msg)
-                    .change_context(WeaverError)
-                    .attach("external commit failed")?;
-
-                let commit_bytes = commit_msg
-                    .to_bytes()
-                    .change_context(WeaverError)
-                    .attach("failed to serialize external commit")?;
-
-                let mls_group_id = group.context().group_id.clone();
-                let group_id = GroupId::from_slice(&mls_group_id);
-
-                let group_ctx = group
-                    .context()
-                    .extensions
-                    .get_as::<GroupContextExt>()
-                    .change_context(WeaverError)?;
-
-                let protocol_name = group_ctx
-                    .as_ref()
-                    .map_or_else(|| "none".to_owned(), |e| e.protocol_name.clone());
-
-                let key_rotation_interval_secs = group_ctx
-                    .as_ref()
-                    .and_then(|e| e.key_rotation_interval_secs);
-
-                let learner = WeaverLearner::new(group, signer, cipher_suite, acceptor_ids);
-
-                Ok::<_, Report<WeaverError>>((
-                    learner,
-                    group_id,
-                    protocol_name,
-                    commit_bytes,
-                    key_rotation_interval_secs,
-                ))
-            })?;
-
-        let group = Self::spawn_actors(
-            learner,
-            group_id,
-            connection_manager.endpoint().clone(),
-            connection_manager.clone(),
-            key_rotation_interval_secs,
-        );
-
-        let join_info = JoinInfo {
-            group,
-            protocol_name,
-        };
-
-        Ok((join_info, commit_bytes))
-    }
-
     fn spawn_actors<C, CS>(
         learner: WeaverLearner<C, CS>,
         group_id: GroupId,
@@ -667,29 +524,6 @@ impl Weaver {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
             .send(GroupRequest::UpdateKeys { reply: reply_tx })
-            .await
-            .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
-
-        reply_rx
-            .await
-            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))?
-    }
-
-    /// Generate a serialized `GroupInfo` suitable for external commit joins.
-    ///
-    /// The returned bytes include the `ExternalPubExt` so a joiner can
-    /// perform an external commit. The ratchet tree is excluded and must
-    /// be fetched separately from a spool.
-    ///
-    /// The raw bytes can be encoded directly into a QR code.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WeaverError`] if the group actor is closed or generation fails.
-    pub async fn generate_external_group_info(&self) -> Result<Vec<u8>, Report<WeaverError>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.request_tx
-            .send(GroupRequest::GenerateExternalGroupInfo { reply: reply_tx })
             .await
             .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
 
@@ -916,11 +750,15 @@ impl Weaver {
     }
 }
 
-/// Waits for an incoming welcome message on the endpoint.
-/// Should be called before the group leader calls `add_member`.
-pub(crate) async fn wait_for_welcome(
+pub(crate) enum IncomingHandshake {
+    Welcome(bytes::Bytes),
+    KeyPackage(GroupId, Vec<u8>),
+}
+
+/// Waits for an incoming handshake (welcome or key package) on the endpoint.
+pub(crate) async fn wait_for_incoming(
     endpoint: &Endpoint,
-) -> Result<bytes::Bytes, Report<WeaverError>> {
+) -> Result<IncomingHandshake, Report<WeaverError>> {
     use futures::StreamExt;
     use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
@@ -950,12 +788,16 @@ pub(crate) async fn wait_for_welcome(
     match handshake {
         Handshake::SendWelcome { welcome } => {
             let bytes = welcome.to_bytes().change_context(WeaverError)?;
-            Ok(bytes.into())
+            Ok(IncomingHandshake::Welcome(bytes.into()))
         }
-        _ => {
-            Err(Report::new(WeaverError)
-                .attach("expected SendWelcome handshake, got something else"))
+        Handshake::SendKeyPackage {
+            group_id,
+            key_package,
+        } => {
+            let bytes = key_package.to_bytes().change_context(WeaverError)?;
+            Ok(IncomingHandshake::KeyPackage(group_id, bytes))
         }
+        _ => Err(Report::new(WeaverError).attach("unexpected handshake type on client endpoint")),
     }
 }
 

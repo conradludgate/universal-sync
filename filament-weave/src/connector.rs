@@ -63,9 +63,6 @@ pub(crate) async fn register_group(
             Err(Report::new(ConnectorError).attach(format!("invalid group info: {e}")))
         }
         HandshakeResponse::Error(e) => Err(Report::new(ConnectorError).attach(e)),
-        HandshakeResponse::Data(_) => {
-            Err(Report::new(ConnectorError).attach("unexpected Data response"))
-        }
     }
 }
 

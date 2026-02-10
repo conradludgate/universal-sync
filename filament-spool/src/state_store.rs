@@ -733,13 +733,7 @@ impl GroupStateStore {
 
     /// Store an accepted proposal and broadcast it to subscribers.
     ///
-    /// Unlike `AcceptorStateStore::accept`, this bypasses the Paxos promise
-    /// check. Used for external commits where the spool validates the MLS
-    /// message directly and needs to distribute the result.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`fjall::Error`] if the storage write fails.
+    #[cfg(test)]
     pub(crate) fn store_and_broadcast(
         &self,
         proposal: &GroupProposal,

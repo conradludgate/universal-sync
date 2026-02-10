@@ -70,20 +70,33 @@ export function JoinSection({ onDocumentJoined }: JoinSectionProps) {
     }
   }, [inviteCode, showToast]);
 
-  const handleJoinExternal = useCallback(async () => {
+  const handleJoinViaInvite = useCallback(async () => {
     const code = externalInvite.trim();
     if (!code) {
-      showToast("Paste an external invite code", "error");
+      showToast("Paste an invite code first", "error");
       return;
     }
-    setExternalJoining(true);
     try {
-      const doc = await tauri.joinExternal(code);
-      onDocumentJoined(doc);
-      showToast("Joined document!", "success");
-      setExternalInvite("");
+      setExternalJoining(true);
+      // Send key package (non-blocking — returns once sent)
+      await tauri.joinExternal(code);
+      showToast("Key package sent! Waiting for welcome…", "success");
     } catch (error) {
-      console.error("External join error:", error);
+      console.error("Failed to send key package:", error);
+      showToast(`Failed to join: ${error}`, "error");
+      setExternalJoining(false);
+      return;
+    }
+    // Wait for the welcome in the background
+    try {
+      const doc = await tauri.recvWelcome();
+      if (doc) {
+        showToast("Joined document!", "success");
+        onDocumentJoined(doc);
+        setExternalInvite("");
+      }
+    } catch (error) {
+      console.error("Failed to receive welcome:", error);
       showToast(`Failed to join: ${error}`, "error");
     } finally {
       setExternalJoining(false);
@@ -142,23 +155,22 @@ export function JoinSection({ onDocumentJoined }: JoinSectionProps) {
           </div>
         )}
       </div>
-
-      <div className="sidebar-section-header" style={{ marginTop: "0.75rem" }}>
-        <span className="sidebar-section-title">Join with Invite</span>
-      </div>
-      <div className="join-inline">
+      <div className="join-inline" style={{ marginTop: "0.5rem" }}>
+        <label>
+          <span>Join with Invite</span>
+        </label>
         <div className="peer-input-row">
           <textarea
             className="input-textarea"
-            placeholder="Paste external invite code..."
+            placeholder="Paste invite code…"
             rows={3}
             value={externalInvite}
             onChange={(e) => setExternalInvite(e.target.value)}
           />
           <button
             className="btn btn-primary btn-sm"
-            onClick={handleJoinExternal}
-            disabled={externalJoining}
+            onClick={handleJoinViaInvite}
+            disabled={externalJoining || !externalInvite.trim()}
           >
             {externalJoining ? "Joining…" : "Join"}
           </button>

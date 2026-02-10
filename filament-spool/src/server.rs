@@ -173,15 +173,9 @@ where
         Handshake::JoinMessages(group_id, subscriber) => {
             handle_message_stream(group_id, subscriber, reader, writer, registry).await
         }
-        Handshake::SendWelcome { .. } => {
-            Err(Report::new(ConnectorError).attach("acceptors do not handle welcome messages"))
-        }
-        Handshake::FetchTree {
-            group_id,
-            confirmed_transcript_hash,
-        } => handle_fetch_tree(group_id, confirmed_transcript_hash, writer, registry).await,
-        Handshake::ExternalCommit { commit } => {
-            handle_external_commit(commit, writer, registry).await
+        Handshake::SendWelcome { .. } | Handshake::SendKeyPackage { .. } => {
+            Err(Report::new(ConnectorError)
+                .attach("acceptors do not handle welcome or key package messages"))
         }
     }
 }
@@ -413,53 +407,5 @@ where
         }
     }
 
-    Ok(())
-}
-
-async fn handle_fetch_tree<C, CS>(
-    group_id: GroupId,
-    confirmed_transcript_hash: bytes::Bytes,
-    mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
-    registry: AcceptorRegistry<C, CS>,
-) -> Result<(), Report<ConnectorError>>
-where
-    C: ExternalMlsConfig + Clone + Send + Sync + 'static,
-    CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
-{
-    let response = match registry.export_tree(&group_id, &confirmed_transcript_hash) {
-        Some(tree_bytes) => HandshakeResponse::Data(tree_bytes.into()),
-        None => HandshakeResponse::GroupNotFound,
-    };
-    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
-    writer
-        .send(response_bytes.into())
-        .await
-        .change_context(ConnectorError)?;
-    debug!(?group_id, "fetched ratchet tree");
-    Ok(())
-}
-
-async fn handle_external_commit<C, CS>(
-    commit: MlsMessage,
-    mut writer: FramedWrite<SendStream, LengthDelimitedCodec>,
-    registry: AcceptorRegistry<C, CS>,
-) -> Result<(), Report<ConnectorError>>
-where
-    C: ExternalMlsConfig + Clone + Send + Sync + 'static,
-    CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
-{
-    let result = registry.apply_external_commit(commit).await;
-    let response = match result {
-        Ok(()) => HandshakeResponse::Ok,
-        Err(e) => {
-            warn!(?e, "external commit rejected");
-            HandshakeResponse::Error(format!("{e:?}"))
-        }
-    };
-    let response_bytes = postcard::to_allocvec(&response).change_context(ConnectorError)?;
-    writer
-        .send(response_bytes.into())
-        .await
-        .change_context(ConnectorError)?;
     Ok(())
 }

@@ -31,6 +31,7 @@ pub struct WeaverClient {
     cipher_suite: WeaverCipherSuite,
     connection_manager: ConnectionManager,
     welcome_rx: mpsc::Receiver<bytes::Bytes>,
+    key_package_rx: mpsc::Receiver<(filament_core::GroupId, Vec<u8>)>,
 }
 
 impl WeaverClient {
@@ -66,11 +67,12 @@ impl WeaverClient {
             .build();
 
         let (welcome_tx, welcome_rx) = mpsc::channel(16);
+        let (key_package_tx, key_package_rx) = mpsc::channel(16);
         let connection_manager = ConnectionManager::new(endpoint);
 
         let endpoint_clone = connection_manager.endpoint().clone();
         tokio::spawn(async move {
-            Self::welcome_acceptor_loop(endpoint_clone, welcome_tx).await;
+            Self::incoming_loop(endpoint_clone, welcome_tx, key_package_tx).await;
         });
 
         Self {
@@ -79,22 +81,39 @@ impl WeaverClient {
             cipher_suite,
             connection_manager,
             welcome_rx,
+            key_package_rx,
         }
     }
 
-    async fn welcome_acceptor_loop(endpoint: Endpoint, tx: mpsc::Sender<bytes::Bytes>) {
+    async fn incoming_loop(
+        endpoint: Endpoint,
+        welcome_tx: mpsc::Sender<bytes::Bytes>,
+        key_package_tx: mpsc::Sender<(filament_core::GroupId, Vec<u8>)>,
+    ) {
+        use crate::group::IncomingHandshake;
         loop {
-            match crate::group::wait_for_welcome(&endpoint).await {
-                Ok(welcome_bytes) => {
-                    if tx.send(welcome_bytes).await.is_err() {
+            match crate::group::wait_for_incoming(&endpoint).await {
+                Ok(IncomingHandshake::Welcome(bytes)) => {
+                    if welcome_tx.send(bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(IncomingHandshake::KeyPackage(group_id, bytes)) => {
+                    if key_package_tx.send((group_id, bytes)).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(?e, "welcome acceptor error (may be normal on shutdown)");
+                    tracing::debug!(?e, "incoming handshake error (may be normal on shutdown)");
                 }
             }
         }
+    }
+
+    /// Returns this client's iroh endpoint public key (32 bytes).
+    #[must_use]
+    pub fn endpoint_id(&self) -> [u8; 32] {
+        *self.connection_manager.endpoint().id().as_bytes()
     }
 
     /// Generate a serialised key package containing this client's endpoint identity.
@@ -174,124 +193,73 @@ impl WeaverClient {
         std::mem::replace(&mut self.welcome_rx, empty_rx)
     }
 
-    /// Join a group via an external commit using raw `GroupInfo` bytes.
-    ///
-    /// 1. Parses the `GroupInfo` to extract the acceptor list and
-    ///    confirmed transcript hash.
-    /// 2. Connects to a spool and fetches the ratchet tree.
-    /// 3. Creates an external commit using the `GroupInfo` + tree.
-    /// 4. Submits the commit back to the spool.
+    /// Receive the next key package sent by a remote peer, or wait for one.
+    /// Returns `None` on shutdown.
+    pub async fn recv_key_package(&mut self) -> Option<(filament_core::GroupId, Vec<u8>)> {
+        self.key_package_rx.recv().await
+    }
+
+    /// Take the key-package receiver for use in a `select!` loop.
+    /// After this, `recv_key_package` will always return `None`.
+    pub fn take_key_package_rx(&mut self) -> mpsc::Receiver<(filament_core::GroupId, Vec<u8>)> {
+        let (_, empty_rx) = mpsc::channel(1);
+        std::mem::replace(&mut self.key_package_rx, empty_rx)
+    }
+
+    /// Send this client's key package to a remote peer, requesting to join
+    /// the given group. The remote peer will receive a `KeyPackage` event
+    /// and can call `add_member` with it.
     ///
     /// # Errors
     ///
-    /// Returns [`WeaverError`] if any step fails.
-    pub async fn join_external(
+    /// Returns [`WeaverError`] if key package generation, connecting, or
+    /// sending fails.
+    pub async fn send_key_package(
         &self,
-        group_info_bytes: &[u8],
-    ) -> Result<JoinInfo, Report<WeaverError>> {
-        use filament_core::{Handshake, HandshakeResponse, PAXOS_ALPN};
-        use futures::{SinkExt, StreamExt};
+        target: [u8; 32],
+        group_id: filament_core::GroupId,
+    ) -> Result<(), Report<WeaverError>> {
+        use filament_core::{Handshake, PAXOS_ALPN};
+        use futures::SinkExt;
         use iroh::PublicKey;
-        use mls_rs::group::ExportedTree;
 
-        let metadata = crate::group::parse_group_info_metadata(group_info_bytes)?;
+        let key_package_bytes = self.generate_key_package()?;
+        let key_package = MlsMessage::from_bytes(&key_package_bytes).change_context(WeaverError)?;
 
-        let spool_id = metadata
-            .acceptor_ids
-            .first()
-            .ok_or_else(|| Report::new(WeaverError).attach("GroupInfo has no acceptors"))?;
+        let public_key = PublicKey::from_bytes(&target)
+            .map_err(|_| Report::new(WeaverError).attach("invalid target public key"))?;
 
         let endpoint = self.connection_manager.endpoint();
-        let spool_public_key = PublicKey::from_bytes(spool_id.as_bytes())
-            .map_err(|_| Report::new(WeaverError).attach("invalid spool public key"))?;
-
-        let send_handshake = |handshake: Handshake| {
-            let endpoint = endpoint.clone();
-            async move {
-                let conn = endpoint
-                    .connect(spool_public_key, PAXOS_ALPN)
-                    .await
-                    .change_context(WeaverError)
-                    .attach("failed to connect to spool")?;
-
-                let (send, recv) = conn.open_bi().await.change_context(WeaverError)?;
-                let codec = tokio_util::codec::LengthDelimitedCodec::builder()
-                    .max_frame_length(16 * 1024 * 1024)
-                    .new_codec();
-                let mut writer = tokio_util::codec::FramedWrite::new(send, codec.clone());
-                let mut reader = tokio_util::codec::FramedRead::new(recv, codec);
-
-                let hs_bytes = postcard::to_allocvec(&handshake).change_context(WeaverError)?;
-
-                writer
-                    .send(hs_bytes.into())
-                    .await
-                    .change_context(WeaverError)?;
-
-                let resp_bytes = reader
-                    .next()
-                    .await
-                    .ok_or_else(|| Report::new(WeaverError).attach("spool closed before response"))?
-                    .change_context(WeaverError)?;
-
-                let resp: HandshakeResponse =
-                    postcard::from_bytes(&resp_bytes).change_context(WeaverError)?;
-
-                Ok::<_, Report<WeaverError>>(resp)
-            }
-        };
-
-        // Fetch the ratchet tree from spool.
-        let resp = send_handshake(Handshake::FetchTree {
-            group_id: metadata.group_id,
-            confirmed_transcript_hash: metadata.confirmed_transcript_hash.into(),
-        })
-        .await?;
-
-        let tree_bytes = match resp {
-            HandshakeResponse::Data(data) => data,
-            HandshakeResponse::GroupNotFound => {
-                return Err(Report::new(WeaverError).attach("ratchet tree not found on spool"));
-            }
-            other => {
-                return Err(Report::new(WeaverError)
-                    .attach(format!("unexpected spool response: {other:?}")));
-            }
-        };
-
-        let tree_data = ExportedTree::from_bytes(&tree_bytes)
+        let conn = endpoint
+            .connect(public_key, PAXOS_ALPN)
+            .await
             .change_context(WeaverError)
-            .attach("failed to parse ratchet tree")?;
+            .attach("failed to connect to target")?;
 
-        // Create external commit with the tree data.
-        let (join_info, commit_bytes) = Weaver::join_external(
-            &self.client,
-            self.signer.clone(),
-            self.cipher_suite.clone(),
-            &self.connection_manager,
-            group_info_bytes,
-            tree_data,
-        )
-        .await?;
+        let (send, _recv) = conn.open_bi().await.change_context(WeaverError)?;
+        let mut framed = tokio_util::codec::FramedWrite::new(
+            send,
+            tokio_util::codec::LengthDelimitedCodec::new(),
+        );
 
-        // Submit external commit to spool.
-        let commit = MlsMessage::from_bytes(&commit_bytes).change_context(WeaverError)?;
-        let resp = send_handshake(Handshake::ExternalCommit { commit }).await?;
+        let handshake = Handshake::SendKeyPackage {
+            group_id,
+            key_package,
+        };
+        let hs_bytes = postcard::to_allocvec(&handshake).change_context(WeaverError)?;
+        framed
+            .send(hs_bytes.into())
+            .await
+            .change_context(WeaverError)?;
 
-        match resp {
-            HandshakeResponse::Ok => {}
-            HandshakeResponse::Error(e) => {
-                return Err(
-                    Report::new(WeaverError).attach(format!("external commit rejected: {e}"))
-                );
-            }
-            other => {
-                return Err(Report::new(WeaverError)
-                    .attach(format!("unexpected commit response: {other:?}")));
-            }
-        }
+        let mut send = framed.into_inner();
+        send.finish().change_context(WeaverError)?;
+        // stopped() may return an error if the peer closes the connection
+        // before explicitly stopping the stream — that's fine, finish()
+        // already ensures the data is flushed.
+        let _ = send.stopped().await;
 
-        Ok(join_info)
+        Ok(())
     }
 }
 

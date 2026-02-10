@@ -14,7 +14,7 @@ export const joinDocumentBytes = (welcomeB58: string) =>
   invoke<DocumentInfo>("join_document_bytes", { welcomeB58 });
 
 export const joinExternal = (inviteB58: string) =>
-  invoke<DocumentInfo>("join_external", { inviteB58 });
+  invoke<void>("join_external", { inviteB58 });
 
 export const generateExternalInvite = (groupId: string) =>
   invoke<string>("generate_external_invite", { groupId });

@@ -259,8 +259,6 @@ impl MlsCodecExtension for LeafNodeExt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInfoExt {
     pub acceptors: Vec<AcceptorId>,
-    #[serde(default)]
-    pub invited_by: Option<MemberFingerprint>,
 }
 
 impl GroupInfoExt {
@@ -268,14 +266,7 @@ impl GroupInfoExt {
     pub fn new(acceptors: impl IntoIterator<Item = AcceptorId>) -> Self {
         Self {
             acceptors: acceptors.into_iter().collect(),
-            invited_by: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_invited_by(mut self, fingerprint: MemberFingerprint) -> Self {
-        self.invited_by = Some(fingerprint);
-        self
     }
 
     #[must_use]

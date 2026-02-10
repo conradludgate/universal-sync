@@ -2275,56 +2275,20 @@ async fn test_multi_acceptor_message_delivery() {
 }
 
 // =============================================================================
-// External Commit Tests
+// Key Package Send Tests
 // =============================================================================
 
-/// Test 1: Happy path external commit join.
-///
-/// The GroupInfo payload (without ratchet tree) must fit in a QR code.
-/// Version 15 QR at medium EC holds 412 binary bytes.
+/// Bob sends his key package directly to Alice's endpoint. Alice receives
+/// it, calls add_member, and Bob joins via the resulting welcome.
 #[tokio::test]
-async fn test_external_group_info_fits_qr_code() {
-    init_tracing();
-    let discovery = TestAddressLookup::new();
-
-    let (_acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
-    let alice_group = alice
-        .create(std::slice::from_ref(&acceptor_id), "none")
-        .await
-        .expect("create group");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let group_info_bytes = alice_group
-        .generate_external_group_info()
-        .await
-        .expect("generate external group info");
-
-    let len = group_info_bytes.len();
-    eprintln!("GroupInfo payload size: {len} bytes");
-    assert!(
-        len <= 412,
-        "GroupInfo ({len} bytes) exceeds QR v15 medium-EC capacity (412 bytes)"
-    );
-
-    alice_group.shutdown().await;
-}
-
-/// Alice creates a group with an acceptor, generates GroupInfo bytes,
-/// Bob uses the payload to join via external commit.
-#[tokio::test]
-async fn test_external_commit_join() {
+async fn test_key_package_send_flow() {
     init_tracing();
     let discovery = TestAddressLookup::new();
 
     let (acceptor_task, acceptor_id, _dir) = spawn_acceptor(&discovery).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Alice creates group with acceptor
-    let alice = test_weaver_client("alice", test_endpoint(&discovery).await);
+    let mut alice = test_weaver_client("alice", test_endpoint(&discovery).await);
 
     let mut alice_group = alice
         .create(std::slice::from_ref(&acceptor_id), "none")
@@ -2333,52 +2297,49 @@ async fn test_external_commit_join() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Alice generates GroupInfo bytes (no ratchet tree, suitable for QR code)
-    let group_info_bytes = alice_group
-        .generate_external_group_info()
+    let group_id = alice_group.group_id();
+
+    let mut bob = test_weaver_client("bob", test_endpoint(&discovery).await);
+
+    let alice_endpoint_id = alice.endpoint_id();
+
+    bob.send_key_package(alice_endpoint_id, group_id)
         .await
-        .expect("generate external group info");
+        .expect("bob send key package");
 
-    tracing::info!(
-        len = group_info_bytes.len(),
-        "Alice generated GroupInfo for QR"
-    );
+    let (received_group_id, key_package_bytes) =
+        tokio::time::timeout(Duration::from_secs(5), alice.recv_key_package())
+            .await
+            .expect("timeout waiting for key package")
+            .expect("channel closed");
 
-    // Bob scans QR code and joins via external commit
-    let bob = test_weaver_client("bob", test_endpoint(&discovery).await);
+    assert_eq!(received_group_id, group_id);
 
-    let join_info = bob
-        .join_external(&group_info_bytes)
+    alice_group
+        .add_member(&key_package_bytes)
         .await
-        .expect("bob external commit join");
+        .expect("alice add bob");
+
+    let welcome = tokio::time::timeout(Duration::from_secs(5), bob.recv_welcome())
+        .await
+        .expect("timeout waiting for welcome")
+        .expect("channel closed");
+
+    let join_info = bob.join(&welcome).await.expect("bob join group");
     let mut bob_group = join_info.group;
 
-    // Wait for Alice to learn the external commit from the spool.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     let alice_ctx = alice_group.context().await.expect("alice context");
     let bob_ctx = bob_group.context().await.expect("bob context");
 
-    tracing::info!(
-        alice_epoch = ?alice_ctx.epoch,
-        bob_epoch = ?bob_ctx.epoch,
-        alice_members = alice_ctx.member_count,
-        bob_members = bob_ctx.member_count,
-        "External commit join complete"
-    );
-
-    assert_eq!(bob_ctx.spools.len(), 1, "Bob should have 1 acceptor");
     assert_eq!(
         alice_ctx.epoch, bob_ctx.epoch,
         "Alice and Bob must agree on the epoch"
     );
-    assert_eq!(
-        alice_ctx.member_count, bob_ctx.member_count,
-        "Alice and Bob must agree on the member count"
-    );
     assert!(
         alice_ctx.member_count >= 2,
-        "Group must have at least 2 members after external join"
+        "Group must have at least 2 members"
     );
 
     alice_group.shutdown().await;

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use filament_core::GroupId;
 use filament_weave::{Weaver, WeaverClient};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use yrs::Transact;
 
 use crate::document::DocumentActor;
@@ -19,6 +19,7 @@ use crate::yrs_crdt::YrsCrdt;
 pub struct CoordinatorActor<E: EventEmitter> {
     group_client: WeaverClient,
     welcome_rx: mpsc::Receiver<bytes::Bytes>,
+    key_package_rx: mpsc::Receiver<(GroupId, Vec<u8>)>,
     doc_actors: HashMap<GroupId, mpsc::Sender<DocRequest>>,
     request_rx: mpsc::Receiver<CoordinatorRequest>,
     pending_welcome_reply: Option<oneshot::Sender<Result<DocumentInfo, String>>>,
@@ -32,9 +33,11 @@ impl<E: EventEmitter> CoordinatorActor<E> {
         emitter: E,
     ) -> Self {
         let welcome_rx = group_client.take_welcome_rx();
+        let key_package_rx = group_client.take_key_package_rx();
         Self {
             group_client,
             welcome_rx,
+            key_package_rx,
             doc_actors: HashMap::new(),
             request_rx,
             pending_welcome_reply: None,
@@ -53,6 +56,9 @@ impl<E: EventEmitter> CoordinatorActor<E> {
                 }
                 Some(welcome_bytes) = self.welcome_rx.recv() => {
                     self.handle_welcome_received(welcome_bytes).await;
+                }
+                Some((group_id, key_package_bytes)) = self.key_package_rx.recv() => {
+                    self.handle_key_package_received(group_id, key_package_bytes).await;
                 }
             }
         }
@@ -77,8 +83,11 @@ impl<E: EventEmitter> CoordinatorActor<E> {
                 let _ = reply.send(result);
             }
             CoordinatorRequest::JoinExternal { invite_b58, reply } => {
-                let result = self.join_external(&invite_b58).await;
+                let result = self.send_key_package_from_invite(&invite_b58).await;
                 let _ = reply.send(result);
+            }
+            CoordinatorRequest::GenerateExternalInvite { group_id, reply } => {
+                let _ = reply.send(Ok(self.generate_external_invite(group_id)));
             }
             CoordinatorRequest::ForDoc { group_id, request } => {
                 self.route_to_doc(group_id, request).await;
@@ -112,23 +121,52 @@ impl<E: EventEmitter> CoordinatorActor<E> {
         self.join_with_welcome(&welcome_bytes).await
     }
 
-    async fn join_external(&mut self, invite_b58: &str) -> Result<DocumentInfo, String> {
-        let group_info_bytes = bs58::decode(invite_b58)
+    fn generate_external_invite(&self, group_id: GroupId) -> String {
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(&self.group_client.endpoint_id());
+        payload.extend_from_slice(group_id.as_bytes());
+        bs58::encode(payload).into_string()
+    }
+
+    async fn send_key_package_from_invite(&self, invite_b58: &str) -> Result<(), String> {
+        let bytes = bs58::decode(invite_b58)
             .into_vec()
             .map_err(|e| format!("invalid base58: {e}"))?;
-        let join_info = self
-            .group_client
-            .join_external(&group_info_bytes)
+        if bytes.len() != 64 {
+            return Err(format!("invite must be 64 bytes, got {}", bytes.len()));
+        }
+        let target: [u8; 32] = bytes[..32].try_into().unwrap();
+        let group_id = GroupId::from_slice(&bytes[32..]);
+        let target_b58 = bs58::encode(&target).into_string();
+        let group_id_b58 = bs58::encode(group_id.as_bytes()).into_string();
+        debug!(%target_b58, %group_id_b58, "sending key package to target");
+        self.group_client
+            .send_key_package(target, group_id)
             .await
-            .map_err(|e| format!("external join failed: {e:?}"))?;
+            .map_err(|e| format!("failed to send key package: {e:?}"))?;
+        debug!(%target_b58, %group_id_b58, "key package sent, waiting for welcome");
+        Ok(())
+    }
 
-        let client_id = join_info.group.client_id().0;
-        let crdt = YrsCrdt::with_client_id(client_id);
-
-        self.register_document(join_info.group, crdt)
+    async fn handle_key_package_received(&self, group_id: GroupId, key_package_bytes: Vec<u8>) {
+        let group_id_b58 = bs58::encode(group_id.as_bytes()).into_string();
+        debug!(%group_id_b58, "received key package from remote peer");
+        let key_package_b58 = bs58::encode(&key_package_bytes).into_string();
+        let (tx, rx) = oneshot::channel();
+        let request = DocRequest::AddMember {
+            key_package_b58,
+            reply: tx,
+        };
+        self.route_to_doc(group_id, request).await;
+        match rx.await {
+            Ok(Ok(())) => info!(%group_id_b58, "added member from received key package"),
+            Ok(Err(e)) => warn!(%group_id_b58, ?e, "failed to add member from key package"),
+            Err(_) => warn!(%group_id_b58, "document actor dropped reply for key package"),
+        }
     }
 
     async fn handle_welcome_received(&mut self, welcome_bytes: bytes::Bytes) {
+        debug!(len = welcome_bytes.len(), "received welcome message");
         match self.join_with_welcome(&welcome_bytes).await {
             Ok(doc_info) => {
                 if let Some(reply) = self.pending_welcome_reply.take() {

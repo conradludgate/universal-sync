@@ -77,7 +77,7 @@ pub async fn join_document_bytes(
 pub async fn join_external(
     state: tauri::State<'_, AppState>,
     invite_b58: String,
-) -> Result<DocumentInfo, String> {
+) -> Result<(), String> {
     coord_request(&state, |reply| CoordinatorRequest::JoinExternal {
         invite_b58,
         reply,
@@ -90,8 +90,10 @@ pub async fn generate_external_invite(
     state: tauri::State<'_, AppState>,
     group_id: String,
 ) -> Result<String, String> {
-    doc_request(&state, &group_id, |reply| {
-        DocRequest::GenerateExternalInvite { reply }
+    let gid = parse_group_id(&group_id)?;
+    coord_request(&state, |reply| CoordinatorRequest::GenerateExternalInvite {
+        group_id: gid,
+        reply,
     })
     .await
 }

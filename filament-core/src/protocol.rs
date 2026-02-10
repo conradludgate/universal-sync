@@ -78,20 +78,14 @@ pub enum Handshake {
         #[serde(with = "mls_bytes")]
         welcome: MlsMessage,
     },
-    /// Fetch the ratchet tree for an external commit join.
+    /// Send a key package to request joining a group.
     ///
-    /// The `confirmed_transcript_hash` is used to verify epoch consistency
-    /// between the joiner's `GroupInfo` and the spool's group state.
-    FetchTree {
+    /// The receiver uses `add_member` with the key package through the
+    /// normal Paxos commit flow.
+    SendKeyPackage {
         group_id: GroupId,
-        confirmed_transcript_hash: Bytes,
-    },
-    /// Submit an external commit to join a group.
-    ///
-    /// The spool extracts the group ID from the MLS message.
-    ExternalCommit {
         #[serde(with = "mls_bytes")]
-        commit: MlsMessage,
+        key_package: MlsMessage,
     },
 }
 
@@ -101,8 +95,6 @@ pub enum HandshakeResponse {
     GroupNotFound,
     InvalidGroupInfo(String),
     Error(String),
-    /// Response carrying opaque bytes (used for `FetchTree`).
-    Data(Bytes),
 }
 
 /// Paxos payload wrapping an MLS message (commit or proposal).
@@ -613,7 +605,6 @@ mod tests {
             HandshakeResponse::GroupNotFound,
             HandshakeResponse::InvalidGroupInfo("bad".into()),
             HandshakeResponse::Error("err".into()),
-            HandshakeResponse::Data(Bytes::from_static(&[1, 2, 3])),
         ] {
             let bytes = postcard::to_allocvec(&variant).unwrap();
             let _decoded: HandshakeResponse = postcard::from_bytes(&bytes).unwrap();
@@ -660,11 +651,10 @@ mod tests {
             Handshake::SendWelcome {
                 welcome: msg.clone(),
             },
-            Handshake::FetchTree {
+            Handshake::SendKeyPackage {
                 group_id: GroupId::new([7; 32]),
-                confirmed_transcript_hash: Bytes::from_static(&[8, 9]),
+                key_package: msg,
             },
-            Handshake::ExternalCommit { commit: msg },
         ];
         for h in variants {
             let bytes = postcard::to_allocvec(&h).unwrap();
