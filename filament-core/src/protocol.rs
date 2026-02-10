@@ -113,18 +113,18 @@ impl GroupMessage {
 }
 
 impl crate::codec::Versioned for GroupMessage {
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error> {
-        match protocol_version {
-            1 => postcard::to_allocvec(self),
-            _ => Err(postcard::Error::SerializeBufferFull),
-        }
+    fn serialize_versioned(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<u8>, crate::codec::VersionedError> {
+        crate::codec::serialize_v1(self, protocol_version)
     }
 
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error> {
-        match protocol_version {
-            1 => postcard::from_bytes(bytes),
-            _ => Err(postcard::Error::DeserializeUnexpectedEnd),
-        }
+    fn deserialize_versioned(
+        protocol_version: u32,
+        bytes: &[u8],
+    ) -> Result<Self, crate::codec::VersionedError> {
+        crate::codec::deserialize_v1(protocol_version, bytes)
     }
 }
 
@@ -264,7 +264,7 @@ impl AuthData {
     pub fn from_bytes_versioned(
         bytes: &[u8],
         protocol_version: u32,
-    ) -> Result<Self, postcard::Error> {
+    ) -> Result<Self, crate::codec::VersionedError> {
         Self::deserialize_versioned(protocol_version, bytes)
     }
 }
@@ -272,50 +272,50 @@ impl AuthData {
 use crate::codec::Versioned;
 
 impl Versioned for AuthData {
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error> {
-        match protocol_version {
-            1 => postcard::to_allocvec(self),
-            _ => Err(postcard::Error::SerializeBufferFull),
-        }
+    fn serialize_versioned(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<u8>, crate::codec::VersionedError> {
+        crate::codec::serialize_v1(self, protocol_version)
     }
 
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error> {
-        match protocol_version {
-            1 => postcard::from_bytes(bytes),
-            _ => Err(postcard::Error::DeserializeUnexpectedEnd),
-        }
+    fn deserialize_versioned(
+        protocol_version: u32,
+        bytes: &[u8],
+    ) -> Result<Self, crate::codec::VersionedError> {
+        crate::codec::deserialize_v1(protocol_version, bytes)
     }
 }
 
 impl Versioned for MessageRequest {
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error> {
-        match protocol_version {
-            1 => postcard::to_allocvec(self),
-            _ => Err(postcard::Error::SerializeBufferFull),
-        }
+    fn serialize_versioned(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<u8>, crate::codec::VersionedError> {
+        crate::codec::serialize_v1(self, protocol_version)
     }
 
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error> {
-        match protocol_version {
-            1 => postcard::from_bytes(bytes),
-            _ => Err(postcard::Error::DeserializeUnexpectedEnd),
-        }
+    fn deserialize_versioned(
+        protocol_version: u32,
+        bytes: &[u8],
+    ) -> Result<Self, crate::codec::VersionedError> {
+        crate::codec::deserialize_v1(protocol_version, bytes)
     }
 }
 
 impl Versioned for MessageResponse {
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error> {
-        match protocol_version {
-            1 => postcard::to_allocvec(self),
-            _ => Err(postcard::Error::SerializeBufferFull),
-        }
+    fn serialize_versioned(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<u8>, crate::codec::VersionedError> {
+        crate::codec::serialize_v1(self, protocol_version)
     }
 
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error> {
-        match protocol_version {
-            1 => postcard::from_bytes(bytes),
-            _ => Err(postcard::Error::DeserializeUnexpectedEnd),
-        }
+    fn deserialize_versioned(
+        protocol_version: u32,
+        bytes: &[u8],
+    ) -> Result<Self, crate::codec::VersionedError> {
+        crate::codec::deserialize_v1(protocol_version, bytes)
     }
 }
 
@@ -615,8 +615,8 @@ mod tests {
     }
 
     fn test_mls_message() -> MlsMessage {
-        use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
         use mls_rs::identity::SigningIdentity;
+        use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
         use mls_rs::{CipherSuite, CipherSuiteProvider, CryptoProvider};
         use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 

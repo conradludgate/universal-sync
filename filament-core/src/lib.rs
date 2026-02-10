@@ -13,14 +13,14 @@ pub mod extension;
 pub mod proposal;
 pub mod protocol;
 pub mod sink_stream;
-pub use codec::{Versioned, VersionedCodec};
-pub use crdt::{Crdt, CrdtError, NoCrdt, COMPACTION_BASE};
+pub use codec::{Versioned, VersionedCodec, VersionedError};
+pub use crdt::{COMPACTION_BASE, Crdt, CrdtError, NoCrdt};
 pub use error::{
     AcceptorContext, ConnectorError, EpochContext, GroupContext, MemberContext, OperationContext,
 };
 pub use extension::{
-    GroupContextExt, GroupContextExtV1, GroupInfoExt, KeyPackageExt, LeafNodeExt, SyncProposal,
-    CURRENT_PROTOCOL_VERSION, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE,
+    CURRENT_PROTOCOL_VERSION, GroupContextExt, GroupContextExtV1, GroupInfoExt, KeyPackageExt,
+    LeafNodeExt, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE, SyncProposal,
 };
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub use protocol::{
@@ -89,23 +89,23 @@ mod tests {
 
     #[test]
     fn load_secret_key_raw_bytes() {
-        let dir = std::env::temp_dir().join("filament_test_raw_key");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key");
         let key = [42u8; 32];
-        std::fs::write(&dir, key).unwrap();
-        let loaded = load_secret_key(&dir).unwrap();
+        std::fs::write(&path, key).unwrap();
+        let loaded = load_secret_key(&path).unwrap();
         assert_eq!(loaded, key);
-        std::fs::remove_file(&dir).ok();
     }
 
     #[test]
     fn load_secret_key_base58() {
-        let dir = std::env::temp_dir().join("filament_test_b58_key");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key");
         let key = [1u8; 32];
         let encoded = bs58::encode(key).into_string();
-        std::fs::write(&dir, encoded).unwrap();
-        let loaded = load_secret_key(&dir).unwrap();
+        std::fs::write(&path, encoded).unwrap();
+        let loaded = load_secret_key(&path).unwrap();
         assert_eq!(loaded, key);
-        std::fs::remove_file(&dir).ok();
     }
 
     #[test]
@@ -116,20 +116,20 @@ mod tests {
 
     #[test]
     fn load_secret_key_invalid_base58() {
-        let dir = std::env::temp_dir().join("filament_test_bad_b58");
-        std::fs::write(&dir, "not-valid-base58!!!").unwrap();
-        let result = load_secret_key(&dir);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "not-valid-base58!!!").unwrap();
+        let result = load_secret_key(&path);
         assert!(result.is_err());
-        std::fs::remove_file(&dir).ok();
     }
 
     #[test]
     fn load_secret_key_wrong_length_base58() {
-        let dir = std::env::temp_dir().join("filament_test_short_b58");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("key");
         let short = bs58::encode([1u8; 16]).into_string();
-        std::fs::write(&dir, short).unwrap();
-        let result = load_secret_key(&dir);
+        std::fs::write(&path, short).unwrap();
+        let result = load_secret_key(&path);
         assert!(result.is_err());
-        std::fs::remove_file(&dir).ok();
     }
 }

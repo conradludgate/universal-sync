@@ -14,6 +14,7 @@ mod group_actor;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Instant;
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
@@ -259,6 +260,8 @@ pub struct JoinInfo {
 ///
 /// All mutations are sent to a background actor. Drop cancels actors without waiting;
 /// use [`shutdown()`](Self::shutdown) for graceful termination.
+const DEFAULT_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[allow(clippy::struct_field_names)]
 pub struct Weaver {
     request_tx: mpsc::Sender<GroupRequest>,
@@ -268,6 +271,8 @@ pub struct Weaver {
     actor_handle: Option<JoinHandle<()>>,
     group_id: GroupId,
     client_id: ClientId,
+    in_flight_reply: Option<oneshot::Receiver<Result<(), Report<WeaverError>>>>,
+    batch_deadline: Option<Instant>,
 }
 
 /// `block_in_place` on multi-threaded runtimes, direct call on single-threaded.
@@ -440,7 +445,7 @@ impl Weaver {
         let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(64);
         let (request_tx, request_rx) = mpsc::channel(64);
-        let (app_message_tx, app_message_rx) = mpsc::channel(256);
+        let (app_message_tx, app_message_rx) = mpsc::channel(4096);
 
         infra
             .group_registry
@@ -475,6 +480,8 @@ impl Weaver {
             actor_handle: Some(actor_handle),
             group_id,
             client_id,
+            in_flight_reply: None,
+            batch_deadline: None,
         }
     }
 
@@ -557,15 +564,28 @@ impl Weaver {
 
     /// Flush local CRDT changes and broadcast. No-op if no pending changes.
     ///
-    /// Uses a two-phase protocol: the CRDT's internal state vector is only
-    /// advanced after the send succeeds. If the send fails, the next call
-    /// will re-encode from the last confirmed state, automatically including
-    /// any new edits (batching).
+    /// Batches updates: defers calling [`Crdt::flush`] while a previous send is
+    /// in-flight and the batch timeout has not been reached. Once the in-flight
+    /// send is confirmed or the timeout fires, flushes (including all edits since
+    /// last confirm) and sends one message. Uses a two-phase protocol so the CRDT
+    /// state vector only advances after the send succeeds.
     ///
     /// # Errors
     ///
     /// Returns [`WeaverError`] if flushing the CRDT or sending the message fails.
     pub async fn send_update(&mut self, crdt: &mut impl Crdt) -> Result<(), Report<WeaverError>> {
+        if let Some(rx) = self.in_flight_reply.take() {
+            let deadline_passed = self.batch_deadline.is_some_and(|d| Instant::now() >= d);
+            if !deadline_passed {
+                self.in_flight_reply = Some(rx);
+                return Ok(());
+            }
+            rx.await
+                .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+            crdt.confirm_flush(0);
+            self.batch_deadline = None;
+        }
+
         let update = crdt.flush(0).change_context(WeaverError)?;
 
         let Some(data) = update else {
@@ -581,11 +601,60 @@ impl Weaver {
             .await
             .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
 
-        reply_rx
-            .await
-            .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+        self.in_flight_reply = Some(reply_rx);
+        self.batch_deadline = Some(Instant::now() + DEFAULT_BATCH_TIMEOUT);
+        Ok(())
+    }
 
-        crdt.confirm_flush(0);
+    /// Wait for any in-flight send to complete and confirm the flush.
+    /// Call before comparing CRDT state (e.g. in tests) so the last batch is confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if the in-flight send failed.
+    pub async fn wait_pending_send(
+        &mut self,
+        crdt: &mut impl Crdt,
+    ) -> Result<(), Report<WeaverError>> {
+        if let Some(rx) = self.in_flight_reply.take() {
+            self.batch_deadline = None;
+            rx.await
+                .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+            crdt.confirm_flush(0);
+        }
+        Ok(())
+    }
+
+    /// Wait for in-flight send, then flush and send any remaining CRDT state until
+    /// [`Crdt::flush`] returns `None`. Ensures all local edits are sent before
+    /// comparing state (e.g. in tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeaverError`] if any send fails.
+    pub async fn flush_remaining(
+        &mut self,
+        crdt: &mut impl Crdt,
+    ) -> Result<(), Report<WeaverError>> {
+        self.wait_pending_send(crdt).await?;
+        loop {
+            let update = crdt.flush(0).change_context(WeaverError)?;
+            let Some(data) = update else {
+                break;
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            self.request_tx
+                .send(GroupRequest::SendMessage {
+                    data,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| Report::new(WeaverError).attach("group actor closed"))?;
+            reply_rx
+                .await
+                .map_err(|_| Report::new(WeaverError).attach("group actor dropped reply"))??;
+            crdt.confirm_flush(0);
+        }
         Ok(())
     }
 

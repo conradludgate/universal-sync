@@ -147,6 +147,7 @@ mod tests {
     use futures::{SinkExt, StreamExt};
 
     use super::*;
+    use crate::ConnectorError;
 
     #[tokio::test]
     async fn sink_stream_close() {
@@ -222,13 +223,4 @@ mod tests {
             Poll::Ready(Ok(()))
         }
     }
-
-    #[derive(Debug, Default)]
-    struct ConnectorError;
-    impl std::fmt::Display for ConnectorError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("test")
-        }
-    }
-    impl std::error::Error for ConnectorError {}
 }

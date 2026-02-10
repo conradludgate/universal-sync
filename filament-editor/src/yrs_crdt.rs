@@ -22,17 +22,13 @@ pub struct PeerAwareness {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CrdtMessage {
     pub(crate) awareness: PeerAwareness,
-    #[serde(with = "option_yrs_update")]
+    #[serde(deserialize_with = "option_yrs_update::deserialize")]
     pub(crate) doc_update: Option<Vec<u8>>,
 }
 
 mod option_yrs_update {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer};
     use yrs::updates::decoder::Decode;
-
-    pub(crate) fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
-        v.serialize(s)
-    }
 
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         d: D,

@@ -22,3 +22,6 @@ bs58.workspace = true
 postcard.workspace = true
 serde.workspace = true
 error-stack.workspace = true
+rand.workspace = true
+tokio-util.workspace = true
+hdrhistogram.workspace = true

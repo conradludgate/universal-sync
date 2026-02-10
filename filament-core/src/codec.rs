@@ -4,12 +4,72 @@
 //! - [`PostcardCodec`]: plain postcard serialization (for unversioned messages like Handshake)
 //! - [`VersionedCodec`]: version-dispatched deserialization driven by a `protocol_version`
 
-use std::io;
 use std::marker::PhantomData;
+use std::{fmt, io};
 
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
+
+/// Error from versioned serialize/deserialize.
+#[derive(Debug)]
+pub enum VersionedError {
+    UnknownProtocolVersion(u32),
+    Postcard(postcard::Error),
+}
+
+impl fmt::Display for VersionedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownProtocolVersion(v) => write!(f, "unknown protocol version: {v}"),
+            Self::Postcard(e) => fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl std::error::Error for VersionedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Postcard(e) => Some(e),
+            Self::UnknownProtocolVersion(_) => None,
+        }
+    }
+}
+
+impl From<postcard::Error> for VersionedError {
+    fn from(e: postcard::Error) -> Self {
+        Self::Postcard(e)
+    }
+}
+
+const SUPPORTED_VERSION: u32 = 1;
+
+/// Serialize with protocol version 1 (postcard). Returns [`VersionedError::UnknownProtocolVersion`] for other versions.
+///
+/// # Errors
+///
+/// Returns [`VersionedError::UnknownProtocolVersion`] if `protocol_version != 1`, or [`VersionedError::Postcard`] if serialization fails.
+pub fn serialize_v1<T: Serialize>(t: &T, protocol_version: u32) -> Result<Vec<u8>, VersionedError> {
+    if protocol_version != SUPPORTED_VERSION {
+        return Err(VersionedError::UnknownProtocolVersion(protocol_version));
+    }
+    postcard::to_allocvec(t).map_err(VersionedError::Postcard)
+}
+
+/// Deserialize with protocol version 1 (postcard). Returns [`VersionedError::UnknownProtocolVersion`] for other versions.
+///
+/// # Errors
+///
+/// Returns [`VersionedError::UnknownProtocolVersion`] if `protocol_version != 1`, or [`VersionedError::Postcard`] if deserialization fails.
+pub fn deserialize_v1<T: for<'de> Deserialize<'de>>(
+    protocol_version: u32,
+    bytes: &[u8],
+) -> Result<T, VersionedError> {
+    if protocol_version != SUPPORTED_VERSION {
+        return Err(VersionedError::UnknownProtocolVersion(protocol_version));
+    }
+    postcard::from_bytes(bytes).map_err(VersionedError::Postcard)
+}
 
 /// Version-dispatched serialization/deserialization.
 ///
@@ -20,15 +80,15 @@ pub trait Versioned: Sized {
     ///
     /// # Errors
     ///
-    /// Returns an error if serialization fails.
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error>;
+    /// Returns an error if the version is unknown or serialization fails.
+    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, VersionedError>;
 
     /// Deserialize from the given protocol version's schema.
     ///
     /// # Errors
     ///
     /// Returns an error if the version is unknown or deserialization fails.
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error>;
+    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, VersionedError>;
 }
 
 fn new_length_delimited_codec() -> LengthDelimitedCodec {
@@ -174,7 +234,7 @@ where
         match self.inner.decode(src)? {
             Some(bytes) => {
                 let item = T::deserialize_versioned(self.protocol_version, &bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 Ok(Some(item))
             }
             None => Ok(None),
@@ -191,7 +251,7 @@ where
     fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<(), Self::Error> {
         let bytes = item
             .serialize_versioned(self.protocol_version)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.inner.encode(Bytes::from(bytes), dst)
     }
 }

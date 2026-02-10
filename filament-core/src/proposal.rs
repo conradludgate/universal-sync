@@ -24,6 +24,12 @@ impl AcceptorId {
     }
 }
 
+impl From<[u8; 32]> for AcceptorId {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
 /// Paxos round identifier (MLS epoch number).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
@@ -141,18 +147,18 @@ impl Proposal for GroupProposal {
 use crate::codec::Versioned;
 
 impl Versioned for GroupProposal {
-    fn serialize_versioned(&self, protocol_version: u32) -> Result<Vec<u8>, postcard::Error> {
-        match protocol_version {
-            1 => postcard::to_allocvec(self),
-            _ => Err(postcard::Error::SerializeBufferFull),
-        }
+    fn serialize_versioned(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<u8>, crate::codec::VersionedError> {
+        crate::codec::serialize_v1(self, protocol_version)
     }
 
-    fn deserialize_versioned(protocol_version: u32, bytes: &[u8]) -> Result<Self, postcard::Error> {
-        match protocol_version {
-            1 => postcard::from_bytes(bytes),
-            _ => Err(postcard::Error::DeserializeUnexpectedEnd),
-        }
+    fn deserialize_versioned(
+        protocol_version: u32,
+        bytes: &[u8],
+    ) -> Result<Self, crate::codec::VersionedError> {
+        crate::codec::deserialize_v1(protocol_version, bytes)
     }
 }
 
