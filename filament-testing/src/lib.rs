@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, Mutex};
 
-use filament_core::{AcceptorId, PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
+use filament_core::{ALPN, AcceptorId, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE};
 pub use filament_editor::{PeerAwareness, YrsCrdt};
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
@@ -118,7 +118,7 @@ pub async fn test_endpoint(discovery: &TestAddressLookup) -> Endpoint {
 
     let endpoint = Endpoint::empty_builder(RelayMode::Disabled)
         .transport_config(transport_config)
-        .alpns(vec![PAXOS_ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()])
         .bind_addr(bind_addr)
         .expect("valid bind address")
         .bind()

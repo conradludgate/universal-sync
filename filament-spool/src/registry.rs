@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use filament_core::{AcceptorId, Epoch, GroupId, GroupInfoExt};
 use filament_warp::Learner;
@@ -26,7 +27,7 @@ impl std::error::Error for RegistryError {}
 use crate::acceptor::GroupAcceptor;
 use crate::learner::GroupLearningActor;
 use crate::metrics::SharedMetrics;
-use crate::state_store::{GroupStateStore, SharedFjallStateStore};
+use crate::state_store::{GroupStateStore, SharedFjallStateStore, StoredAppMessage};
 
 pub type EpochWatcher = (watch::Receiver<Epoch>, Box<dyn Fn() -> Epoch + Send>);
 
@@ -217,10 +218,10 @@ where
         group_id: &GroupId,
         id: &filament_core::MessageId,
         level: u8,
-        msg: &filament_core::EncryptedAppMessage,
+        data: Bytes,
     ) -> Result<(), Report<RegistryError>> {
         self.state_store
-            .store_app_message(group_id, id, level, msg)
+            .store_app_message(group_id, id, level, data)
             .change_context(RegistryError)
             .attach("failed to store message")
     }
@@ -229,7 +230,7 @@ where
         &self,
         group_id: &GroupId,
         state_vector: &filament_core::StateVector,
-    ) -> Vec<(filament_core::MessageId, filament_core::EncryptedAppMessage)> {
+    ) -> Vec<(filament_core::MessageId, StoredAppMessage)> {
         self.state_store.get_messages_after(group_id, state_vector)
     }
 

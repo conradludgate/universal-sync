@@ -130,15 +130,30 @@ Total: 16 bytes. Same as current format.
 
 ### Value format
 
+Values are either a full message or a single erasure-coded shard (for compacted messages when parity > 0):
+
 ```rust
 #[derive(Serialize, Deserialize)]
+enum StoredMessage {
+    Full(StoredAppMessage),
+    Shard(StoredShard),
+}
+
 struct StoredAppMessage {
     level: u8,
     msg: EncryptedAppMessage,
 }
+
+struct StoredShard {
+    level: u8,
+    shard_index: u8,
+    data_shards: u8,
+    total_shards: u8,
+    data: Vec<u8>,
+}
 ```
 
-Serialized with postcard. Level is stored in the value; deletion reads the value to check level.
+Serialized with postcard; storage envelope is unchanged. Level is in the value; deletion reads the value to check level. See [COMPACTED-ERASURE-CODING.md](COMPACTED-ERASURE-CODING.md).
 
 ### Operation implementations
 
@@ -230,7 +245,7 @@ Since we're not maintaining backward compatibility, a clean break is acceptable:
 | Aspect | Choice |
 |--------|--------|
 | **Key format** | `sender (8) \|\| seq (8)` = 16 bytes (unchanged) |
-| **Value format** | `postcard(StoredAppMessage { level, msg })` |
+| **Value format** | `postcard(StoredMessage::Full or Shard)` |
 | **Insert** | Single write |
 | **Backfill** | Full scan, filter by seq > sv[sender] |
 | **Deletion** | Full scan, read value to check level < compaction_level AND seq <= watermark[sender] |

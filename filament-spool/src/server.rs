@@ -4,8 +4,8 @@ use error_stack::{Report, ResultExt};
 use filament_core::codec::{PostcardCodec, VersionedCodec};
 use filament_core::sink_stream::{Mapped, SinkStream};
 use filament_core::{
-    ConnectorError, Epoch, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
-    MemberFingerprint, MemberId, MessageRequest, MessageResponse, PAXOS_ALPN, StateVector,
+    ALPN, ConnectorError, Epoch, GroupId, GroupMessage, GroupProposal, Handshake,
+    HandshakeResponse, MemberFingerprint, MemberId, MessageRequest, MessageResponse, StateVector,
 };
 use filament_warp::acceptor::{AcceptorHandler, run_acceptor_with_epoch_waiter};
 use filament_warp::{AcceptorMessage, AcceptorRequest, Learner};
@@ -77,7 +77,7 @@ where
         .change_context(ConnectorError)?;
 
     let alpn = conn.alpn();
-    if alpn != PAXOS_ALPN {
+    if alpn != ALPN {
         warn!(?alpn, "unexpected ALPN, closing connection");
         return Err(Report::new(ConnectorError).attach("unexpected ALPN"));
     }
@@ -328,7 +328,11 @@ where
                     if id.sender == subscriber {
                         continue;
                     }
-                    let response = MessageResponse::Message { id, message };
+                    let response = MessageResponse::Message {
+                        id,
+                        level: message.level,
+                        data: message.data,
+                    };
                     connection.send(response).await.change_context(ConnectorError)?;
                 }
             }
@@ -352,7 +356,7 @@ where
     CS: CipherSuiteProvider + Clone + Send + Sync + 'static,
 {
     match request {
-        MessageRequest::Send { id, level, message } => {
+        MessageRequest::Send { id, level, data } => {
             if !acceptor.is_fingerprint_in_roster(group_id, id.sender) {
                 debug!(sender = ?id.sender, "rejecting message from sender not in roster");
                 connection
@@ -362,7 +366,7 @@ where
                 return Ok(());
             }
 
-            match registry.store_message(group_id, &id, level, &message) {
+            match registry.store_message(group_id, &id, level, data) {
                 Ok(()) => {
                     connection
                         .send(MessageResponse::Stored)
@@ -394,8 +398,13 @@ where
                 .collect();
 
             for (id, message) in messages {
+                let response = MessageResponse::Message {
+                    id,
+                    level: message.level,
+                    data: message.data,
+                };
                 connection
-                    .send(MessageResponse::Message { id, message })
+                    .send(response)
                     .await
                     .change_context(ConnectorError)?;
             }

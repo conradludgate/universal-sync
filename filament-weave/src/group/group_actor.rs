@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 
+use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, AuthData, COMPACTION_BASE, EncryptedAppMessage, Epoch, GroupId, GroupMessage,
-    GroupProposal, Handshake, KeyPackageExt, MemberFingerprint, MemberId, MessageId, PAXOS_ALPN,
-    StateVector, SyncProposal,
+    ALPN, AcceptorId, AuthData, COMPACTION_BASE, Epoch, GroupId, GroupMessage, GroupProposal,
+    Handshake, KeyPackageExt, MemberFingerprint, MemberId, MessageId, StateVector, SyncProposal,
 };
 use filament_warp::proposer::{ProposeResult, Proposer, QuorumTracker};
 use filament_warp::{AcceptorMessage, Learner, Proposal};
@@ -61,6 +61,7 @@ where
     compaction_state: CompactionState,
     last_epoch_advance: std::time::Instant,
     key_rotation_interval: Option<std::time::Duration>,
+    shard_buffer: HashMap<MessageId, (u8, u8, Vec<Option<bytes::BytesMut>>)>,
 }
 
 struct ActiveProposal {
@@ -246,6 +247,16 @@ impl ReceivedSeqs {
     }
 }
 
+struct CompactionShardParams {
+    message_id: MessageId,
+    seq: u64,
+    level: u8,
+    watermark: StateVector,
+    selected: Vec<AcceptorId>,
+    count: usize,
+    parity: usize,
+}
+
 const MAX_PROPOSAL_RETRIES: u32 = 6;
 const PROPOSAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 fn exponential_backoff_duration(retries: u32) -> std::time::Duration {
@@ -321,6 +332,7 @@ where
             compaction_state: CompactionState::new(),
             last_epoch_advance: std::time::Instant::now(),
             key_rotation_interval,
+            shard_buffer: HashMap::new(),
         }
     }
 
@@ -820,10 +832,6 @@ where
             }
         };
 
-        let encrypted_msg = EncryptedAppMessage {
-            ciphertext: ciphertext.clone(),
-        };
-
         let message_id = MessageId {
             group_id: self.group_id,
             sender: self.own_fingerprint,
@@ -843,7 +851,7 @@ where
                 let _ = tx.try_send(AcceptorOutbound::AppMessage {
                     id: message_id,
                     level: 0,
-                    msg: encrypted_msg.clone(),
+                    data: ciphertext.clone(),
                 });
             }
         }
@@ -1169,7 +1177,7 @@ where
 
         let conn = self
             .endpoint
-            .connect(public_key, PAXOS_ALPN)
+            .connect(public_key, ALPN)
             .await
             .change_context(WeaverError)?;
 
@@ -1226,8 +1234,62 @@ where
             } => {
                 self.handle_proposal_response(acceptor_id, response).await;
             }
-            AcceptorInbound::EncryptedMessage { msg } => {
-                self.handle_encrypted_message(msg);
+            AcceptorInbound::EncryptedMessage { id, level, data } => {
+                if level == 0 {
+                    self.handle_encrypted_message(data.clone());
+                    return;
+                }
+                let Some((plaintext_shard, auth_data)) =
+                    self.decrypt_to_plaintext_and_auth(data.as_ref())
+                else {
+                    return;
+                };
+                let AuthData::Compaction {
+                    shard_index,
+                    data_shards,
+                    total_shards,
+                    ..
+                } = auth_data
+                else {
+                    tracing::debug!("ignoring non-compaction message on shard path");
+                    return;
+                };
+                let parity_shards = total_shards.saturating_sub(data_shards);
+                let total = usize::from(data_shards) + usize::from(parity_shards);
+                let entry = self.shard_buffer.entry(id).or_insert_with(|| {
+                    (
+                        data_shards,
+                        parity_shards,
+                        (0..total).map(|_| None).collect(),
+                    )
+                });
+                let idx = usize::from(shard_index);
+                if idx >= entry.2.len() {
+                    entry.2.resize(idx + 1, None);
+                }
+                entry.2[idx] = Some(bytes::BytesMut::from(plaintext_shard.as_slice()));
+                let present = entry.2.iter().filter(|o| o.is_some()).count();
+                if present >= usize::from(data_shards) {
+                    let (data_shards_u8, parity_shards_u8, shards) =
+                        self.shard_buffer.remove(&id).expect("just inserted");
+                    let data_shards_usize = usize::from(data_shards_u8);
+                    let parity_shards_usize = usize::from(parity_shards_u8);
+                    let snapshot = if data_shards_usize == 1 && parity_shards_usize == 0 {
+                        shards
+                            .into_iter()
+                            .next()
+                            .and_then(|o| o)
+                            .map(|shard| bytes::Bytes::from(shard.to_vec()))
+                    } else {
+                        crate::erasure::decode(shards, data_shards_usize, parity_shards_usize)
+                    };
+                    if let Some(snapshot) = snapshot {
+                        self.received_seqs.record(id.sender, id.seq);
+                        self.received_seqs_dirty = true;
+                        self.compaction_state.record_entry(usize::from(level));
+                        let _ = self.app_message_tx.try_send(snapshot.to_vec());
+                    }
+                }
             }
             AcceptorInbound::Connected { acceptor_id } => {
                 if self.connected_acceptors.insert(acceptor_id) {
@@ -1360,8 +1422,28 @@ where
         }
     }
 
-    fn handle_encrypted_message(&mut self, msg: EncryptedAppMessage) {
-        let mls_message = match MlsMessage::from_bytes(&msg.ciphertext) {
+    /// Decrypt an application message and return plaintext + auth data without applying.
+    /// Returns `None` if not an application message or decode fails.
+    fn decrypt_to_plaintext_and_auth(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> Option<(Vec<u8>, filament_core::AuthData)> {
+        let mls_message = MlsMessage::from_bytes(ciphertext).ok()?;
+        let received = blocking(|| {
+            self.learner
+                .group_mut()
+                .process_incoming_message(mls_message)
+        })
+        .ok()?;
+        let ReceivedMessage::ApplicationMessage(app_msg) = received else {
+            return None;
+        };
+        let auth_data = filament_core::AuthData::from_bytes(&app_msg.authenticated_data).ok()?;
+        Some((app_msg.data().to_vec(), auth_data))
+    }
+
+    fn handle_encrypted_message(&mut self, msg: Bytes) {
+        let mls_message = match MlsMessage::from_bytes(&msg) {
             Ok(msg) => msg,
             Err(e) => {
                 tracing::warn!(?e, "failed to deserialize MLS message");
@@ -1563,7 +1645,7 @@ where
                 continue;
             }
 
-            let Ok(mls_message) = MlsMessage::from_bytes(&pending_msg.msg.ciphertext) else {
+            let Ok(mls_message) = MlsMessage::from_bytes(&pending_msg.msg) else {
                 tracing::debug!("dropping malformed pending message");
                 continue;
             };
@@ -1642,8 +1724,16 @@ where
             AuthData::Update { .. } => {
                 self.compaction_state.record_entry(0);
             }
-            AuthData::Compaction { level, .. } => {
+            AuthData::Compaction {
+                data_shards: 1,
+                total_shards: 1,
+                level,
+                ..
+            } => {
                 self.compaction_state.record_entry(usize::from(*level));
+            }
+            AuthData::Compaction { .. } => {
+                return;
             }
         }
 
@@ -1727,34 +1817,6 @@ where
         self.received_seqs.record(self.own_fingerprint, seq);
         self.received_seqs_dirty = true;
 
-        let authenticated_data =
-            match AuthData::compaction(seq, level, watermark.clone()).to_bytes() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::warn!(?e, "failed to encode compaction auth data");
-                    return false;
-                }
-            };
-        let mls_message = match blocking(|| {
-            self.learner
-                .encrypt_application_message(data, authenticated_data)
-        }) {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(?e, "failed to encrypt compacted message");
-                return false;
-            }
-        };
-
-        let ciphertext = match mls_message.to_bytes() {
-            Ok(bytes) => bytes::Bytes::from(bytes),
-            Err(e) => {
-                tracing::warn!(?e, "failed to serialize compacted message");
-                return false;
-            }
-        };
-
-        let encrypted_msg = EncryptedAppMessage { ciphertext };
         let message_id = MessageId {
             group_id: self.group_id,
             sender: self.own_fingerprint,
@@ -1769,24 +1831,129 @@ where
         );
 
         let selected = crate::rendezvous::select_acceptors(&acceptor_ids, &message_id, count);
+        let parity = crate::erasure::parity_for_count(count);
 
-        tracing::info!(
-            level,
-            count,
-            total_acceptors = acceptor_ids.len(),
-            "sending compacted message to acceptors"
-        );
-
-        for acceptor_id in selected {
-            if let Some(tx) = self.acceptor_txs.get(&acceptor_id) {
-                let _ = tx.try_send(AcceptorOutbound::AppMessage {
-                    id: message_id,
-                    level,
-                    msg: encrypted_msg.clone(),
-                });
+        if parity == 0 {
+            let authenticated_data =
+                match AuthData::compaction(seq, level, watermark.clone()).to_bytes() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(?e, "failed to encode compaction auth data");
+                        return false;
+                    }
+                };
+            let mls_message = match blocking(|| {
+                self.learner
+                    .encrypt_application_message(data, authenticated_data)
+            }) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!(?e, "failed to encrypt compacted message");
+                    return false;
+                }
+            };
+            let ciphertext = match mls_message.to_bytes() {
+                Ok(bytes) => bytes::Bytes::from(bytes),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to serialize compacted message");
+                    return false;
+                }
+            };
+            tracing::info!(
+                level,
+                count,
+                total_acceptors = acceptor_ids.len(),
+                "sending compacted message to acceptors (full copy)"
+            );
+            for acceptor_id in &selected {
+                if let Some(tx) = self.acceptor_txs.get(acceptor_id) {
+                    let _ = tx.try_send(AcceptorOutbound::AppMessage {
+                        id: message_id,
+                        level,
+                        data: ciphertext.clone(),
+                    });
+                }
+            }
+        } else {
+            let params = CompactionShardParams {
+                message_id,
+                seq,
+                level,
+                watermark: watermark.clone(),
+                selected: selected.clone(),
+                count,
+                parity,
+            };
+            if !self.send_compaction_shards(data, &params) {
+                return false;
             }
         }
 
+        true
+    }
+
+    fn send_compaction_shards(&mut self, data: &[u8], params: &CompactionShardParams) -> bool {
+        let data_shards = params.count - params.parity;
+        let Some(plaintext_shards) = crate::erasure::encode(data, params.count, params.parity)
+        else {
+            tracing::warn!("erasure encode failed");
+            return false;
+        };
+        let total_shards_u8 = u8::try_from(params.count).unwrap_or(u8::MAX);
+        let data_shards_u8 = u8::try_from(data_shards).unwrap_or(u8::MAX);
+        tracing::info!(
+            level = params.level,
+            count = params.count,
+            data_shards,
+            parity = params.parity,
+            "sending compacted message as encrypted shards"
+        );
+        for (i, acceptor_id) in params.selected.iter().enumerate() {
+            if i >= plaintext_shards.len() {
+                break;
+            }
+            let shard_index = u8::try_from(i).unwrap_or(u8::MAX);
+            let authenticated_data = match AuthData::compaction_shard(
+                params.seq,
+                params.level,
+                params.watermark.clone(),
+                shard_index,
+                data_shards_u8,
+                total_shards_u8,
+            )
+            .to_bytes()
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(?e, "failed to encode compaction shard auth data");
+                    return false;
+                }
+            };
+            let mls_message = match blocking(|| {
+                self.learner
+                    .encrypt_application_message(plaintext_shards[i].as_ref(), authenticated_data)
+            }) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::warn!(?e, "failed to encrypt shard");
+                    return false;
+                }
+            };
+            let encrypted_shard = match mls_message.to_bytes() {
+                Ok(bytes) => bytes::Bytes::from(bytes),
+                Err(e) => {
+                    tracing::warn!(?e, "failed to serialize shard");
+                    return false;
+                }
+            };
+            if let Some(tx) = self.acceptor_txs.get(acceptor_id) {
+                let _ = tx.try_send(AcceptorOutbound::AppMessage {
+                    id: params.message_id,
+                    level: params.level,
+                    data: encrypted_shard,
+                });
+            }
+        }
         true
     }
 

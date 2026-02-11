@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, ConnectorError, Epoch, GroupId, GroupMessage, GroupProposal, PAXOS_ALPN,
+    ALPN, AcceptorId, ConnectorError, Epoch, GroupId, GroupMessage, GroupProposal,
 };
 use filament_warp::AcceptorStateStore;
 use filament_warp::proposer::QuorumTracker;
@@ -238,7 +238,7 @@ async fn run_peer_connection(
     let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
         .expect("AcceptorId should be a valid public key");
     let conn = endpoint
-        .connect(public_key, PAXOS_ALPN)
+        .connect(public_key, ALPN)
         .await
         .change_context(ConnectorError)?;
 

@@ -4,7 +4,7 @@ use error_stack::{Report, ResultExt};
 pub use filament_core::ConnectorError;
 use filament_core::codec::PostcardCodec;
 use filament_core::{
-    AcceptorId, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse, PAXOS_ALPN,
+    ALPN, AcceptorId, GroupId, GroupMessage, GroupProposal, Handshake, HandshakeResponse,
 };
 use futures::{SinkExt, StreamExt};
 use iroh::{Endpoint, PublicKey};
@@ -25,7 +25,7 @@ pub(crate) async fn register_group(
     let public_key = PublicKey::from_bytes(acceptor_id.as_bytes())
         .expect("AcceptorId should be a valid public key");
     let conn = endpoint
-        .connect(public_key, PAXOS_ALPN)
+        .connect(public_key, ALPN)
         .await
         .change_context(ConnectorError)?;
 

@@ -7,9 +7,10 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use filament_core::{
-    Attempt, EncryptedAppMessage, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint,
-    MemberId, MessageId, StateVector,
+    Attempt, Epoch, GroupId, GroupMessage, GroupProposal, MemberFingerprint, MemberId, MessageId,
+    StateVector,
 };
 use filament_warp::acceptor::RoundState;
 use filament_warp::core::decision;
@@ -47,10 +48,12 @@ struct SlimAccepted {
     message: GroupMessage,
 }
 
+/// Single on-disk format: full messages stored as degenerate shard
+/// (`shard_index=0`, `data_shards=1`, `total_shards=1`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredAppMessage {
-    level: u8,
-    msg: EncryptedAppMessage,
+pub struct StoredAppMessage {
+    pub level: u8,
+    pub data: Bytes,
 }
 
 const PROMISED_SENTINEL_EPOCH: u64 = u64::MAX;
@@ -122,7 +125,7 @@ pub(crate) struct FjallStateStore {
     snapshot_cache: quick_cache::sync::Cache<(GroupId, Epoch), bytes::Bytes>,
     latest_epoch: RwLock<HashMap<GroupId, Epoch>>,
     accepted_cache: quick_cache::sync::Cache<(GroupId, Epoch), Arc<(GroupProposal, GroupMessage)>>,
-    message_cache: quick_cache::sync::Cache<MessageId, Arc<EncryptedAppMessage>>,
+    message_cache: quick_cache::sync::Cache<MessageId, Bytes>,
 }
 
 impl FjallStateStore {
@@ -202,13 +205,10 @@ impl FjallStateStore {
         })
     }
 
-    fn serialize_app_message(level: u8, msg: &EncryptedAppMessage) -> Vec<u8> {
-        let stored = StoredAppMessage {
-            level,
-            msg: msg.clone(),
-        };
-        let data = postcard::to_allocvec(&stored).expect("serialization should not fail");
-        storage_versioned_encode(STORAGE_VERSION, &data)
+    fn serialize_app_message(level: u8, data: Bytes) -> Vec<u8> {
+        let stored = StoredAppMessage { level, data };
+        let payload = postcard::to_allocvec(&stored).expect("serialization should not fail");
+        storage_versioned_encode(STORAGE_VERSION, &payload)
     }
 
     fn deserialize_app_message(bytes: &[u8]) -> Option<StoredAppMessage> {
@@ -221,16 +221,18 @@ impl FjallStateStore {
         group_id: &GroupId,
         id: &MessageId,
         level: u8,
-        msg: &EncryptedAppMessage,
+        data: Bytes,
     ) -> Result<(), fjall::Error> {
         let ks = self.get_keyspaces(group_id);
         let msg_key = Self::build_message_key(id.sender, id.seq);
-        let msg_bytes = Self::serialize_app_message(level, msg);
+        let msg_bytes = Self::serialize_app_message(level, data.clone());
         ks.messages.insert(msg_key, &msg_bytes)?;
 
         self.db.persist(PersistMode::SyncAll)?;
 
-        self.message_cache.insert(*id, Arc::new(msg.clone()));
+        if level == 0 {
+            self.message_cache.insert(*id, data);
+        }
 
         if let Ok(broadcasts) = self.message_broadcasts.read()
             && let Some(tx) = broadcasts.get(group_id.as_bytes())
@@ -248,7 +250,7 @@ impl FjallStateStore {
         &self,
         group_id: &GroupId,
         state_vector: &StateVector,
-    ) -> Vec<(MessageId, EncryptedAppMessage)> {
+    ) -> Vec<(MessageId, StoredAppMessage)> {
         let ks = self.get_keyspaces(group_id);
         let mut messages = Vec::new();
 
@@ -261,14 +263,11 @@ impl FjallStateStore {
                 let covered = state_vector
                     .get(&msg_id.sender)
                     .is_some_and(|&hw| msg_id.seq <= hw);
-                if !covered {
-                    if let Some(cached) = self.message_cache.get(&msg_id) {
-                        messages.push((msg_id, (*cached).clone()));
-                    } else if let Some(stored) = Self::deserialize_app_message(&value) {
-                        self.message_cache
-                            .insert(msg_id, Arc::new(stored.msg.clone()));
-                        messages.push((msg_id, stored.msg));
+                if !covered && let Some(item) = Self::deserialize_app_message(&value) {
+                    if item.level == 0 {
+                        self.message_cache.insert(msg_id, item.data.clone());
                     }
+                    messages.push((msg_id, item));
                 }
             }
         }
@@ -669,9 +668,9 @@ impl SharedFjallStateStore {
         group_id: &GroupId,
         id: &MessageId,
         level: u8,
-        msg: &EncryptedAppMessage,
+        data: Bytes,
     ) -> Result<(), fjall::Error> {
-        self.inner.store_app_message(group_id, id, level, msg)
+        self.inner.store_app_message(group_id, id, level, data)
     }
 
     #[must_use]
@@ -679,7 +678,7 @@ impl SharedFjallStateStore {
         &self,
         group_id: &GroupId,
         state_vector: &StateVector,
-    ) -> Vec<(MessageId, EncryptedAppMessage)> {
+    ) -> Vec<(MessageId, StoredAppMessage)> {
         self.inner.get_messages_after(group_id, state_vector)
     }
 
@@ -1261,12 +1260,10 @@ mod tests {
             sender,
             seq: 2,
         };
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[10, 20]),
-        };
+        let msg = bytes::Bytes::from_static(&[10, 20]);
 
-        store.store_app_message(&gid, &id1, 0, &msg).unwrap();
-        store.store_app_message(&gid, &id2, 0, &msg).unwrap();
+        store.store_app_message(&gid, &id1, 0, msg.clone()).unwrap();
+        store.store_app_message(&gid, &id2, 0, msg).unwrap();
 
         let all = store.get_messages_after(&gid, &StateVector::default());
         assert_eq!(all.len(), 2);
@@ -1279,6 +1276,27 @@ mod tests {
     }
 
     #[test]
+    fn test_store_shard_and_get_messages_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        let gid = GroupId::new([1u8; 32]);
+        let sender = MemberFingerprint([3u8; 8]);
+        let id = MessageId {
+            group_id: gid,
+            sender,
+            seq: 10,
+        };
+        store
+            .store_app_message(&gid, &id, 1, Bytes::from_static(&[1, 2, 3, 4, 5]))
+            .unwrap();
+        let messages = store.get_messages_after(&gid, &StateVector::default());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, id);
+        assert_eq!(messages[0].1.level, 1);
+        assert_eq!(&*messages[0].1.data, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
     fn test_delete_before_watermark_partial() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_test_store(dir.path());
@@ -1286,9 +1304,7 @@ mod tests {
 
         let sender_a = MemberFingerprint([10u8; 8]);
         let sender_b = MemberFingerprint([20u8; 8]);
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[1]),
-        };
+        let msg = bytes::Bytes::from_static(&[1]);
 
         for seq in 1..=5 {
             let id = MessageId {
@@ -1296,7 +1312,7 @@ mod tests {
                 sender: sender_a,
                 seq,
             };
-            store.store_app_message(&gid, &id, 0, &msg).unwrap();
+            store.store_app_message(&gid, &id, 0, msg.clone()).unwrap();
         }
         for seq in 1..=3 {
             let id = MessageId {
@@ -1304,7 +1320,7 @@ mod tests {
                 sender: sender_b,
                 seq,
             };
-            store.store_app_message(&gid, &id, 0, &msg).unwrap();
+            store.store_app_message(&gid, &id, 0, msg.clone()).unwrap();
         }
 
         let mut watermark = StateVector::default();
@@ -1343,10 +1359,8 @@ mod tests {
                 sender,
                 seq,
             };
-            let msg = EncryptedAppMessage {
-                ciphertext: bytes::Bytes::from(seq.to_le_bytes().to_vec()),
-            };
-            store.store_app_message(&gid, &id, 0, &msg).unwrap();
+            let msg = bytes::Bytes::from(seq.to_le_bytes().to_vec());
+            store.store_app_message(&gid, &id, 0, msg).unwrap();
         }
 
         let id = MessageId {
@@ -1354,10 +1368,8 @@ mod tests {
             sender,
             seq: 6,
         };
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[0x11]),
-        };
-        store.store_app_message(&gid, &id, 1, &msg).unwrap();
+        let msg = bytes::Bytes::from_static(&[0x11]);
+        store.store_app_message(&gid, &id, 1, msg).unwrap();
 
         let mut watermark = StateVector::default();
         watermark.insert(sender, 6);
@@ -1383,10 +1395,8 @@ mod tests {
                 sender,
                 seq,
             };
-            let msg = EncryptedAppMessage {
-                ciphertext: bytes::Bytes::from(seq.to_le_bytes().to_vec()),
-            };
-            store.store_app_message(&gid, &id, 0, &msg).unwrap();
+            let msg = bytes::Bytes::from(seq.to_le_bytes().to_vec());
+            store.store_app_message(&gid, &id, 0, msg).unwrap();
         }
 
         let id_l1 = MessageId {
@@ -1395,14 +1405,7 @@ mod tests {
             seq: 4,
         };
         store
-            .store_app_message(
-                &gid,
-                &id_l1,
-                1,
-                &EncryptedAppMessage {
-                    ciphertext: bytes::Bytes::from_static(&[0x11]),
-                },
-            )
+            .store_app_message(&gid, &id_l1, 1, bytes::Bytes::from_static(&[0x11]))
             .unwrap();
 
         let id_l2 = MessageId {
@@ -1411,14 +1414,7 @@ mod tests {
             seq: 5,
         };
         store
-            .store_app_message(
-                &gid,
-                &id_l2,
-                2,
-                &EncryptedAppMessage {
-                    ciphertext: bytes::Bytes::from_static(&[0x22]),
-                },
-            )
+            .store_app_message(&gid, &id_l2, 2, bytes::Bytes::from_static(&[0x22]))
             .unwrap();
 
         let mut watermark = StateVector::default();
@@ -1518,10 +1514,8 @@ mod tests {
             sender,
             seq: 1,
         };
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[42]),
-        };
-        shared.store_app_message(&gid, &id, 0, &msg).unwrap();
+        let msg = bytes::Bytes::from_static(&[42]);
+        shared.store_app_message(&gid, &id, 0, msg).unwrap();
 
         let msgs = shared.get_messages_after(&gid, &StateVector::default());
         assert_eq!(msgs.len(), 1);
@@ -1581,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_app_message_invalid() {
+    fn deserialize_stored_message_invalid() {
         assert!(FjallStateStore::deserialize_app_message(&[]).is_none());
         assert!(FjallStateStore::deserialize_app_message(b"nope").is_none());
     }
@@ -1757,21 +1751,17 @@ mod tests {
             sender,
             seq: 1,
         };
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[1, 2, 3]),
-        };
+        let msg = bytes::Bytes::from_static(&[1, 2, 3]);
 
-        store.store_app_message(&gid, &id, 0, &msg).unwrap();
+        store.store_app_message(&gid, &id, 0, msg).unwrap();
 
         assert!(store.message_cache.get(&id).is_some());
-        assert_eq!(
-            store.message_cache.get(&id).unwrap().ciphertext,
-            &[1, 2, 3][..]
-        );
+        assert_eq!(&*store.message_cache.get(&id).unwrap(), &[1, 2, 3][..]);
 
         let msgs = store.get_messages_after(&gid, &StateVector::default());
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].1.ciphertext, &[1, 2, 3][..]);
+        assert_eq!(msgs[0].1.level, 0);
+        assert_eq!(&*msgs[0].1.data, &[1, 2, 3][..]);
     }
 
     #[test]
@@ -1780,9 +1770,7 @@ mod tests {
         let store = open_test_store(dir.path());
         let gid = GroupId::new([0xE7; 32]);
         let sender = MemberFingerprint([0xBB; 8]);
-        let msg = EncryptedAppMessage {
-            ciphertext: bytes::Bytes::from_static(&[1]),
-        };
+        let msg = bytes::Bytes::from_static(&[1]);
 
         for seq in 1..=3 {
             let id = MessageId {
@@ -1790,7 +1778,7 @@ mod tests {
                 sender,
                 seq,
             };
-            store.store_app_message(&gid, &id, 0, &msg).unwrap();
+            store.store_app_message(&gid, &id, 0, msg.clone()).unwrap();
         }
 
         for seq in 1..=3 {

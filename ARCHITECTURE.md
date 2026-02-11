@@ -147,6 +147,14 @@ all acceptors at the highest level. This distributes storage load while
 maintaining deterministic routing — any device can compute which
 acceptors hold a given message.
 
+**Compacted messages (level ≥ 1)** use the same count and selection; a
+fixed parity map then decides whether to send a full copy (0..=1
+acceptors) or Reed–Solomon erasure-coded shards (2+ acceptors). Each
+selected spool stores either one shard or the full message. On backfill,
+the device may receive full messages or shards; it buffers shards by
+`MessageId` and decodes when it has enough data shards. See
+[plan/COMPACTED-ERASURE-CODING.md](plan/COMPACTED-ERASURE-CODING.md).
+
 Devices connect to all acceptors and subscribe to live broadcasts plus
 backfill, so they receive the full message set across all acceptors.
 
@@ -188,7 +196,7 @@ storage engine) with three keyspaces:
 |----------|-----|-------|
 | `accepted` | `(group_id, epoch)` | `SlimAccepted` (proposal + message); sentinel at `epoch=u64::MAX` stores the last promised proposal |
 | `snapshots` | `(group_id, epoch)` | `ExternalSnapshot` bytes (full group state for crash recovery) |
-| `messages` | `(group_id, sender_fingerprint, seq)` | Encrypted application message |
+| `messages` | `(group_id, sender_fingerprint, seq)` | Full encrypted message or one erasure-coded shard (see [plan/COMPACTED-ERASURE-CODING.md](plan/COMPACTED-ERASURE-CODING.md)) |
 
 Accepted and promised writes are fsynced before acknowledging. Snapshot
 writes do not fsync (recoverable from accepted values). On server restart,

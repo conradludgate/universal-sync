@@ -16,10 +16,11 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Instant;
 
+use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, ClientId, Crdt, EncryptedAppMessage, Epoch, GroupContextExt, GroupId, GroupInfoExt,
-    Handshake, KeyPackageExt, LeafNodeExt, MessageId,
+    AcceptorId, ClientId, Crdt, Epoch, GroupContextExt, GroupId, GroupInfoExt, Handshake,
+    KeyPackageExt, LeafNodeExt, MessageId,
 };
 use iroh::Endpoint;
 use mls_rs::client_builder::MlsConfig;
@@ -146,7 +147,9 @@ enum AcceptorInbound {
         response: crate::connector::ProposalResponse,
     },
     EncryptedMessage {
-        msg: EncryptedAppMessage,
+        id: MessageId,
+        level: u8,
+        data: bytes::Bytes,
     },
     Connected {
         acceptor_id: AcceptorId,
@@ -157,7 +160,7 @@ enum AcceptorInbound {
 }
 
 struct PendingMessage {
-    msg: EncryptedAppMessage,
+    msg: Bytes,
     attempts: u32,
 }
 
@@ -172,7 +175,7 @@ enum AcceptorOutbound {
     AppMessage {
         id: MessageId,
         level: u8,
-        msg: EncryptedAppMessage,
+        data: bytes::Bytes,
     },
 }
 
@@ -260,7 +263,7 @@ pub struct JoinInfo {
 ///
 /// All mutations are sent to a background actor. Drop cancels actors without waiting;
 /// use [`shutdown()`](Self::shutdown) for graceful termination.
-const DEFAULT_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+const DEFAULT_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[allow(clippy::struct_field_names)]
 pub struct Weaver {

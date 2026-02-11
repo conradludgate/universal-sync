@@ -146,9 +146,13 @@ impl AcceptorActor {
                                 break ConnectionResult::Disconnected { was_connected: true };
                             }
                         }
-                        AcceptorOutbound::AppMessage { id, level, msg } => {
+                        AcceptorOutbound::AppMessage { id, level, data } => {
                             if let Some(ref mut writer) = message_writer_opt {
-                                let request = MessageRequest::Send { id, level, message: msg };
+                                let request = MessageRequest::Send {
+                                    id,
+                                    level,
+                                    data: data.clone(),
+                                };
                                 let _ = writer.send(request).await;
                             }
                         }
@@ -178,10 +182,11 @@ impl AcceptorActor {
                     }
                 } => {
                     match result {
-                        Ok(MessageResponse::Message { message, .. }) => {
-                            let _ = self.inbound_tx.send(AcceptorInbound::EncryptedMessage {
-                                msg: message,
-                            }).await;
+                        Ok(MessageResponse::Message { id, level, data }) => {
+                            let _ = self
+                                .inbound_tx
+                                .send(AcceptorInbound::EncryptedMessage { id, level, data })
+                                .await;
                         }
                         Ok(MessageResponse::BackfillComplete { .. }
                             | MessageResponse::Stored) => {}

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use error_stack::{Report, ResultExt};
 use filament_core::{
-    AcceptorId, Epoch, GroupId, Handshake, HandshakeResponse, MemberFingerprint, PAXOS_ALPN,
+    ALPN, AcceptorId, Epoch, GroupId, Handshake, HandshakeResponse, MemberFingerprint,
 };
 use futures::{FutureExt, SinkExt, StreamExt};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -71,7 +71,7 @@ impl ConnectionManager {
         let public_key = Self::acceptor_public_key(acceptor_id);
         let conn = self
             .endpoint
-            .connect(public_key, PAXOS_ALPN)
+            .connect(public_key, ALPN)
             .await
             .change_context(ConnectorError)?;
 
@@ -118,7 +118,7 @@ impl ConnectionManager {
     ) -> Result<Connection, Report<ConnectorError>> {
         let public_key = Self::acceptor_public_key(acceptor_id);
         self.endpoint
-            .connect(public_key, PAXOS_ALPN)
+            .connect(public_key, ALPN)
             .await
             .change_context(ConnectorError)
     }

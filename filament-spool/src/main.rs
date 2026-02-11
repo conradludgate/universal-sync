@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use filament_core::{PAXOS_ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE, load_secret_key};
+use filament_core::{ALPN, SYNC_EXTENSION_TYPE, SYNC_PROPOSAL_TYPE, load_secret_key};
 use filament_spool::api::ApiState;
 use filament_spool::{
     AcceptorMetrics, AcceptorRegistry, MetricsEncoder, SharedFjallStateStore, accept_connection,
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut endpoint_builder = Endpoint::builder()
         .transport_config(transport_config)
         .secret_key(secret_key.clone())
-        .alpns(vec![PAXOS_ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()])
         .address_lookup(PkarrPublisher::n0_dns())
         .address_lookup(DnsAddressLookup::n0_dns())
         .address_lookup(MdnsAddressLookup::builder());

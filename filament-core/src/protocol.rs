@@ -184,16 +184,10 @@ pub struct MessageId {
     pub seq: u64,
 }
 
-/// Encrypted application message (MLS `PrivateMessage` ciphertext).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EncryptedAppMessage {
-    pub ciphertext: Bytes,
-}
-
 /// Authenticated data carried alongside an MLS application message.
 ///
 /// This is placed in the MLS `authenticated_data` field — authenticated but
-/// not encrypted, so acceptors can inspect it without decrypting.
+/// not encrypted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthData {
     /// A regular L0 CRDT update.
@@ -201,15 +195,15 @@ pub enum AuthData {
         /// Sender-scoped sequence number.
         seq: u64,
     },
-    /// A compacted snapshot that supersedes earlier messages.
+    /// A compacted snapshot (full or one erasure-coded shard). Full compaction is encoded as
+    /// `shard_index=0`, `data_shards=1`, `total_shards=1`.
     Compaction {
-        /// Sender-scoped sequence number (shared space with `Update`).
         seq: u64,
-        /// Compaction level (1 = L0→L1, 2 = L1→L2, etc.).
         level: u8,
-        /// State vector watermark: messages at or below these per-sender
-        /// sequence numbers are superseded by this compaction.
         watermark: StateVector,
+        shard_index: u8,
+        data_shards: u8,
+        total_shards: u8,
     },
 }
 
@@ -220,13 +214,36 @@ impl AuthData {
         Self::Update { seq }
     }
 
-    /// Create authenticated data for a compaction.
+    /// Create authenticated data for a full compaction (one ciphertext). Encoded as (0, 1, 1).
     #[must_use]
     pub fn compaction(seq: u64, level: u8, watermark: StateVector) -> Self {
         Self::Compaction {
             seq,
             level,
             watermark,
+            shard_index: 0,
+            data_shards: 1,
+            total_shards: 1,
+        }
+    }
+
+    /// Create authenticated data for one encrypted shard of a compacted snapshot.
+    #[must_use]
+    pub fn compaction_shard(
+        seq: u64,
+        level: u8,
+        watermark: StateVector,
+        shard_index: u8,
+        data_shards: u8,
+        total_shards: u8,
+    ) -> Self {
+        Self::Compaction {
+            seq,
+            level,
+            watermark,
+            shard_index,
+            data_shards,
+            total_shards,
         }
     }
 
@@ -324,7 +341,7 @@ pub enum MessageRequest {
     Send {
         id: MessageId,
         level: u8,
-        message: EncryptedAppMessage,
+        data: Bytes,
     },
     Subscribe {
         state_vector: StateVector,
@@ -340,7 +357,8 @@ pub enum MessageResponse {
     Stored,
     Message {
         id: MessageId,
-        message: EncryptedAppMessage,
+        level: u8,
+        data: Bytes,
     },
     BackfillComplete {
         has_more: bool,
@@ -446,16 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encrypted_app_message_roundtrip() {
-        let msg = EncryptedAppMessage {
-            ciphertext: Bytes::from_static(&[1, 2, 3, 4, 5]),
-        };
-        let bytes = postcard::to_allocvec(&msg).unwrap();
-        let decoded: EncryptedAppMessage = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
     fn test_message_request_variants_roundtrip() {
         let send = MessageRequest::Send {
             id: MessageId {
@@ -464,9 +472,7 @@ mod tests {
                 seq: 1,
             },
             level: 0,
-            message: EncryptedAppMessage {
-                ciphertext: Bytes::from_static(&[10, 20]),
-            },
+            data: Bytes::from_static(&[10, 20]),
         };
         let bytes = postcard::to_allocvec(&send).unwrap();
         let decoded: MessageRequest = postcard::from_bytes(&bytes).unwrap();
@@ -482,6 +488,48 @@ mod tests {
             decoded,
             MessageRequest::Backfill { limit: 100, .. }
         ));
+
+        let send_level1 = MessageRequest::Send {
+            id: MessageId {
+                group_id: GroupId::new([0u8; 32]),
+                sender: MemberFingerprint([1u8; 8]),
+                seq: 2,
+            },
+            level: 1,
+            data: Bytes::from_static(&[1, 2, 3]),
+        };
+        let bytes = postcard::to_allocvec(&send_level1).unwrap();
+        let decoded: MessageRequest = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, MessageRequest::Send { .. }));
+    }
+
+    #[test]
+    fn test_message_response_variants_roundtrip() {
+        let msg = MessageResponse::Message {
+            id: MessageId {
+                group_id: GroupId::new([0u8; 32]),
+                sender: MemberFingerprint([1u8; 8]),
+                seq: 1,
+            },
+            level: 0,
+            data: Bytes::from_static(&[10, 20]),
+        };
+        let bytes = postcard::to_allocvec(&msg).unwrap();
+        let decoded: MessageResponse = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, MessageResponse::Message { level: 0, .. }));
+
+        let shard = MessageResponse::Message {
+            id: MessageId {
+                group_id: GroupId::new([0u8; 32]),
+                sender: MemberFingerprint([1u8; 8]),
+                seq: 2,
+            },
+            level: 1,
+            data: Bytes::from_static(&[4, 5, 6]),
+        };
+        let bytes = postcard::to_allocvec(&shard).unwrap();
+        let decoded: MessageResponse = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, MessageResponse::Message { level: 1, .. }));
     }
 
     #[test]
@@ -505,16 +553,51 @@ mod tests {
         assert_eq!(ad, decoded);
         assert_eq!(decoded.seq(), 50);
 
-        match decoded {
+        match &decoded {
             AuthData::Compaction {
                 level,
                 watermark: wm,
+                shard_index: 0,
+                data_shards: 1,
+                total_shards: 1,
                 ..
             } => {
-                assert_eq!(level, 1);
-                assert_eq!(wm, watermark);
+                assert_eq!(*level, 1);
+                assert_eq!(wm, &watermark);
             }
-            AuthData::Update { .. } => panic!("expected Compaction"),
+            AuthData::Update { .. } | AuthData::Compaction { .. } => {
+                panic!("expected full Compaction (0, 1, 1)")
+            }
+        }
+    }
+
+    #[test]
+    fn auth_data_compaction_shard_roundtrip() {
+        let mut watermark = StateVector::new();
+        watermark.insert(MemberFingerprint([0xCC; 8]), 10);
+
+        let ad = AuthData::compaction_shard(99, 2, watermark.clone(), 1, 2, 3);
+        let bytes = ad.to_bytes().unwrap();
+        let decoded = AuthData::from_bytes(&bytes).unwrap();
+        assert_eq!(ad, decoded);
+        assert_eq!(decoded.seq(), 99);
+
+        match &decoded {
+            AuthData::Compaction {
+                level,
+                watermark: wm,
+                shard_index,
+                data_shards,
+                total_shards,
+                ..
+            } => {
+                assert_eq!(*level, 2);
+                assert_eq!(wm, &watermark);
+                assert_eq!(*shard_index, 1);
+                assert_eq!(*data_shards, 2);
+                assert_eq!(*total_shards, 3);
+            }
+            AuthData::Update { .. } => panic!("expected Compaction with shard"),
         }
     }
 
@@ -522,6 +605,10 @@ mod tests {
     fn auth_data_seq_accessor() {
         assert_eq!(AuthData::update(7).seq(), 7);
         assert_eq!(AuthData::compaction(99, 2, StateVector::new()).seq(), 99);
+        assert_eq!(
+            AuthData::compaction_shard(11, 1, StateVector::new(), 0, 2, 3).seq(),
+            11
+        );
     }
 
     #[test]

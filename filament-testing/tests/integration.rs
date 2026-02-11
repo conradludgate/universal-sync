@@ -1067,6 +1067,10 @@ async fn yrs_insert_and_send(
         text_ref.insert(&mut txn, position, text);
     }
     group.send_update(crdt).await.expect("send update");
+    group
+        .wait_pending_send(crdt)
+        .await
+        .expect("wait_pending_send");
 }
 
 /// Helper: read text from a Yrs CRDT.
@@ -1434,6 +1438,8 @@ async fn test_post_compaction_bidirectional() {
     )
     .await;
     handle_compaction_event(&mut alice_group, &mut alice_crdt, &compaction_event).await;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Bob catches up with initial state via backfill
     wait_for_sync(&mut bob_group, &mut bob_crdt, "Hello", 10).await;

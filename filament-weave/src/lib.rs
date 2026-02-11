@@ -34,6 +34,7 @@
 pub(crate) mod client;
 pub(crate) mod connection;
 pub(crate) mod connector;
+pub(crate) mod erasure;
 pub(crate) mod group;
 pub(crate) mod group_state;
 pub(crate) mod learner;

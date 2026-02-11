@@ -229,7 +229,7 @@ impl WeaverClient {
         group_id: filament_core::GroupId,
         hmac_tag: [u8; 32],
     ) -> Result<(), Report<WeaverError>> {
-        use filament_core::{Handshake, PAXOS_ALPN};
+        use filament_core::{ALPN, Handshake};
         use futures::SinkExt;
         use iroh::PublicKey;
 
@@ -241,7 +241,7 @@ impl WeaverClient {
 
         let endpoint = self.infra.connection_manager.endpoint();
         let conn = endpoint
-            .connect(public_key, PAXOS_ALPN)
+            .connect(public_key, ALPN)
             .await
             .change_context(WeaverError)
             .attach("failed to connect to target")?;

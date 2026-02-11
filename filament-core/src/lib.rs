@@ -24,13 +24,13 @@ pub use extension::{
 };
 pub use proposal::{AcceptorId, Attempt, Epoch, GroupProposal, MemberId, UnsignedProposal};
 pub use protocol::{
-    AuthData, ClientId, EncryptedAppMessage, GroupId, GroupMessage, Handshake, HandshakeResponse,
-    MemberFingerprint, MessageId, MessageRequest, MessageResponse, StateVector, StreamType,
+    AuthData, ClientId, GroupId, GroupMessage, Handshake, HandshakeResponse, MemberFingerprint,
+    MessageId, MessageRequest, MessageResponse, StateVector, StreamType,
 };
 pub use sink_stream::FromIoError;
 
-/// ALPN protocol identifier for Paxos connections
-pub const PAXOS_ALPN: &[u8] = b"filament/paxos/1";
+/// ALPN protocol identifier for filament connections
+pub const ALPN: &[u8] = b"filament/1";
 
 #[derive(Debug)]
 pub struct KeyLoadError;
